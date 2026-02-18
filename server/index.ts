@@ -127,6 +127,11 @@ app.use((req, res, next) => {
   // API routes
   await registerRoutes(httpServer, app);
 
+  // simple homepage
+  app.get("/", (_req, res) => {
+    res.send("Signage API running");
+  });
+
   // simple ping for devices / uptime checks
   app.get("/api/ping", (_req, res) => {
     res.json({ ok: true, time: new Date().toISOString() });
