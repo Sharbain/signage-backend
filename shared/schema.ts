@@ -419,9 +419,15 @@ export const deviceCommands = pgTable("device_commands", {
   id: serial("id").primaryKey(),
   deviceId: text("device_id").notNull(),
   payload: jsonb("payload").$type<Record<string, any>>().notNull(),
-  executed: boolean("executed").default(false),
+
+  // Delivery + execution tracking (used by /api/commands/active and device polling routes)
+  sent: boolean("sent").default(false).notNull(),
+  executed: boolean("executed").default(false).notNull(),
+  executedAt: timestamp("executed_at"),
+
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
+
 
 export const insertDeviceCommandSchema = createInsertSchema(deviceCommands).omit({
   id: true,
