@@ -1,5 +1,6 @@
 import type { Express, Request, Response, NextFunction } from "express";
 import { createServer, type Server } from "http";
+import { randomUUID } from "crypto";
 import {
   storage,
   saveDeviceStatus,
@@ -30,6 +31,7 @@ import {
 import { pool } from "./db";
 import { z } from "zod";
 import { requireRole } from "./middleware/permissions";
+import { authenticateJWT, authenticateDevice, authenticateUserOrDevice } from "./middleware/auth";
 
 const uploadsDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadsDir)) {
@@ -202,10 +204,6 @@ const clientAttachmentUpload = multer({
   },
 });
 
-interface AuthRequest extends Request {
-  user?: { sub: string; email: string };
-}
-
 if (!process.env.JWT_SECRET) {
   throw new Error("JWT_SECRET environment variable must be set");
 }
@@ -289,29 +287,46 @@ const loginSchema = z.object({
 
 const updateScreenSchema = insertScreenSchema.partial();
 
-function authMiddleware(req: AuthRequest, res: Response, next: NextFunction) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).json({ error: "No token provided" });
-  }
-  const token = authHeader.split(" ")[1];
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET) as {
-      sub: string;
-      email: string;
-    };
-    req.user = decoded;
-    next();
-  } catch {
-    return res.status(401).json({ error: "Invalid token" });
-  }
-}
+// authMiddleware replaced by authenticateJWT in server/middleware/auth.ts
 
 export async function registerRoutes(
   httpServer: Server,
   app: Express,
 ): Promise<Server> {
-  app.use("/uploads", (await import("express")).default.static(uploadsDir));
+  // --------------------------------------------------
+  // Protect uploads (no public filesystem exposure)
+  // Allow either admin/user JWT or a valid device token.
+  // --------------------------------------------------
+  if (process.env.NODE_ENV !== "test") {
+    app.use(
+      "/uploads",
+      authenticateUserOrDevice,
+      (await import("express")).default.static(uploadsDir, {
+        fallthrough: false,
+        setHeaders: (res) => {
+          res.setHeader("X-Content-Type-Options", "nosniff");
+          res.setHeader("Cache-Control", "private, max-age=300");
+        },
+      }),
+    );
+  }
+
+  // --------------------------------------------------
+  // Global API auth
+  // - Allowlist auth + ping + device register
+  // - Device endpoints are protected separately
+  // --------------------------------------------------
+  app.use("/api", (req, res, next) => {
+    const p = req.path;
+    if (p.startsWith("/auth/")) return next();
+    if (p === "/ping") return next();
+    if (p === "/screens/register") return next();
+    if (p.startsWith("/device/")) return next();
+    return authenticateJWT(req, res, next);
+  });
+
+  // Device API must use device token when a specific deviceId is present
+  app.use("/api/device/:deviceId", authenticateDevice);
 
       // =====================================================
       // DASHBOARD SUMMARY
@@ -1207,12 +1222,12 @@ export async function registerRoutes(
       }
 
       const accessToken = jwt.sign(
-        { sub: user.id, email: user.email },
+        { sub: user.id, email: user.email, role: user.role },
         JWT_SECRET,
         { expiresIn: "24h" },
       );
 
-      res.json({ accessToken, user: { id: user.id, email: user.email } });
+      res.json({ accessToken, user: { id: user.id, email: user.email, role: user.role } });
     } catch (error) {
       if (error instanceof z.ZodError) {
         return res.status(400).json({ error: error.errors });
@@ -1235,15 +1250,25 @@ export async function registerRoutes(
       // Check if device already exists
       const existingScreen = await storage.getScreenByDeviceId(deviceId);
       if (existingScreen) {
+        // If the device has no token yet, mint one (returned only on this register call)
+        let deviceToken: string | null = null;
+        if (!existingScreen.password) {
+          deviceToken = randomUUID();
+          const hash = await bcrypt.hash(deviceToken, 10);
+          await storage.updateScreen(existingScreen.id, { password: hash } as any);
+        }
+
         // Update last seen and return existing screen
         const updated = await storage.updateScreen(existingScreen.id, {
           lastSeen: new Date(),
           status: "online",
         });
-        return res.json({ message: "Device reconnected", screen: updated });
+        return res.json({ message: "Device reconnected", screen: updated, deviceToken });
       }
 
       // Create new screen
+      const deviceToken = randomUUID();
+      const hash = await bcrypt.hash(deviceToken, 10);
       const screen = await storage.createScreen({
         deviceId,
         name: name || `Screen ${deviceId}`,
@@ -1251,9 +1276,10 @@ export async function registerRoutes(
         location: location || "Unknown",
         status: "online",
         lastSeen: new Date(),
+        password: hash,
       });
 
-      res.status(201).json({ message: "Device registered", screen });
+      res.status(201).json({ message: "Device registered", screen, deviceToken });
     } catch (error) {
       res.status(500).json({ error: "Failed to register device" });
     }
@@ -1587,7 +1613,7 @@ export async function registerRoutes(
     timestamp: z.number().nullable().optional(),
   });
 
-  app.post("/api/device/status", async (req, res) => {
+  app.post("/api/device/status", authenticateDevice, async (req, res) => {
     try {
       const authHeader = req.headers.authorization;
       if (!authHeader) return res.status(401).json({ error: "Missing token" });
@@ -1628,8 +1654,8 @@ export async function registerRoutes(
 
   app.post(
     "/api/device/status/auth",
-    authMiddleware as any,
-    async (req: AuthRequest, res) => {
+    authenticateJWT as any,
+    async (req: Request, res) => {
       try {
         const validatedData = deviceStatusSchema.parse(req.body);
 
@@ -1970,7 +1996,7 @@ export async function registerRoutes(
   });
 
   // Screenshot capture endpoint using Puppeteer
-  app.get("/api/webpage-screenshot", async (req, res) => {
+  app.get("/api/webpage-screenshot", requireRole("admin"), async (req, res) => {
     const { url, width, height } = req.query;
     if (!url || typeof url !== "string") {
       return res.status(400).json({ error: "URL is required" });
@@ -2743,8 +2769,8 @@ export async function registerRoutes(
 
   app.post(
     "/api/playlists",
-    authMiddleware as any,
-    async (req: AuthRequest, res) => {
+    authenticateJWT as any,
+    async (req: Request, res) => {
       try {
         const { screen_id, media_id, position, duration_override } = req.body;
 
@@ -2766,8 +2792,8 @@ export async function registerRoutes(
 
   app.delete(
     "/api/playlists/:id",
-    authMiddleware as any,
-    async (req: AuthRequest, res) => {
+    authenticateJWT as any,
+    async (req: Request, res) => {
       try {
         const id = parseInt(req.params.id);
         const deleted = await storage.deletePlaylistEntry(id);
