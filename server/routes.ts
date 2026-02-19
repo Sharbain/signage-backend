@@ -1187,7 +1187,11 @@ export async function registerRoutes(
     try {
       const { email, password } = registerSchema.parse(req.body);
 
-      const existingUser = await storage.getUserByEmail(email);
+      
+      if (process.env.DISABLE_PUBLIC_REGISTER === "true") {
+        return res.status(403).json({ error: "public_registration_disabled" });
+      }
+const existingUser = await storage.getUserByEmail(email);
       if (existingUser) {
         return res.status(400).json({ error: "User already exists" });
       }
@@ -1235,6 +1239,76 @@ export async function registerRoutes(
       res.status(500).json({ error: "Internal server error" });
     }
   });
+
+
+  // Admin: Users management (admin-only)
+  app.get("/api/admin/users", authenticateJWT, requireRole("admin"), async (req, res) => {
+    try {
+      const all = await storage.getAllUsers();
+      // Never return password hashes
+      const safe = all.map((u) => ({ id: u.id, email: u.email, name: u.name, role: u.role, createdAt: u.createdAt }));
+      return res.json({ users: safe });
+    } catch (e) {
+      console.error("GET /api/admin/users error", e);
+      return res.status(500).json({ error: "failed_to_list_users" });
+    }
+  });
+
+  app.post("/api/admin/users", authenticateJWT, requireRole("admin"), async (req, res) => {
+    try {
+      const email = String((req.body as any)?.email || "").trim().toLowerCase();
+      const password = String((req.body as any)?.password || "");
+      const role = String((req.body as any)?.role || "restricted");
+      const name = (req.body as any)?.name ? String((req.body as any).name) : undefined;
+
+      if (!email || !email.includes("@")) return res.status(400).json({ error: "invalid_email" });
+      if (!password || password.length < 6) return res.status(400).json({ error: "password_too_short" });
+
+      const allowedRoles = new Set(["admin", "manager", "viewer", "restricted"]);
+      const finalRole = allowedRoles.has(role) ? role : "restricted";
+
+      const existing = await storage.getUserByEmail(email);
+      if (existing) return res.status(409).json({ error: "user_already_exists" });
+
+      const hashedPassword = await bcrypt.hash(password, 10);
+      const user = await storage.createUser({
+        email,
+        passwordHash: hashedPassword,
+        role: finalRole as any,
+        name,
+      } as any);
+
+      return res.json({ ok: true, user: { id: user.id, email: user.email, name: user.name, role: user.role } });
+    } catch (e) {
+      console.error("POST /api/admin/users error", e);
+      return res.status(500).json({ error: "failed_to_create_user" });
+    }
+  });
+
+  // Admin: rotate device token (returned once; stored hashed)
+  app.post(
+    "/api/admin/screens/:id/rotate-token",
+    authenticateJWT,
+    requireRole("admin"),
+    async (req, res) => {
+      try {
+        const id = Number(req.params.id);
+        if (!Number.isFinite(id)) return res.status(400).json({ error: "invalid_id" });
+
+        const screen = await storage.getScreen(id);
+        if (!screen) return res.status(404).json({ error: "screen_not_found" });
+
+        const deviceToken = randomUUID();
+        const hash = await bcrypt.hash(deviceToken, 10);
+        await storage.updateScreen(id, { password: hash } as any);
+
+        return res.json({ ok: true, deviceToken, screenId: id, deviceId: (screen as any).deviceId || (screen as any).device_id });
+      } catch (e) {
+        console.error("rotate-token error", e);
+        return res.status(500).json({ error: "failed_to_rotate_token" });
+      }
+    },
+  );
 
   // Screens Routes
 
