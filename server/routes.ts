@@ -3152,7 +3152,7 @@ const existingUser = await storage.getUserByEmail(email);
   app.post("/api/groups/:id/icon/clear", requireRole("admin"), async (req, res) => {
     try {
       const { id } = req.params;
-      await storage.updateGroupIcon(id, null);
+      await storage.updateGroupIcon(id, null as any);
       res.json({ success: true });
     } catch (error) {
       console.error("Clear group icon error:", error);
@@ -3469,7 +3469,7 @@ const existingUser = await storage.getUserByEmail(email);
       const id = rawId.replace("group_", "");
 
       try {
-        await storage.updateGroupIcon(id, null);
+        await storage.updateGroupIcon(id, null as any);
         res.json({ success: true });
       } catch (error) {
         console.error("clear group icon error", error);
