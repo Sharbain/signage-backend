@@ -1,7 +1,41 @@
 import { db, pool } from "./db";
 import { supabase } from "./supabaseClient";
-import { users, screens, media, playlists, templates, templatePlaylistItems, templateSchedule, deviceGroups, deviceGroupMap, deviceStatusLogs, schedule, type User, type InsertUser, type Screen, type InsertScreen, type Media, type InsertMedia, type Playlist, type InsertPlaylist, type Template, type InsertTemplate, type TemplatePlaylistItem, type InsertTemplatePlaylistItem, type TemplateSchedule, type InsertTemplateSchedule, type DeviceGroup, type InsertDeviceGroup, type DeviceGroupMap, type InsertDeviceGroupMap, type InsertDeviceStatusLog, type DeviceStatusLog, type Schedule, type InsertSchedule } from "@shared/schema";
-import { eq, asc, or, desc, and, lt, gt, ne, sql } from "drizzle-orm";
+import {
+  users,
+  screens,
+  media,
+  playlists,
+  templates,
+  templatePlaylistItems,
+  templateSchedule,
+  deviceGroups,
+  deviceGroupMap,
+  deviceStatusLogs,
+  schedule,
+  type User,
+  type InsertUser,
+  type Screen,
+  type InsertScreen,
+  type Media,
+  type InsertMedia,
+  type Playlist,
+  type InsertPlaylist,
+  type Template,
+  type InsertTemplate,
+  type TemplatePlaylistItem,
+  type InsertTemplatePlaylistItem,
+  type TemplateSchedule,
+  type InsertTemplateSchedule,
+  type DeviceGroup,
+  type InsertDeviceGroup,
+  type DeviceGroupMap,
+  type InsertDeviceGroupMap,
+  type InsertDeviceStatusLog,
+  type DeviceStatusLog,
+  type Schedule,
+  type InsertSchedule,
+} from "@shared/schema";
+import { eq, asc, desc, and, lt, gt, ne, sql } from "drizzle-orm";
 
 export interface DeviceStatusUpdate {
   status?: string;
@@ -21,7 +55,7 @@ export interface IStorage {
   getUser(id: string): Promise<User | undefined>;
   getUserByEmail(email: string): Promise<User | undefined>;
   createUser(user: InsertUser): Promise<User>;
-  
+
   getAllScreens(): Promise<Screen[]>;
   getScreen(id: number): Promise<Screen | undefined>;
   getScreenByDeviceId(deviceId: string): Promise<Screen | undefined>;
@@ -29,7 +63,7 @@ export interface IStorage {
   updateScreen(id: number, screen: Partial<InsertScreen>): Promise<Screen | undefined>;
   updateDeviceStatus(deviceId: string, status: DeviceStatusUpdate): Promise<Screen | undefined>;
   deleteScreen(id: number): Promise<boolean>;
-  
+
   getAllMedia(): Promise<Media[]>;
   getMedia(id: number): Promise<Media | undefined>;
   createMedia(media: InsertMedia): Promise<Media>;
@@ -59,6 +93,8 @@ export interface IStorage {
 
   getAllGroups(): Promise<DeviceGroup[]>;
   createGroup(group: InsertDeviceGroup): Promise<DeviceGroup>;
+  deleteGroup(id: string): Promise<boolean>;
+  updateGroupIcon(id: string, iconUrl: string | null): Promise<void>;
   addDeviceToGroup(deviceId: string, groupId: string): Promise<DeviceGroupMap>;
   getDevicesByGroup(groupId: string): Promise<DeviceGroupMap[]>;
   getDeviceCountsByGroup(): Promise<Record<string, { online: number; offline: number }>>;
@@ -72,6 +108,10 @@ export interface IStorage {
   updateContentSchedule(id: number, data: Partial<InsertSchedule>): Promise<Schedule | undefined>;
   deleteContentSchedule(id: number): Promise<boolean>;
   checkScheduleOverlap(start: Date, end: Date, excludeId?: number): Promise<boolean>;
+
+  // Optional helpers your class already has (not required by routes, but correct to expose)
+  getAllUsers?(): Promise<User[]>;
+  getAllScreensWithGroup?(): Promise<(Screen & { groupId: string | null })[]>;
 }
 
 export class DbStorage implements IStorage {
@@ -89,7 +129,6 @@ export class DbStorage implements IStorage {
     const result = await db.select().from(users).orderBy(users.createdAt);
     return result;
   }
-
 
   async createUser(insertUser: InsertUser): Promise<User> {
     const result = await db.insert(users).values(insertUser).returning();
@@ -147,11 +186,13 @@ export class DbStorage implements IStorage {
     if (statusUpdate.latitude !== undefined) updateData.latitude = statusUpdate.latitude;
     if (statusUpdate.longitude !== undefined) updateData.longitude = statusUpdate.longitude;
     if (statusUpdate.errors !== undefined) updateData.errors = statusUpdate.errors;
-    
-    const result = await db.update(screens)
+
+    const result = await db
+      .update(screens)
       .set(updateData)
       .where(eq(screens.deviceId, deviceId))
       .returning();
+
     return result[0];
   }
 
@@ -213,7 +254,9 @@ export class DbStorage implements IStorage {
   }
 
   async getTemplatePlaylistItems(templateId: string): Promise<TemplatePlaylistItem[]> {
-    return db.select().from(templatePlaylistItems)
+    return db
+      .select()
+      .from(templatePlaylistItems)
       .where(eq(templatePlaylistItems.templateId, templateId))
       .orderBy(asc(templatePlaylistItems.orderIndex));
   }
@@ -224,7 +267,8 @@ export class DbStorage implements IStorage {
   }
 
   async updateTemplatePlaylistItemOrder(id: string, orderIndex: number): Promise<TemplatePlaylistItem | undefined> {
-    const result = await db.update(templatePlaylistItems)
+    const result = await db
+      .update(templatePlaylistItems)
       .set({ orderIndex })
       .where(eq(templatePlaylistItems.id, id))
       .returning();
@@ -245,19 +289,15 @@ export class DbStorage implements IStorage {
   }
 
   async getSchedulesByDevice(deviceId: string): Promise<TemplateSchedule[]> {
-    return db.select().from(templateSchedule).where(
-      and(eq(templateSchedule.targetType, 'device'), eq(templateSchedule.targetId, deviceId))
-    );
+    return db.select().from(templateSchedule).where(and(eq(templateSchedule.targetType, "device"), eq(templateSchedule.targetId, deviceId)));
   }
 
   async getSchedulesByGroup(groupId: string): Promise<TemplateSchedule[]> {
-    return db.select().from(templateSchedule).where(
-      and(eq(templateSchedule.targetType, 'group'), eq(templateSchedule.targetId, groupId))
-    );
+    return db.select().from(templateSchedule).where(and(eq(templateSchedule.targetType, "group"), eq(templateSchedule.targetId, groupId)));
   }
 
-  async createSchedule(schedule: InsertTemplateSchedule): Promise<TemplateSchedule> {
-    const result = await db.insert(templateSchedule).values(schedule).returning();
+  async createSchedule(scheduleData: InsertTemplateSchedule): Promise<TemplateSchedule> {
+    const result = await db.insert(templateSchedule).values(scheduleData).returning();
     return result[0];
   }
 
@@ -270,47 +310,19 @@ export class DbStorage implements IStorage {
     return db.select().from(deviceGroups);
   }
 
-  async getGroupByNameAndParent(name: string, parentId: string | null): Promise<DeviceGroup | undefined> {
-    const result = await db.select().from(deviceGroups)
-      .where(sql`${deviceGroups.parentId} IS NOT DISTINCT FROM ${parentId} AND LOWER(${deviceGroups.name}) = LOWER(${name})`)
-      .limit(1);
-    return result[0];
-  }
-
-  async getGroupByNameAndParentExcluding(name: string, parentId: string | null, excludeId: string): Promise<DeviceGroup | undefined> {
-    const result = await db.select().from(deviceGroups)
-      .where(sql`${deviceGroups.parentId} IS NOT DISTINCT FROM ${parentId} AND LOWER(${deviceGroups.name}) = LOWER(${name}) AND ${deviceGroups.id} <> ${excludeId}`)
-      .limit(1);
-    return result[0];
-  }
-
-  async getGroupById(id: string): Promise<DeviceGroup | undefined> {
-    const result = await db.select().from(deviceGroups).where(eq(deviceGroups.id, id)).limit(1);
-    return result[0];
-  }
-
-  async updateGroupName(id: string, name: string): Promise<void> {
-    await db.update(deviceGroups).set({ name }).where(eq(deviceGroups.id, id));
-  }
-
-  async updateGroupParent(id: string, parentId: string | null): Promise<void> {
-    await db.update(deviceGroups).set({ parentId }).where(eq(deviceGroups.id, id));
-  }
-
   async createGroup(group: InsertDeviceGroup): Promise<DeviceGroup> {
     const result = await db.insert(deviceGroups).values(group).returning();
     return result[0];
   }
 
   async deleteGroup(id: string): Promise<boolean> {
-    // First remove all device associations
     await db.delete(deviceGroupMap).where(eq(deviceGroupMap.groupId, id));
-    // Then delete the group
     const result = await db.delete(deviceGroups).where(eq(deviceGroups.id, id)).returning();
     return result.length > 0;
   }
 
-  async updateGroupIcon(id: string, iconUrl: string | null): Promise<void>; 
+  // ✅ FIXED: proper method body, no stray semicolon
+  async updateGroupIcon(id: string, iconUrl: string | null): Promise<void> {
     await db.update(deviceGroups).set({ iconUrl }).where(eq(deviceGroups.id, id));
   }
 
@@ -319,23 +331,23 @@ export class DbStorage implements IStorage {
   }
 
   async updateScreenGroup(deviceId: string, groupId: string | null): Promise<void> {
-    // Remove existing group association
     await db.delete(deviceGroupMap).where(eq(deviceGroupMap.deviceId, deviceId));
-    // Add new group association if groupId is provided
     if (groupId) {
       await db.insert(deviceGroupMap).values({ deviceId, groupId });
     }
   }
 
   async addDeviceToGroup(deviceId: string, groupId: string): Promise<DeviceGroupMap> {
-    const existing = await db.select().from(deviceGroupMap)
+    const existing = await db
+      .select()
+      .from(deviceGroupMap)
       .where(sql`${deviceGroupMap.deviceId} = ${deviceId} AND ${deviceGroupMap.groupId} = ${groupId}`)
       .limit(1);
-    
+
     if (existing.length > 0) {
       return existing[0];
     }
-    
+
     const result = await db.insert(deviceGroupMap).values({ deviceId, groupId }).returning();
     return result[0];
   }
@@ -353,34 +365,15 @@ export class DbStorage implements IStorage {
       JOIN device_group_map m ON m.device_id = s.device_id
       GROUP BY m.group_id
     `);
-    
+
     const counts: Record<string, { online: number; offline: number }> = {};
-    (result.rows as any[]).forEach(row => {
-      counts[row.group_id] = { 
-        online: parseInt(row.online) || 0, 
-        offline: parseInt(row.offline) || 0 
+    (result.rows as any[]).forEach((row) => {
+      counts[row.group_id] = {
+        online: parseInt(row.online) || 0,
+        offline: parseInt(row.offline) || 0,
       };
     });
     return counts;
-  }
-
-  async getDeviceGroupId(deviceId: string): Promise<string | null> {
-    const result = await db.select().from(deviceGroupMap).where(eq(deviceGroupMap.deviceId, deviceId)).limit(1);
-    return result[0]?.groupId || null;
-  }
-
-  async getGroupAncestorChain(groupId: string): Promise<DeviceGroup[]> {
-    const chain: DeviceGroup[] = [];
-    let currentId: string | null = groupId;
-    
-    while (currentId) {
-      const group = await this.getGroupById(currentId);
-      if (!group) break;
-      chain.push(group);
-      currentId = group.parentId;
-    }
-    
-    return chain;
   }
 
   async createDeviceStatusLog(log: InsertDeviceStatusLog): Promise<DeviceStatusLog> {
@@ -389,7 +382,9 @@ export class DbStorage implements IStorage {
   }
 
   async getDeviceStatusLogs(deviceId: string, limit: number = 100): Promise<DeviceStatusLog[]> {
-    return db.select().from(deviceStatusLogs)
+    return db
+      .select()
+      .from(deviceStatusLogs)
       .where(eq(deviceStatusLogs.deviceId, deviceId))
       .orderBy(desc(deviceStatusLogs.createdAt))
       .limit(limit);
@@ -420,10 +415,7 @@ export class DbStorage implements IStorage {
   }
 
   async checkScheduleOverlap(start: Date, end: Date, excludeId?: number): Promise<boolean> {
-    const conditions = [
-      lt(schedule.start, end),
-      gt(schedule.end, start)
-    ];
+    const conditions = [lt(schedule.start, end), gt(schedule.end, start)];
     if (excludeId !== undefined) {
       conditions.push(ne(schedule.id, excludeId));
     }
@@ -482,15 +474,15 @@ export async function saveDeviceStatus(data: {
 
 export async function getDashboardSummary() {
   const allScreens = await storage.getAllScreens();
-  
-  const activeDevices = allScreens.filter(s => s.isOnline === true).length;
-  const offlineDevices = allScreens.filter(s => s.isOnline === false || s.isOnline === null).length;
+
+  const activeDevices = allScreens.filter((s) => s.isOnline === true).length;
+  const offlineDevices = allScreens.filter((s) => s.isOnline === false || s.isOnline === null).length;
 
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
 
   const allLogs = await db.select().from(deviceStatusLogs);
-  const todaysImpressions = allLogs.filter(log => {
+  const todaysImpressions = allLogs.filter((log) => {
     if (!log.createdAt) return false;
     return new Date(log.createdAt) >= todayStart;
   }).length;
@@ -507,7 +499,7 @@ export async function getDashboardSummary() {
 
 export async function listDevicesForDashboard() {
   const allScreens = await storage.getAllScreens();
-  return allScreens.map(screen => ({
+  return allScreens.map((screen) => ({
     id: screen.id.toString(),
     name: screen.name,
     location_branch: screen.location,
@@ -520,7 +512,7 @@ export async function getDashboardAlerts() {
   const allScreens = await storage.getAllScreens();
 
   allScreens
-    .filter(d => !d.isOnline)
+    .filter((d) => !d.isOnline)
     .forEach((d, idx) => {
       alerts.push({
         id: idx + 1,
@@ -549,28 +541,30 @@ export async function listAllDevicesWithStatus() {
     location_branch: d.location,
     is_online: d.isOnline ?? false,
     last_seen: d.lastSeen,
-    status: latest[d.deviceId || '']?.status || d.status || "unknown",
-    current_content_id: latest[d.deviceId || '']?.currentContentId || d.currentContent || null,
-    temperature: latest[d.deviceId || '']?.temperature || d.temperature || null,
-    free_storage: latest[d.deviceId || '']?.freeStorage || d.freeStorage || null,
-    battery_level: latest[d.deviceId || '']?.batteryLevel || d.batteryLevel || null,
-    signal_strength: latest[d.deviceId || '']?.signalStrength || d.signalStrength || null,
-    latitude: latest[d.deviceId || '']?.latitude || d.latitude || null,
-    longitude: latest[d.deviceId || '']?.longitude || d.longitude || null,
-    errors: latest[d.deviceId || '']?.errors || d.errors || [],
-    last_status_at: latest[d.deviceId || '']?.createdAt || null,
+    status: latest[d.deviceId || ""]?.status || d.status || "unknown",
+    current_content_id: latest[d.deviceId || ""]?.currentContentId || d.currentContent || null,
+    temperature: latest[d.deviceId || ""]?.temperature || d.temperature || null,
+    free_storage: latest[d.deviceId || ""]?.freeStorage || d.freeStorage || null,
+    battery_level: latest[d.deviceId || ""]?.batteryLevel || d.batteryLevel || null,
+    signal_strength: latest[d.deviceId || ""]?.signalStrength || d.signalStrength || null,
+    latitude: latest[d.deviceId || ""]?.latitude || d.latitude || null,
+    longitude: latest[d.deviceId || ""]?.longitude || d.longitude || null,
+    errors: latest[d.deviceId || ""]?.errors || d.errors || [],
+    last_status_at: latest[d.deviceId || ""]?.createdAt || null,
   }));
 }
 
 export async function getDeviceDetails(deviceId: string) {
   const device = await db.select().from(screens).where(eq(screens.id, parseInt(deviceId))).limit(1);
-  
+
   if (!device || device.length === 0) {
     throw new Error("Device not found");
   }
 
-  const allLogs = await db.select().from(deviceStatusLogs)
-    .where(eq(deviceStatusLogs.deviceId, device[0].deviceId || ''))
+  const allLogs = await db
+    .select()
+    .from(deviceStatusLogs)
+    .where(eq(deviceStatusLogs.deviceId, device[0].deviceId || ""))
     .orderBy(deviceStatusLogs.createdAt);
 
   const history = allLogs.slice(-50).reverse();
@@ -583,22 +577,22 @@ export async function getDeviceDetails(deviceId: string) {
   };
 }
 
-export async function createDevice(input: {
-  name: string;
-  location_branch?: string;
-}) {
+export async function createDevice(input: { name: string; location_branch?: string }) {
   const randomPart = Math.random().toString(36).substring(2, 10).toUpperCase();
   const deviceId = `DEV-${randomPart}`;
 
   const { name, location_branch } = input;
 
-  const [created] = await db.insert(screens).values({
-    deviceId,
-    name,
-    location: location_branch || "Unknown",
-    status: "offline",
-    isOnline: false,
-  }).returning();
+  const [created] = await db
+    .insert(screens)
+    .values({
+      deviceId,
+      name,
+      location: location_branch || "Unknown",
+      status: "offline",
+      isOnline: false,
+    })
+    .returning();
 
   return {
     id: created.id.toString(),
@@ -608,13 +602,13 @@ export async function createDevice(input: {
   };
 }
 
-export async function createNotification({ 
-  userId = null, 
-  type, 
-  level, 
-  title, 
-  message, 
-  deviceId = null 
+export async function createNotification({
+  userId = null,
+  type,
+  level,
+  title,
+  message,
+  deviceId = null,
 }: {
   userId?: string | null;
   type: string;
@@ -630,11 +624,7 @@ export async function createNotification({
   );
 }
 
-export async function queueCommand(
-  deviceId: string, 
-  command: string, 
-  params: Record<string, any> | null
-) {
+export async function queueCommand(deviceId: string, command: string, params: Record<string, any> | null) {
   const payload = { command, ...params };
   await pool.query(
     `INSERT INTO device_commands (device_id, payload, executed)
@@ -651,13 +641,13 @@ export async function getQueuedCommands(deviceId: string) {
      ORDER BY created_at ASC`,
     [deviceId]
   );
-  
+
   return rows.map((row: any) => {
     const { command, ...rest } = row.payload || {};
     return {
       id: row.id,
       command: command || "UNKNOWN",
-      payload: Object.keys(rest).length > 0 ? rest : null
+      payload: Object.keys(rest).length > 0 ? rest : null,
     };
   });
 }
