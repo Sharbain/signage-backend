@@ -321,6 +321,8 @@ export async function registerRoutes(
     if (p.startsWith("/auth/")) return next();
     if (p === "/ping") return next();
     if (p === "/screens/register") return next();
+    // Device claim (pairing) should not require user JWT
+    if (p === "/device/claim") return next();
     if (p.startsWith("/device/")) return next();
     return authenticateJWT(req, res, next);
   });
@@ -900,6 +902,41 @@ export async function registerRoutes(
   // =====================================================
   // COMMAND HISTORY FOR DEVICE (CMS)
   // =====================================================
+  // ✅ ADMIN (dashboard) - JWT protected
+  app.get(
+    "/api/admin/devices/:deviceId/commands/history",
+    authenticateJWT,
+    requireRole("admin", "manager"),
+    async (req, res) => {
+      const { deviceId } = req.params;
+
+      try {
+        const result = await pool.query(
+          `
+          SELECT
+            id,
+            payload,
+            sent,
+            executed,
+            executed_at,
+            created_at
+          FROM device_commands
+          WHERE device_id = $1
+          ORDER BY created_at DESC
+          LIMIT 50
+          `,
+          [deviceId],
+        );
+
+        return res.json(result.rows);
+      } catch (err) {
+        console.error("Admin command history error:", err);
+        return res.status(500).json({ error: "failed_to_fetch_command_history" });
+      }
+    },
+  );
+
+  // Device-scoped history (device auth) - keep for backwards compatibility
   app.get("/api/device/:deviceId/commands/history", async (req, res) => {
     const { deviceId } = req.params;
 
@@ -1124,14 +1161,10 @@ export async function registerRoutes(
     }
   });
 
-  app.get("/api/devices/:id/token", (req, res) => {
-    const deviceId = req.params.id;
-
-    const token = jwt.sign({ device_id: deviceId }, process.env.JWT_SECRET!, {
-      expiresIn: "365d",
-    });
-
-    res.json({ token });
+  // ❌ Disabled: minting long-lived device JWTs is insecure.
+  // Use pairing + api_key_hash instead (see /api/device/claim + admin pairing endpoint).
+  app.get("/api/devices/:id/token", authenticateJWT, requireRole("admin"), (_req, res) => {
+    return res.status(410).json({ error: "disabled" });
   });
 
   app.post("/api/device/login", async (req, res) => {
@@ -1434,103 +1467,116 @@ const existingUser = await storage.getUserByEmail(email);
     }
   });
 
-      // ✅ CMS → DEVICE COMMAND (NORMALIZED FORMAT)
-      app.post("/api/device/:deviceId/command", async (req, res) => {
-        const { deviceId } = req.params;
-        const { type, value, state, duration } = req.body;
+      // ✅ ADMIN → DEVICE COMMAND (JWT protected)
+      // This endpoint is used by the dashboard (NOT by the device).
+      app.post(
+        "/api/admin/devices/:deviceId/command",
+        authenticateJWT,
+        requireRole("admin", "manager"),
+        async (req, res) => {
+          const { deviceId } = req.params;
+          const { type, value, state, duration } = req.body;
 
-        if (!type) {
-          return res.status(400).json({ error: "Command type is required" });
-        }
+          if (!type) {
+            return res.status(400).json({ error: "Command type is required" });
+          }
 
-        let payload: any;
+          let payload: any;
 
-        switch (type) {
-          case "SET_VOLUME":
-            payload = { type: "volume", value };
-            break;
+          switch (type) {
+            case "SET_VOLUME":
+              payload = { type: "volume", value };
+              break;
 
-          case "SET_BRIGHTNESS":
-            payload = { type: "brightness", value };
-            break;
+            case "SET_BRIGHTNESS":
+              payload = { type: "brightness", value };
+              break;
 
-          case "MUTE":
-            payload = { type: "volume", value: 0 };
-            break;
+            case "MUTE":
+              payload = { type: "volume", value: 0 };
+              break;
 
-          case "UNMUTE":
-            payload = { type: "unmute" };
-            break;
+            case "UNMUTE":
+              payload = { type: "unmute" };
+              break;
 
-          case "SCREEN_OFF":
-            payload = { type: "screen", state: "off" };
-            break;
+            case "SCREEN_OFF":
+              payload = { type: "screen", state: "off" };
+              break;
 
-          case "SCREEN_ON":
-            payload = { type: "screen", state: "on" };
-            break;
+            case "SCREEN_ON":
+              payload = { type: "screen", state: "on" };
+              break;
 
-          case "REBOOT":
-            payload = { type: "reboot" };
-            break;
+            case "REBOOT":
+              payload = { type: "reboot" };
+              break;
 
-          case "SCREENSHOT":
-            payload = { type: "screenshot" };
-            break;
+            case "SCREENSHOT":
+              payload = { type: "screenshot" };
+              break;
 
-          case "RECORD":
-            payload = { type: "record", duration: duration || 10 };
-            break;
+            case "RECORD":
+              payload = { type: "record", duration: duration || 10 };
+              break;
 
-          case "PLAY_CONTENT":
-            const { contentId, contentName, contentUrl, contentType } = req.body;
-            payload = { 
-              type: "play_content", 
-              contentId,
-              contentName,
-              contentUrl,
-              contentType
-            };
-            // Also update the device's current content
-            await pool.query(
-              `UPDATE screens SET current_content = $1, current_content_name = $2 WHERE device_id = $3`,
-              [contentId, contentName, deviceId]
-            );
-            break;
+            case "PLAY_CONTENT": {
+              const { contentId, contentName, contentUrl, contentType } = req.body;
+              payload = {
+                type: "play_content",
+                contentId,
+                contentName,
+                contentUrl,
+                contentType,
+              };
+              // Also update the device's current content
+              await pool.query(
+                `UPDATE screens SET current_content = $1, current_content_name = $2 WHERE device_id = $3`,
+                [contentId, contentName, deviceId],
+              );
+              break;
+            }
 
-          case "PING":
-            const { message } = req.body;
-            payload = { type: "ping", message: message || "This Device is being pingged" };
-            break;
+            case "PING": {
+              const { message } = req.body;
+              payload = { type: "ping", message: message || "This Device is being pinged" };
+              break;
+            }
 
-          case "SHUTDOWN":
-            payload = { type: "shutdown" };
-            break;
+            case "SHUTDOWN":
+              payload = { type: "shutdown" };
+              break;
 
-          case "POWER_ON":
-            payload = { type: "power_on" };
-            break;
+            case "POWER_ON":
+              payload = { type: "power_on" };
+              break;
 
-          default:
-            return res.status(400).json({ error: "Unknown command type" });
-        }
+            default:
+              return res.status(400).json({ error: "Unknown command type" });
+          }
 
-        const result = await pool.query(
-          `
-          INSERT INTO device_commands (device_id, payload, sent, executed)
-          VALUES ($1, $2, false, false)
-          RETURNING id, created_at
-          `,
-          [deviceId, JSON.stringify(payload)]
-        );
+          const result = await pool.query(
+            `
+            INSERT INTO device_commands (device_id, payload, sent, executed)
+            VALUES ($1, $2, false, false)
+            RETURNING id, created_at
+            `,
+            [deviceId, JSON.stringify(payload)],
+          );
 
-        const command = result.rows[0];
-        res.json({ 
-          success: true, 
-          commandId: command.id,
-          createdAt: command.created_at,
-          queued: payload 
-        });
+          const command = result.rows[0];
+          return res.json({
+            success: true,
+            commandId: command.id,
+            createdAt: command.created_at,
+            queued: payload,
+          });
+        },
+      );
+
+      // ❌ Deprecated (was incorrectly protected by device auth)
+      app.post("/api/device/:deviceId/command", (_req, res) => {
+        return res.status(410).json({ error: "moved_to_/api/admin/devices/:deviceId/command" });
       });
 
   app.post("/api/device/:deviceId/heartbeat", async (req, res) => {
