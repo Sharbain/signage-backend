@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcrypt";
+import crypto from "crypto";
 import { pool } from "../db";
 
 // NOTE:
@@ -32,6 +33,10 @@ function getAuthHeader(req: Request): string | undefined {
   const h = req.headers.authorization;
   if (!h) return undefined;
   return Array.isArray(h) ? h[0] : h;
+}
+
+function sha256Hex(input: string): string {
+  return crypto.createHash("sha256").update(input).digest("hex");
 }
 
 export async function authenticateJWT(req: Request, res: Response, next: NextFunction) {
@@ -83,19 +88,71 @@ export async function authenticateDevice(req: Request, res: Response, next: Next
   }
 
   try {
-    const { rows } = await pool.query(
-      `SELECT id, device_id, password
+    const tokenHash = sha256Hex(deviceToken);
+
+    // --------------------------------------------------
+    // Fast-path (v2): sha256 token lookup with an index
+    // NOTE: If the DB hasn't been migrated yet (missing column),
+    // we gracefully fall back to the legacy bcrypt path.
+    // --------------------------------------------------
+    try {
+      const fast = await pool.query(
+        `SELECT id, device_id, api_key_hash, revoked_at
+         FROM screens
+         WHERE device_id = $1
+           AND api_key_hash = $2
+         LIMIT 1`,
+        [deviceId, tokenHash],
+      );
+
+      if (fast.rows.length) {
+        const screen = fast.rows[0] as { id: number; device_id: string; revoked_at: string | null };
+        if (screen.revoked_at) return res.status(401).json({ error: "device_revoked" });
+        req.device = { deviceId: screen.device_id, screenId: screen.id };
+        return next();
+      }
+    } catch (e: any) {
+      // 42703 = undefined_column (Postgres)
+      if (String(e?.code) !== "42703") throw e;
+    }
+
+    // --------------------------------------------------
+    // Legacy-path (v1): bcrypt compare against screens.password
+    // On success, auto-migrate to v2 fields (api_key_hash).
+    // --------------------------------------------------
+    const legacy = await pool.query(
+      `SELECT id, device_id, password, api_key_hash, revoked_at
        FROM screens
-       WHERE device_id = $1`,
+       WHERE device_id = $1
+       LIMIT 1`,
       [deviceId],
     );
-    if (!rows.length) return res.status(401).json({ error: "unknown_device" });
+    if (!legacy.rows.length) return res.status(401).json({ error: "unknown_device" });
 
-    const screen = rows[0] as { id: number; device_id: string; password: string | null };
-    if (!screen.password) return res.status(401).json({ error: "device_token_not_set" });
+    const screen = legacy.rows[0] as {
+      id: number;
+      device_id: string;
+      password: string | null;
+      api_key_hash: string | null;
+      revoked_at: string | null;
+    };
+
+    if (screen.revoked_at) return res.status(401).json({ error: "device_revoked" });
+    if (!screen.password) return res.status(401).json({ error: "invalid_device_token" });
 
     const ok = await bcrypt.compare(deviceToken, screen.password);
     if (!ok) return res.status(401).json({ error: "invalid_device_token" });
+
+    // Auto-migrate on successful legacy auth.
+    await pool.query(
+      `UPDATE screens
+       SET api_key_hash = $2,
+           api_key_last4 = $3,
+           password = NULL,
+           rotated_at = NOW()
+       WHERE id = $1`,
+      [screen.id, tokenHash, deviceToken.slice(-4)],
+    );
 
     req.device = { deviceId: screen.device_id, screenId: screen.id };
     return next();
@@ -125,6 +182,28 @@ export async function authenticateUserOrDevice(req: Request, res: Response, next
     if (!deviceToken) return res.status(401).json({ error: "missing_device_token" });
 
     try {
+      const tokenHash = sha256Hex(deviceToken);
+
+      // Fast-path: api_key_hash lookup (no deviceId required for /uploads)
+      try {
+        const fast = await pool.query(
+          `SELECT id, device_id, revoked_at
+           FROM screens
+           WHERE api_key_hash = $1
+           LIMIT 1`,
+          [tokenHash],
+        );
+        if (fast.rows.length) {
+          const screen = fast.rows[0] as { id: number; device_id: string; revoked_at: string | null };
+          if (screen.revoked_at) return res.status(401).json({ error: "device_revoked" });
+          req.device = { deviceId: screen.device_id, screenId: screen.id };
+          return next();
+        }
+      } catch (e: any) {
+        if (String(e?.code) !== "42703") throw e;
+      }
+
+      // Legacy fallback (temporary): scan a bounded number of legacy bcrypt tokens.
       const { rows } = await pool.query(
         `SELECT id, device_id, password
          FROM screens
@@ -133,6 +212,17 @@ export async function authenticateUserOrDevice(req: Request, res: Response, next
       );
       for (const r of rows as Array<{ id: number; device_id: string; password: string }>) {
         if (await bcrypt.compare(deviceToken, r.password)) {
+          // Auto-migrate to v2 on first successful legacy use.
+          await pool.query(
+            `UPDATE screens
+             SET api_key_hash = $2,
+                 api_key_last4 = $3,
+                 password = NULL,
+                 rotated_at = NOW()
+             WHERE id = $1`,
+            [r.id, tokenHash, deviceToken.slice(-4)],
+          );
+
           req.device = { deviceId: r.device_id, screenId: r.id };
           return next();
         }
