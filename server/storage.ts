@@ -310,7 +310,7 @@ export class DbStorage implements IStorage {
     return result.length > 0;
   }
 
-  async updateGroupIcon(id: string, iconUrl: string | null): Promise<void>; {
+  async updateGroupIcon(id: string, iconUrl: string | null): Promise<void>; 
     await db.update(deviceGroups).set({ iconUrl }).where(eq(deviceGroups.id, id));
   }
 
