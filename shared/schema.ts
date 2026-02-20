@@ -42,6 +42,17 @@ export const screens = pgTable("screens", {
   longitude: doublePrecision("longitude"),
   errors: jsonb("errors").$type<string[]>().default([]),
   password: text("password"),
+  // Device auth v2 (fast token lookup + rotation/revocation)
+  apiKeyHash: text("api_key_hash"),
+  apiKeyLast4: text("api_key_last4"),
+  revokedAt: timestamp("revoked_at"),
+  rotatedAt: timestamp("rotated_at"),
+  tokenVersion: integer("token_version").notNull().default(1),
+  // One-time pairing (optional, used for secure provisioning)
+  pairingCodeHash: text("pairing_code_hash"),
+  pairingExpiresAt: timestamp("pairing_expires_at"),
+  // Optional mTLS binding (enterprise mode)
+  mtlsFingerprint: text("mtls_fingerprint"),
   groupId: uuid("group_id"),
   screenshot: text("screenshot"),
   screenshotAt: timestamp("screenshot_at"),
