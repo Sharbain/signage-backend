@@ -1578,7 +1578,52 @@ const existingUser = await storage.getUserByEmail(email);
       app.post("/api/device/:deviceId/command", (_req, res) => {
         return res.status(410).json({ error: "moved_to_/api/admin/devices/:deviceId/command" });
       });
+  // 🔽 ADD THIS BLOCK HERE
+app.post("/api/device/activate", async (req, res) => {
+  try {
+    const pairingCode = String(req.body?.pairingCode || "").trim().toUpperCase();
+    if (!pairingCode) return res.status(400).json({ error: "pairing_code_required" });
 
+    const result = await pool.query(
+      `SELECT device_id, pairing_expires_at
+       FROM screens
+       WHERE pairing_code = $1`,
+      [pairingCode]
+    );
+
+    const row = result.rows[0];
+    if (!row) return res.status(404).json({ error: "invalid_pairing_code" });
+
+    if (!row.pairing_expires_at || new Date(row.pairing_expires_at).getTime() < Date.now()) {
+      return res.status(401).json({ error: "pairing_code_expired" });
+    }
+
+    await pool.query(
+      `UPDATE screens
+       SET pairing_code = NULL,
+           pairing_expires_at = NULL,
+           is_online = true,
+           last_seen = NOW()
+       WHERE device_id = $1`,
+      [row.device_id]
+    );
+
+    const deviceToken = jwt.sign(
+      { deviceId: row.device_id, type: "device" },
+      JWT_SECRET,
+      { expiresIn: "30d" }
+    );
+
+    return res.json({ deviceId: row.device_id, deviceToken });
+  } catch (e) {
+    console.error("activate error:", e);
+    return res.status(500).json({ error: "activate_failed" });
+  }
+});
+
+// 🔽 EXISTING ROUTE (leave untouched)
+  
+app.post("/api/device/:deviceId/heartbeat", async (req, res) => {
   app.post("/api/device/:deviceId/heartbeat", async (req, res) => {
     const { deviceId } = req.params;
     const {
