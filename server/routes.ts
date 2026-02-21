@@ -1623,7 +1623,6 @@ app.post("/api/device/activate", async (req, res) => {
 
 // 🔽 EXISTING ROUTE (leave untouched)
   
-app.post("/api/device/:deviceId/heartbeat", async (req, res) => {
   app.post("/api/device/:deviceId/heartbeat", async (req, res) => {
     const { deviceId } = req.params;
     const {
