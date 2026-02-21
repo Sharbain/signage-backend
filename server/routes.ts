@@ -3793,7 +3793,7 @@ app.post("/api/device/activate", async (req, res) => {
         let zones: any[] = [];
 
         if (resolvedTemplate) {
-          playlist = await storage.getPlaylistItemsByTemplate(
+          playlist = await storage.getTemplatePlaylistItems(
             resolvedTemplate.id,
           );
           // Parse zones from template layout JSON
@@ -4017,19 +4017,19 @@ app.post("/api/device/activate", async (req, res) => {
       });
 
       // Recursive function to build nested tree
-      function buildNode(
-        id: string,
-        text: string,
-        type: string,
-        icon?: string,
-      ): any {
-        const node: any = { id, text, type };
-        if (icon) node.icon = icon;
-        const children = childrenByParent[id];
-        if (children && children.length > 0) {
-          node.children = children.map((c: any) =>
-            buildNode(c.id, c.text, c.type, c.icon),
-          );
+      const buildNode = (
+  id: string,
+  text: string,
+  type: string,
+  icon?: string,
+): any => {
+  const node: any = { id, text, type };
+  if (icon) node.icon = icon;
+  const children = childrenByParent[id];
+  if (children && children.length > 0) {
+    node.children = children.map((c: any) =>
+      buildNode(c.id, c.text, c.type, c.icon),
+    );
           node.state = { opened: true };
         }
         return node;
@@ -4082,40 +4082,34 @@ app.post("/api/device/activate", async (req, res) => {
   });
 
   app.post("/api/schedule", async (req, res) => {
-    try {
-      const { templateId, deviceId, groupId, startTime, endTime } = req.body;
-      if (!templateId)
-        return res.status(400).json({ error: "templateId is required" });
-      if (!startTime || !endTime)
-        return res
-          .status(400)
-          .json({ error: "startTime and endTime are required" });
+  try {
+    const { templateId, deviceId, groupId, startTime, endTime } = req.body;
 
-      const schedule = await storage.createSchedule({
-        templateId,
-        deviceId: deviceId || null,
-        groupId: groupId || null,
-        startTime,
-        endTime,
-      });
-      res.json({ message: "Schedule assigned", data: schedule });
-    } catch (error) {
-      res.status(500).json({ error: "Failed to create schedule" });
+    if (!templateId) {
+      return res.status(400).json({ error: "templateId is required" });
     }
-  });
+    if (!startTime || !endTime) {
+      return res.status(400).json({ error: "startTime and endTime are required" });
+    }
 
-  app.delete("/api/schedule/:id", async (req, res) => {
-    try {
-      const { id } = req.params;
-      const deleted = await storage.deleteSchedule(id);
-      if (!deleted) {
-        return res.status(404).json({ error: "Schedule not found" });
-      }
-      res.json({ message: "Schedule deleted" });
-    } catch (error) {
-      res.status(500).json({ error: "Failed to delete schedule" });
+    // Must provide either deviceId or groupId
+    if (!deviceId && !groupId) {
+      return res.status(400).json({ error: "deviceId or groupId is required" });
     }
-  });
+
+    const schedule = await storage.createSchedule({
+      templateId,
+      targetType: deviceId ? "device" : "group",
+      targetId: deviceId ?? groupId,
+      startTime,
+      endTime,
+    });
+
+    res.json({ message: "Schedule assigned", data: schedule });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to create schedule" });
+  }
+});
 
   // Content Schedule Routes (for FullCalendar)
   app.get("/api/schedule/list", async (_req, res) => {

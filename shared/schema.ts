@@ -58,6 +58,16 @@ export const screens = pgTable("screens", {
   screenshotAt: timestamp("screenshot_at"),
   thumbnail: text("thumbnail"),
   assignedTemplateId: uuid("assigned_template_id"),
+  apiKeyHash: text("api_key_hash"),
+  apiKeyLast4: text("api_key_last4"),
+  revokedAt: timestamp("revoked_at"),
+  rotatedAt: timestamp("rotated_at"),
+  tokenVersion: integer("token_version").default(0),
+  pairingCodeHash: text("pairing_code_hash"),
+  mtlsFingerprint: text("mtls_fingerprint"),
+
+  pairingCode: text("pairing_code"),
+  pairingExpiresAt: timestamp("pairing_expires_at"),
 });
 
 export const insertScreenSchema = createInsertSchema(screens).omit({
