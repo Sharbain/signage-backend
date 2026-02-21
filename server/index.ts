@@ -151,6 +151,141 @@ app.use((req, res, next) => {
 (async () => {
   await registerRoutes(httpServer, app);
 
+  /* --------------------------------------------------
+     PLAYER DISPLAY ROUTES (Android WebView / TV Browser)
+     - /display shows a helpful message
+     - /display/:screenId renders a simple player page
+  -------------------------------------------------- */
+  app.get("/display", (_req, res) => {
+    res
+      .status(200)
+      .send(
+        `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Lumina Display</title>
+    <style>
+      body{margin:0;background:#000;color:#fff;font-family:system-ui,Segoe UI,Roboto,Arial}
+      .wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center}
+      .card{max-width:560px}
+      code{background:#111;padding:2px 6px;border-radius:6px}
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <h1>Lumina Player</h1>
+        <p>This endpoint expects a screen/device id.</p>
+        <p>Try: <code>/display/&lt;id&gt;</code></p>
+        <p>If you scanned a QR but still see this, the Android app is not passing the id.</p>
+      </div>
+    </div>
+  </body>
+</html>`,
+      );
+  });
+
+  app.get("/display/:screenId", (req, res) => {
+    const screenId = encodeURIComponent(req.params.screenId);
+
+    res
+      .status(200)
+      .send(
+        `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Lumina Display ${screenId}</title>
+    <style>
+      html,body{height:100%;margin:0;background:#000}
+      #root{height:100%;display:flex;align-items:center;justify-content:center;color:#fff;font-family:system-ui,Segoe UI,Roboto,Arial}
+      img,video{max-width:100%;max-height:100%;object-fit:contain}
+    </style>
+  </head>
+  <body>
+    <div id="root">Loading…</div>
+    <script>
+      const root = document.getElementById("root");
+      const screenId = "${screenId}";
+      let idx = 0;
+      let items = [];
+
+      async function fetchContent(){
+        // Preferred: scoped content by screenId
+        const r1 = await fetch("/api/content/" + screenId).catch(() => null);
+        if (r1 && r1.ok) return await r1.json();
+
+        // Fallback: global content
+        const r2 = await fetch("/api/content").catch(() => null);
+        if (r2 && r2.ok) return await r2.json();
+
+        throw new Error("Failed to load content");
+      }
+
+      function renderItem(item){
+        root.innerHTML = "";
+        if(!item){
+          root.textContent = "No content";
+          return;
+        }
+
+        const url = item.url || item.src || item.path;
+        const type = (item.type || item.mime || "").toLowerCase();
+
+        // Video
+        if(type.includes("video")){
+          const v = document.createElement("video");
+          v.src = url;
+          v.autoplay = true;
+          v.muted = true;
+          v.loop = false;
+          v.playsInline = true;
+          v.onended = next;
+          root.appendChild(v);
+          v.play().catch(() => {});
+          return;
+        }
+
+        // Image default
+        const img = document.createElement("img");
+        img.src = url;
+        img.onload = () => setTimeout(next, ((item.duration ?? 10) * 1000));
+        img.onerror = () => setTimeout(next, 2000);
+        root.appendChild(img);
+      }
+
+      function next(){
+        if(!items.length){
+          root.textContent = "No content";
+          return;
+        }
+        idx = (idx + 1) % items.length;
+        renderItem(items[idx]);
+      }
+
+      (async function start(){
+        try{
+          items = await fetchContent();
+          if(!Array.isArray(items)) items = [];
+          idx = 0;
+          renderItem(items[0]);
+        }catch(e){
+          root.textContent = "Player error: " + (e && e.message ? e.message : String(e));
+          setTimeout(() => location.reload(), 5000);
+        }
+      })();
+    </script>
+  </body>
+</html>`,
+      );
+  });
+
+  /* --------------------------------------------------
+     HEALTH / ROOT
+  -------------------------------------------------- */
   app.get("/", (_req, res) => {
     res.send("Signage API running");
   });
