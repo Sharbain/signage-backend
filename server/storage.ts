@@ -577,11 +577,21 @@ export async function getDeviceDetails(deviceId: string) {
   };
 }
 
+function generatePairingCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // avoids O/0 and I/1 confusion
+  const chunk = (n: number) =>
+    Array.from({ length: n }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
+  return `LUM-${chunk(4)}-${chunk(4)}`;
+}
+
 export async function createDevice(input: { name: string; location_branch?: string }) {
   const randomPart = Math.random().toString(36).substring(2, 10).toUpperCase();
   const deviceId = `DEV-${randomPart}`;
 
   const { name, location_branch } = input;
+
+  const pairingCode = generatePairingCode();
+  const pairingExpiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
 
   const [created] = await db
     .insert(screens)
@@ -591,6 +601,10 @@ export async function createDevice(input: { name: string; location_branch?: stri
       location: location_branch || "Unknown",
       status: "offline",
       isOnline: false,
+
+      // NEW: typed pairing
+      pairingCode,
+      pairingExpiresAt,
     })
     .returning();
 
@@ -599,6 +613,10 @@ export async function createDevice(input: { name: string; location_branch?: stri
     device_id: deviceId,
     name,
     location_branch: location_branch || null,
+
+    // NEW: return pairing details to CMS
+    pairing_code: created.pairingCode,
+    pairing_expires_at: created.pairingExpiresAt,
   };
 }
 
