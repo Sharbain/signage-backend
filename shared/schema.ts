@@ -49,7 +49,7 @@ export const screens = pgTable("screens", {
   rotatedAt: timestamp("rotated_at"),
   tokenVersion: integer("token_version").notNull().default(1),
   // One-time pairing (optional, used for secure provisioning)
-  pairingCodeHash: text("pairing_code_hash"),
+  pairingCodeHash: text("pairing_code"),
   pairingExpiresAt: timestamp("pairing_expires_at"),
   // Optional mTLS binding (enterprise mode)
   mtlsFingerprint: text("mtls_fingerprint"),
