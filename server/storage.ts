@@ -325,6 +325,74 @@ export class DbStorage implements IStorage {
   async updateGroupIcon(id: string, iconUrl: string | null): Promise<void> {
     await db.update(deviceGroups).set({ iconUrl }).where(eq(deviceGroups.id, id));
   }
+  
+    // -----------------------------
+  // Groups (required by routes.ts)
+  // -----------------------------
+
+  async getGroupById(id: string): Promise<any | null> {
+    const { rows } = await pool.query(
+      `select * from groups where id = $1 limit 1`,
+      [id],
+    );
+    return rows[0] ?? null;
+  }
+
+  async getGroupByNameAndParent(
+    name: string,
+    parentId: string | null,
+  ): Promise<any | null> {
+    const { rows } = await pool.query(
+      `select * from groups where name = $1 and parent_id is not distinct from $2 limit 1`,
+      [name, parentId],
+    );
+    return rows[0] ?? null;
+  }
+
+  async getGroupByNameAndParentExcluding(
+    name: string,
+    parentId: string | null,
+    excludeId: string,
+  ): Promise<any | null> {
+    const { rows } = await pool.query(
+      `select * from groups where name = $1 and parent_id is not distinct from $2 and id <> $3 limit 1`,
+      [name, parentId, excludeId],
+    );
+    return rows[0] ?? null;
+  }
+
+  async updateGroupName(id: string, name: string): Promise<void> {
+    await pool.query(`update groups set name = $1 where id = $2`, [name, id]);
+  }
+
+  async updateGroupParent(id: string, parentId: string | null): Promise<void> {
+    await pool.query(`update groups set parent_id = $1 where id = $2`, [
+      parentId,
+      id,
+    ]);
+  }
+
+  async getDeviceGroupId(deviceId: string): Promise<string | null> {
+    const { rows } = await pool.query(
+      `select group_id from device_group_map where device_id = $1 limit 1`,
+      [deviceId],
+    );
+    return rows[0]?.group_id ?? null;
+  }
+
+  async getGroupAncestorChain(groupId: string): Promise<any[]> {
+    const chain: any[] = [];
+    let currentId: string | null = groupId;
+
+    for (let i = 0; i < 50 && currentId; i++) {
+      const g = await this.getGroupById(currentId);
+      if (!g) break;
+      chain.push(g);
+      currentId = g.parent_id ?? null;
+    }
+
+    return chain;
+  }
 
   async updateGroupTemplate(id: string, templateId: string | null): Promise<void> {
     await db.update(deviceGroups).set({ assignedTemplate: templateId }).where(eq(deviceGroups.id, id));
@@ -602,8 +670,7 @@ export async function createDevice(input: { name: string; location_branch?: stri
       status: "offline",
       isOnline: false,
 
-      // NEW: typed pairing
-      pairingCode,
+      // Pairing (store expiry only for now — do NOT store raw code)
       pairingExpiresAt,
     })
     .returning();
@@ -614,8 +681,7 @@ export async function createDevice(input: { name: string; location_branch?: stri
     name,
     location_branch: location_branch || null,
 
-    // NEW: return pairing details to CMS
-    pairing_code: created.pairingCode,
+    // Pairing response (no raw code stored/returned here)
     pairing_expires_at: created.pairingExpiresAt,
   };
 }
