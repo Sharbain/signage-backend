@@ -207,77 +207,7 @@ app.use((req, res, next) => {
   </head>
   <body>
     <div id="root">Loading…</div>
-    <script>
-      const root = document.getElementById("root");
-      const screenId = "${screenId}";
-      let idx = 0;
-      let items = [];
-
-      async function fetchContent(){
-        // Preferred: scoped content by screenId
-        const r1 = await fetch("/api/content/" + screenId).catch(() => null);
-        if (r1 && r1.ok) return await r1.json();
-
-        // Fallback: global content
-        const r2 = await fetch("/api/content").catch(() => null);
-        if (r2 && r2.ok) return await r2.json();
-
-        throw new Error("Failed to load content");
-      }
-
-      function renderItem(item){
-        root.innerHTML = "";
-        if(!item){
-          root.textContent = "No content";
-          return;
-        }
-
-        const url = item.url || item.src || item.path;
-        const type = (item.type || item.mime || "").toLowerCase();
-
-        // Video
-        if(type.includes("video")){
-          const v = document.createElement("video");
-          v.src = url;
-          v.autoplay = true;
-          v.muted = true;
-          v.loop = false;
-          v.playsInline = true;
-          v.onended = next;
-          root.appendChild(v);
-          v.play().catch(() => {});
-          return;
-        }
-
-        // Image default
-        const img = document.createElement("img");
-        img.src = url;
-        img.onload = () => setTimeout(next, ((item.duration ?? 10) * 1000));
-        img.onerror = () => setTimeout(next, 2000);
-        root.appendChild(img);
-      }
-
-      function next(){
-        if(!items.length){
-          root.textContent = "No content";
-          return;
-        }
-        idx = (idx + 1) % items.length;
-        renderItem(items[idx]);
-      }
-
-      (async function start(){
-        try{
-          items = await fetchContent();
-          if(!Array.isArray(items)) items = [];
-          idx = 0;
-          renderItem(items[0]);
-        }catch(e){
-          root.textContent = "Player error: " + (e && e.message ? e.message : String(e));
-          setTimeout(() => location.reload(), 5000);
-        }
-      })();
-    </script>
+    <script src="/display/app.js" defer></script>
   </body>
 </html>`,
       );
