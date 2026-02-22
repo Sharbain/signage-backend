@@ -1,4 +1,5 @@
 import express, { type Request, Response, NextFunction } from "express";
+import path from "path";
 import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
@@ -7,6 +8,7 @@ import { registerRoutes } from "./routes";
 import { createServer } from "http";
 
 const app = express();
+app.use("/display", express.static(path.join(process.cwd(), "public/display")));
 const httpServer = createServer(app);
 
 /* --------------------------------------------------
