@@ -38,7 +38,9 @@ app.use((req, res, next) => {
 app.use(helmet());
 
 /* --------------------------------------------------
-   CORS (PRODUCTION-SAFE + VERCEL AUTO SUPPORT)
+   CORS (PRODUCTION-SAFE)
+   - In production: only allow origins in CORS_ORIGIN
+   - In non-production: allow all (for local dev)
 -------------------------------------------------- */
 
 // Comma-separated allowlist from environment
@@ -52,12 +54,9 @@ const corsMiddleware = cors({
     // Allow non-browser clients (curl, server-to-server)
     if (!origin) return cb(null, true);
 
-    // Allow ALL Vercel deployments automatically
-    if (origin.endsWith(".vercel.app")) {
-      return cb(null, true);
-    }
-
-    // If no env origins defined
+    // If no env origins defined:
+    // - allow all in non-production (dev convenience)
+    // - block in production (secure default)
     if (corsOrigins.length === 0) {
       if (process.env.NODE_ENV !== "production") {
         return cb(null, true);
@@ -132,14 +131,14 @@ export function log(message: string, source = "express") {
 
 app.use((req, res, next) => {
   const start = Date.now();
-  const path = req.path;
+  const reqPath = req.path;
 
   res.on("finish", () => {
     const duration = Date.now() - start;
-    if (path.startsWith("/api")) {
+    if (reqPath.startsWith("/api")) {
       const requestId = (req as any).requestId;
       log(
-        `${req.method} ${path} ${res.statusCode} in ${duration}ms (rid=${requestId})`,
+        `${req.method} ${reqPath} ${res.statusCode} in ${duration}ms (rid=${requestId})`,
       );
     }
   });
@@ -208,7 +207,7 @@ app.use((req, res, next) => {
     </style>
   </head>
   <body>
-    <div id="root">Loading…</div>
+    <div id="root">Loading...</div>
     <script src="/display/app.js" defer></script>
   </body>
 </html>`,
