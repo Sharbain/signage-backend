@@ -557,6 +557,117 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
 
   app.use("/api/device/:deviceId", authenticateDevice);
 
+// =====================================================
+// CANONICAL DEVICE COMMAND ROUTES (DeviceKey required)
+// =====================================================
+
+app.get("/api/device/commands", authenticateDevice, async (req, res) => {
+  const deviceId = req.device?.deviceId;
+  if (!deviceId) return res.status(401).json({ error: "device_auth_required" });
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT id, payload, expires_at
+      FROM device_commands
+      WHERE device_id = $1
+        AND status = 'queued'
+        AND (expires_at IS NULL OR expires_at > NOW())
+      ORDER BY created_at ASC
+      LIMIT 20
+      `,
+      [deviceId],
+    );
+
+    if (result.rows.length > 0) {
+      const ids = result.rows.map((r: any) => r.id);
+      await pool.query(
+        `
+        UPDATE device_commands
+        SET status = 'delivered',
+            delivered_at = NOW(),
+            attempts = attempts + 1
+        WHERE id = ANY($1)
+        `,
+        [ids],
+      );
+    }
+
+    return res.json(
+      result.rows.map((r: any) => ({
+        id: String(r.id),
+        ...(typeof r.payload === "string" ? JSON.parse(r.payload) : r.payload),
+      })),
+    );
+  } catch (err) {
+    console.error("Device commands error:", err);
+    return res.json([]);
+  }
+});
+
+app.post("/api/device/commands/:commandId/ack", authenticateDevice, async (req, res) => {
+  const deviceId = req.device?.deviceId;
+  if (!deviceId) return res.status(401).json({ error: "device_auth_required" });
+
+  const { commandId } = req.params;
+
+  try {
+    const result = await pool.query(
+      `
+      UPDATE device_commands
+      SET status = 'acked',
+          acked_at = NOW()
+      WHERE id = $1 AND device_id = $2
+      RETURNING id
+      `,
+      [commandId, deviceId],
+    );
+
+    if (result.rowCount === 0) return res.status(404).json({ error: "Command not found" });
+    return res.json({ success: true, commandId });
+  } catch (err) {
+    console.error("ACK error:", err);
+    return res.status(500).json({ error: "Failed to acknowledge command" });
+  }
+});
+
+app.post("/api/device/commands/:commandId/result", authenticateDevice, async (req, res) => {
+  const deviceId = req.device?.deviceId;
+  if (!deviceId) return res.status(401).json({ error: "device_auth_required" });
+
+  const { commandId } = req.params;
+  const { status, output } = req.body ?? {};
+
+  if (status !== "succeeded" && status !== "failed") {
+    return res.status(400).json({ error: "status must be succeeded|failed" });
+  }
+
+  try {
+    await pool.query(
+      `
+      UPDATE device_commands
+      SET status = $3,
+          executed_at = NOW()
+      WHERE id = $1 AND device_id = $2
+      `,
+      [commandId, deviceId, status],
+    );
+
+    await pool.query(
+      `
+      INSERT INTO device_command_results (command_id, device_id, status, output)
+      VALUES ($1, $2, $3, $4)
+      `,
+      [commandId, deviceId, status, output ?? null],
+    );
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("result error:", err);
+    return res.status(500).json({ error: "failed_to_record_result" });
+  }
+});
+  
       // =====================================================
       // DASHBOARD SUMMARY
       // =====================================================
