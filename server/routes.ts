@@ -327,9 +327,7 @@ export async function registerRoutes(
     return authenticateJWT(req, res, next);
   });
 
-  // Device API must use device token when a specific deviceId is present
-// ✅ PUBLIC: Device activation must NOT require device token
-// ✅ PUBLIC: Device activation must NOT require device token
+ // ✅ PUBLIC: Device activation must NOT require device token
 app.post("/api/device/activate", async (req: Request, res: Response) => {
   try {
     const { pairingCode } = req.body as { pairingCode?: string };
@@ -338,15 +336,14 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "pairingCode required" });
     }
 
-    // Normalize: remove spaces, keep dashes, uppercase for display
+    // Normalize input (keep dashes; trim spaces)
     const normalized = pairingCode.trim();
-    const last4 = normalized.replace(/[^A-Za-z0-9]/g, "").slice(-4);
 
-    if (!last4 || last4.length < 4) {
+    if (normalized.length < 6) {
       return res.status(400).json({ error: "Invalid pairing code format" });
     }
 
-    // Narrow candidates by expiry + last4 (avoid scanning the whole table)
+    // ✅ Only scan currently-valid pairing sessions (small set)
     const { rows: candidates } = await pool.query(
       `
       SELECT
@@ -361,10 +358,9 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
       WHERE pairing_expires_at IS NOT NULL
         AND pairing_expires_at > NOW()
         AND pairing_code_hash IS NOT NULL
-        AND pairing_last4 = $1
-      LIMIT 25
+      ORDER BY pairing_expires_at ASC
+      LIMIT 50
       `,
-      [last4],
     );
 
     if (!candidates || candidates.length === 0) {
@@ -373,8 +369,12 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
 
     const now = new Date();
 
+    // ✅ Find match by bcrypt compare
     let matched: any | null = null;
     for (const c of candidates) {
+      // If locked, skip comparing (avoid giving attacker feedback)
+      if (c.pairing_locked_until && new Date(c.pairing_locked_until) > now) continue;
+
       const ok = await bcrypt.compare(normalized, c.pairing_code_hash);
       if (ok) {
         matched = c;
@@ -382,39 +382,10 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
       }
     }
 
-    // No match: if last4 maps to exactly one candidate, count as an attempt on that device
+    // No match: log generic failure (cannot safely attribute to a single device without last4 column)
     if (!matched) {
-      if (candidates.length === 1) {
-        const deviceId = candidates[0].device_id as string;
-        const attempts = Number(candidates[0].pairing_attempts ?? 0) + 1;
-
-        const shouldLock = attempts >= 5;
-        const lockedUntil = shouldLock ? new Date(Date.now() + 15 * 60 * 1000) : null;
-
-        await pool.query(
-          `
-          UPDATE screens
-          SET pairing_attempts = $2,
-              pairing_locked_until = COALESCE($3, pairing_locked_until),
-              pairing_status = 'unpaired'
-          WHERE device_id = $1
-          `,
-          [deviceId, attempts, lockedUntil],
-        );
-
-        await pool.query(
-          `
-          INSERT INTO device_pairing_logs (device_id, success, ip_address, reason)
-          VALUES ($1, false, $2, $3)
-          `,
-          [deviceId, req.ip ?? null, "invalid_code"],
-        );
-
-        if (shouldLock) {
-          return res.status(429).json({ error: "Too many attempts. Device pairing temporarily locked." });
-        }
-      }
-
+      // optional: log against a synthetic device id or skip DB logging
+      console.warn("Pairing failed: no matching code");
       return res.status(400).json({ error: "Invalid or expired pairing code" });
     }
 
@@ -449,8 +420,6 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
     const apiKeyHash = createHash("sha256").update(deviceKey).digest("hex");
     const apiKeyLast4 = deviceKey.slice(-4);
 
-    // Mark paired, clear one-time pairing hash+expiry, reset attempts/lock.
-    // Store api_key_hash/api_key_last4, and clear any legacy device_token if present.
     await pool.query(
       `
       UPDATE screens
@@ -466,7 +435,8 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
           pairing_locked_until = NULL,
           last_paired_at = NOW(),
           pairing_code_hash = NULL,
-          pairing_expires_at = NULL
+          pairing_expires_at = NULL,
+          pairing_code = NULL
       WHERE device_id = $1
       `,
       [deviceId, apiKeyHash, apiKeyLast4],
