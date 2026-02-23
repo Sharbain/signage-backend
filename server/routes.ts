@@ -362,6 +362,8 @@ export async function registerRoutes(
     if (p.startsWith("/auth/")) return next();
     if (p === "/ping") return next();
     if (p === "/screens/register") return next();
+    // ✅ Public display playlist endpoint (WebView player)
+    if (p.startsWith("/screens/") && p.endsWith("/playlist")) return next();
     // Device claim (pairing) should not require user JWT
     if (p === "/device/claim") return next();
     if (p.startsWith("/device/")) return next();
@@ -490,6 +492,26 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
     console.error("Device activate error:", err);
     return res.status(500).json({ error: "Internal server error" });
   }
+
+// --------------------------------------------------
+// Device: mint short-lived Display Token for WebView player
+// - Android calls this after pairing (DeviceKey auth)
+// - WebView loads /display/:deviceId?token=<displayToken>
+// - public/display/app.js sends Authorization: Bearer <token>
+// --------------------------------------------------
+app.post("/api/device/display-token", authenticateDevice, async (req: Request, res: Response) => {
+  try {
+    const deviceId = req.device?.deviceId;
+    if (!deviceId) return res.status(401).json({ error: "device_auth_required" });
+
+    const displayToken = jwt.sign({ deviceId, role: "display" }, JWT_SECRET, { expiresIn: "6h" });
+    return res.json({ deviceId, displayToken, token: displayToken, expiresInSeconds: 6 * 60 * 60 });
+  } catch (err) {
+    console.error("display-token failed:", err);
+    return res.status(500).json({ error: "display_token_failed" });
+  }
+});
+
 });
 
 
@@ -1765,6 +1787,13 @@ const existingUser = await storage.getUserByEmail(email);
     try {
       const { deviceId } = req.params;
 
+
+// Optional: if a Bearer token is provided, validate it as a display token bound to this deviceId.
+// If no token is provided, we still allow playback (legacy mode) because /display/app.js may not yet pass token.
+if (verifyDisplayTokenOrFail(req, res, deviceId)) {
+  return;
+}
+
       // Find screen by deviceId
       const screen = await storage.getScreenByDeviceId(deviceId);
       if (!screen) {
@@ -2205,6 +2234,13 @@ const existingUser = await storage.getUserByEmail(email);
   app.post("/api/device/:deviceId/status", async (req, res) => {
     try {
       const { deviceId } = req.params;
+
+
+// Optional: if a Bearer token is provided, validate it as a display token bound to this deviceId.
+// If no token is provided, we still allow playback (legacy mode) because /display/app.js may not yet pass token.
+if (verifyDisplayTokenOrFail(req, res, deviceId)) {
+  return;
+}
       const validatedData = deviceStatusSchema.parse(req.body);
 
       const screen = await storage.getScreenByDeviceId(deviceId);
@@ -4547,6 +4583,13 @@ const existingUser = await storage.getUserByEmail(email);
   app.get("/api/schedule/download/:deviceId", async (req, res) => {
     try {
       const { deviceId } = req.params;
+
+
+// Optional: if a Bearer token is provided, validate it as a display token bound to this deviceId.
+// If no token is provided, we still allow playback (legacy mode) because /display/app.js may not yet pass token.
+if (verifyDisplayTokenOrFail(req, res, deviceId)) {
+  return;
+}
 
       // Get schedules for this device
       const deviceSchedules = await storage.getSchedulesByDevice(deviceId);
