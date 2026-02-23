@@ -1432,21 +1432,59 @@ app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) =
     res.sendFile(screenshotPath);
   });
 
-  app.post("/api/devices", authenticateJWT, requireRole("admin"), async (req, res) => {
-    try {
-      const { name, location_branch } = req.body;
+app.post("/api/devices", authenticateJWT, requireRole("admin"), async (req, res) => {
+  try {
+    const { name, location_branch } = req.body;
 
-      if (!name) {
-        return res.status(400).json({ error: "Device name is required" });
-      }
-
-      const device = await createDevice({ name, location_branch });
-      return res.status(201).json({ device });
-    } catch (error) {
-      console.error("Error creating device:", error);
-      return res.status(500).json({ error: "Failed to create device" });
+    if (!name || typeof name !== "string") {
+      return res.status(400).json({ error: "Device name is required" });
     }
-  });
+
+    // 1) Create the device row
+    const device = await createDevice({ name, location_branch });
+
+    // 2) Mint pairing code immediately (so CMS can display it)
+    const expiresMinutesRaw = (req.body?.expiresMinutes ?? 15) as unknown;
+    const expiresMinutes =
+      typeof expiresMinutesRaw === "number"
+        ? expiresMinutesRaw
+        : Number.parseInt(String(expiresMinutesRaw), 10) || 15;
+
+    if (expiresMinutes < 1 || expiresMinutes > 24 * 60) {
+      return res.status(400).json({ error: "expiresMinutes must be between 1 and 1440" });
+    }
+
+    const pairingCode =
+      `LUM-${randomUUID().replace(/-/g, "").slice(0, 4).toUpperCase()}` +
+      `-${randomUUID().replace(/-/g, "").slice(0, 4).toUpperCase()}`;
+
+    // last4 based on alnum only, consistent with activate endpoint normalization
+    const pairingLast4 = pairingCode.replace(/[^A-Za-z0-9]/g, "").slice(-4);
+
+    const pairingCodeHash = await bcrypt.hash(pairingCode, 10);
+    const pairingExpiresAt = new Date(Date.now() + expiresMinutes * 60_000);
+
+    // IMPORTANT: your schema uses api_key_last4 (no pairing_last4 column)
+    await (storage as any).setDevicePairing(
+      device.device_id,
+      pairingCodeHash,
+      pairingExpiresAt,
+      pairingLast4
+    );
+
+    // 3) Return device + pairing fields the frontend expects
+    return res.status(201).json({
+      device: {
+        ...device,
+        pairing_code: pairingCode,
+        pairing_expires_at: pairingExpiresAt.toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error("Error creating device:", error);
+    return res.status(500).json({ error: "Failed to create device" });
+  }
+});
 
   // ❌ Disabled: minting long-lived device JWTs is insecure.
   // Use pairing + api_key_hash instead (see /api/device/claim + admin pairing endpoint).
