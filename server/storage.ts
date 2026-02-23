@@ -64,6 +64,24 @@ export interface IStorage {
   updateDeviceStatus(deviceId: string, status: DeviceStatusUpdate): Promise<Screen | undefined>;
   deleteScreen(id: number): Promise<boolean>;
 
+  // ✅ Secure pairing helpers
+  setDevicePairing(
+    deviceId: string,
+    pairingCodeHash: string,
+    pairingExpiresAt: Date,
+    pairingLast4: string,
+  ): Promise<void>;
+
+  getDevicePairing(deviceId: string): Promise<{
+    id: number;
+    deviceId: string;
+    pairingCodeHash: string | null;
+    pairingExpiresAt: Date | null;
+    tokenVersion?: number | null;
+  } | null>;
+
+  clearDevicePairing(deviceId: string): Promise<void>;
+
   getAllMedia(): Promise<Media[]>;
   getMedia(id: number): Promise<Media | undefined>;
   createMedia(media: InsertMedia): Promise<Media>;
@@ -164,7 +182,11 @@ export class DbStorage implements IStorage {
   }
 
   async updateScreen(id: number, screenUpdate: Partial<InsertScreen>): Promise<Screen | undefined> {
-    const result = await db.update(screens).set(screenUpdate as any).where(eq(screens.id, id)).returning();
+    const result = await db
+      .update(screens)
+      .set(screenUpdate as any)
+      .where(eq(screens.id, id))
+      .returning();
     return result[0];
   }
 
@@ -173,8 +195,12 @@ export class DbStorage implements IStorage {
     return result.length > 0;
   }
 
-  async updateDeviceStatus(deviceId: string, statusUpdate: DeviceStatusUpdate): Promise<Screen | undefined> {
+  async updateDeviceStatus(
+    deviceId: string,
+    statusUpdate: DeviceStatusUpdate
+  ): Promise<Screen | undefined> {
     const updateData: Record<string, unknown> = { lastSeen: new Date() };
+
     if (statusUpdate.status !== undefined) updateData.status = statusUpdate.status;
     if (statusUpdate.currentContent !== undefined) updateData.currentContent = statusUpdate.currentContent;
     if (statusUpdate.currentContentName !== undefined) updateData.currentContentName = statusUpdate.currentContentName;
@@ -194,6 +220,71 @@ export class DbStorage implements IStorage {
       .returning();
 
     return result[0];
+  }
+
+  // ⬇️ DO NOT add another class declaration below this.
+  // Secure Pairing (hash + expiry)
+  // -----------------------------
+
+  /**
+   * Stores hashed pairing code + expiry for a device.
+   * NOTE: never store the raw pairing code.
+   */
+  async setDevicePairing(
+    deviceId: string,
+    pairingCodeHash: string,
+    pairingExpiresAt: Date,
+    pairingLast4: string,
+  ): Promise<void> {
+    await db
+      .update(screens)
+      .set({
+        pairingCodeHash,
+        pairingExpiresAt,
+        apiKeyLast4: pairingLast4, // reuse existing column (last4) for display/debug
+        rotatedAt: new Date(),
+        // bump token version if your schema has it (safe even if undefined in DB? only if column exists)
+        // tokenVersion: sql`${(screens as any).tokenVersion} + 1`,
+      } as any)
+      .where(eq(screens.deviceId, deviceId));
+  }
+
+  /**
+   * Reads pairing info needed for claim verification.
+   */
+  async getDevicePairing(deviceId: string): Promise<{
+    id: number;
+    deviceId: string;
+    pairingCodeHash: string | null;
+    pairingExpiresAt: Date | null;
+    tokenVersion?: number | null;
+  } | null> {
+    const result = await db
+      .select({
+        id: screens.id,
+        deviceId: screens.deviceId,
+        pairingCodeHash: (screens as any).pairingCodeHash,
+        pairingExpiresAt: (screens as any).pairingExpiresAt,
+        tokenVersion: (screens as any).tokenVersion,
+      })
+      .from(screens)
+      .where(eq(screens.deviceId, deviceId))
+      .limit(1);
+
+    return (result[0] as any) ?? null;
+  }
+
+  /**
+   * Clears pairing so it becomes one-time use.
+   */
+  async clearDevicePairing(deviceId: string): Promise<void> {
+    await db
+      .update(screens)
+      .set({
+        pairingCodeHash: null,
+        pairingExpiresAt: null,
+      } as any)
+      .where(eq(screens.deviceId, deviceId));
   }
 
   async getAllMedia(): Promise<Media[]> {
@@ -324,6 +415,74 @@ export class DbStorage implements IStorage {
   // ✅ FIXED: proper method body, no stray semicolon
   async updateGroupIcon(id: string, iconUrl: string | null): Promise<void> {
     await db.update(deviceGroups).set({ iconUrl }).where(eq(deviceGroups.id, id));
+  }
+  
+    // -----------------------------
+  // Groups (required by routes.ts)
+  // -----------------------------
+
+  async getGroupById(id: string): Promise<any | null> {
+    const { rows } = await pool.query(
+      `select * from groups where id = $1 limit 1`,
+      [id],
+    );
+    return rows[0] ?? null;
+  }
+
+  async getGroupByNameAndParent(
+    name: string,
+    parentId: string | null,
+  ): Promise<any | null> {
+    const { rows } = await pool.query(
+      `select * from groups where name = $1 and parent_id is not distinct from $2 limit 1`,
+      [name, parentId],
+    );
+    return rows[0] ?? null;
+  }
+
+  async getGroupByNameAndParentExcluding(
+    name: string,
+    parentId: string | null,
+    excludeId: string,
+  ): Promise<any | null> {
+    const { rows } = await pool.query(
+      `select * from groups where name = $1 and parent_id is not distinct from $2 and id <> $3 limit 1`,
+      [name, parentId, excludeId],
+    );
+    return rows[0] ?? null;
+  }
+
+  async updateGroupName(id: string, name: string): Promise<void> {
+    await pool.query(`update groups set name = $1 where id = $2`, [name, id]);
+  }
+
+  async updateGroupParent(id: string, parentId: string | null): Promise<void> {
+    await pool.query(`update groups set parent_id = $1 where id = $2`, [
+      parentId,
+      id,
+    ]);
+  }
+
+  async getDeviceGroupId(deviceId: string): Promise<string | null> {
+    const { rows } = await pool.query(
+      `select group_id from device_group_map where device_id = $1 limit 1`,
+      [deviceId],
+    );
+    return rows[0]?.group_id ?? null;
+  }
+
+  async getGroupAncestorChain(groupId: string): Promise<any[]> {
+    const chain: any[] = [];
+    let currentId: string | null = groupId;
+
+    for (let i = 0; i < 50 && currentId; i++) {
+      const g = await this.getGroupById(currentId);
+      if (!g) break;
+      chain.push(g);
+      currentId = g.parent_id ?? null;
+    }
+
+    return chain;
   }
 
   async updateGroupTemplate(id: string, templateId: string | null): Promise<void> {
@@ -602,8 +761,7 @@ export async function createDevice(input: { name: string; location_branch?: stri
       status: "offline",
       isOnline: false,
 
-      // NEW: typed pairing
-      pairingCode,
+      // Pairing (store expiry only for now — do NOT store raw code)
       pairingExpiresAt,
     })
     .returning();
@@ -614,8 +772,7 @@ export async function createDevice(input: { name: string; location_branch?: stri
     name,
     location_branch: location_branch || null,
 
-    // NEW: return pairing details to CMS
-    pairing_code: created.pairingCode,
+    // Pairing response (no raw code stored/returned here)
     pairing_expires_at: created.pairingExpiresAt,
   };
 }
