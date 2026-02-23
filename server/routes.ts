@@ -361,7 +361,7 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
       WHERE pairing_expires_at IS NOT NULL
         AND pairing_expires_at > NOW()
         AND pairing_code_hash IS NOT NULL
-        AND api_key_last4 = $1
+        AND pairing_last4 = $1
       LIMIT 25
       `,
       [last4],
