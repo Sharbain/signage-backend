@@ -449,44 +449,49 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
 
       const deviceId = matched.device_id as string;
 
-      // Issue device token (scoped role = "device")
-      const deviceToken = jwt.sign({ deviceId, role: "device" }, JWT_SECRET, { expiresIn: "30d" });
+      // ✅ Issue DeviceKey (API key). Raw key returned ONCE; only hash stored in DB.
+const deviceKey = crypto.randomBytes(32).toString("base64url");
+const apiKeyHash = crypto.createHash("sha256").update(deviceKey).digest("hex");
+const apiKeyLast4 = deviceKey.slice(-4);
 
-      // Mark paired, clear one-time pairing hash+expiry, reset attempts/lock
-      await pool.query(
-        `
-        UPDATE screens
-        SET device_token = $2,
-            is_online = true,
-            last_seen = NOW(),
-            pairing_status = 'paired',
-            pairing_attempts = 0,
-            pairing_locked_until = NULL,
-            last_paired_at = NOW(),
-            pairing_code_hash = NULL,
-            pairing_expires_at = NULL
-        WHERE device_id = $1
-        `,
-        [deviceId, deviceToken],
-      );
+// Mark paired, clear one-time pairing hash+expiry, reset attempts/lock.
+// Store api_key_hash/api_key_last4, and clear any legacy device_token if present.
+await pool.query(
+  `
+  UPDATE screens
+  SET api_key_hash = $2,
+      api_key_last4 = $3,
+      device_token = NULL,
+      revoked_at = NULL,
+      rotated_at = NOW(),
+      is_online = true,
+      last_seen = NOW(),
+      pairing_status = 'paired',
+      pairing_attempts = 0,
+      pairing_locked_until = NULL,
+      last_paired_at = NOW(),
+      pairing_code_hash = NULL,
+      pairing_expires_at = NULL
+  WHERE device_id = $1
+  `,
+  [deviceId, apiKeyHash, apiKeyLast4],
+);
 
-      await pool.query(
-        `
-        INSERT INTO device_pairing_logs (device_id, success, ip_address, reason)
-        VALUES ($1, true, $2, $3)
-        `,
-        [deviceId, req.ip ?? null, "paired"],
-      );
+await pool.query(
+  `
+  INSERT INTO device_pairing_logs (device_id, success, ip_address, reason)
+  VALUES ($1, true, $2, $3)
+  `,
+  [deviceId, req.ip ?? null, "paired"],
+);
 
-      return res.json({
-        deviceToken,
-        deviceId,
-      });
-    } catch (err) {
-      console.error("Device activate error:", err);
-      return res.status(500).json({ error: "Internal server error" });
-    }
-  });
+// Return the raw key ONCE to the device.
+// Device will use: Authorization: DeviceKey <deviceKey>
+return res.json({
+  deviceKey,
+  deviceId,
+  authScheme: "DeviceKey",
+});
   // --------------------------------------------------
   // Admin: rotate/revoke pairing for an existing device
   // --------------------------------------------------
