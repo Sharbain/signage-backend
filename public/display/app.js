@@ -31,9 +31,10 @@
   }
 
   function getToken() {
-    // 1) URL query is best: /display/DEV-123?token=xxxx
+    // 1) URL query is best:
+    // /display/DEV-123?token=xxxx OR /display/DEV-123?t=xxxx
     const qs = new URLSearchParams(location.search || "");
-    const qToken = qs.get("token");
+    const qToken = qs.get("token") || qs.get("t");
     if (qToken && qToken.trim()) return qToken.trim();
 
     // 2) localStorage fallback (support multiple keys)
@@ -207,10 +208,13 @@
     } catch (e) {
       console.error("Playlist load failed:", e);
 
-      // Better message for auth failures
       const status = e && typeof e === "object" ? e.status : null;
+      const body = e && typeof e === "object" ? e.body : "";
+
       if (status === 401) {
-        setText("Unauthorized (401) — missing/invalid screen token");
+        setText(
+          `Unauthorized (401) — missing/invalid screen token${body ? " | " + body : ""}`,
+        );
       } else {
         setText("Failed to load playlist");
       }
