@@ -487,6 +487,70 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
       return res.status(500).json({ error: "Internal server error" });
     }
   });
+  // --------------------------------------------------
+  // Admin: rotate/revoke pairing for an existing device
+  // --------------------------------------------------
+  app.post(
+    "/api/devices/:deviceId/pairing/rotate",
+    authenticateJWT,
+    requireRole("admin"),
+    async (req: Request, res: Response) => {
+      try {
+        const deviceId = req.params.deviceId;
+        const expiresMinutesRaw = (req.body?.expiresMinutes ?? 15) as unknown;
+        const expiresMinutes =
+          typeof expiresMinutesRaw === "number"
+            ? expiresMinutesRaw
+            : Number.parseInt(String(expiresMinutesRaw), 10) || 15;
+
+        if (!deviceId) return res.status(400).json({ message: "deviceId is required" });
+        if (expiresMinutes < 1 || expiresMinutes > 24 * 60) {
+          return res.status(400).json({ message: "expiresMinutes must be between 1 and 1440" });
+        }
+
+        const pairingCode = `LUM-${randomUUID().replace(/-/g, "").slice(0, 4).toUpperCase()}-${randomUUID()
+          .replace(/-/g, "")
+          .slice(0, 4)
+          .toUpperCase()}`;
+
+        const pairingLast4 = pairingCode.slice(-4);
+        const pairingCodeHash = await bcrypt.hash(pairingCode, 10);
+        const pairingExpiresAt = new Date(Date.now() + expiresMinutes * 60_000);
+
+        await (storage as any).setDevicePairing(deviceId, pairingCodeHash, pairingExpiresAt, pairingLast4);
+
+        return res.json({
+          deviceId,
+          pairing_code: pairingCode,
+          pairing_expires_at: pairingExpiresAt.toISOString(),
+        });
+      } catch (err) {
+        console.error("pairing/rotate failed:", err);
+        return res.status(500).json({ message: "Failed to rotate pairing" });
+      }
+    },
+  );
+
+  app.post(
+    "/api/devices/:deviceId/pairing/revoke",
+    authenticateJWT,
+    requireRole("admin"),
+    async (req: Request, res: Response) => {
+      try {
+        const deviceId = req.params.deviceId;
+        if (!deviceId) return res.status(400).json({ message: "deviceId is required" });
+
+        await (storage as any).clearDevicePairing(deviceId);
+
+        return res.json({ deviceId, revoked: true });
+      } catch (err) {
+        console.error("pairing/revoke failed:", err);
+        return res.status(500).json({ message: "Failed to revoke pairing" });
+      }
+    },
+  );
+
+
 
   app.use("/api/device/:deviceId", authenticateDevice);
 
@@ -1305,7 +1369,7 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
     res.sendFile(screenshotPath);
   });
 
-  app.post("/api/devices", async (req, res) => {
+  app.post("/api/devices", authenticateJWT, requireRole("admin"), async (req, res) => {
     try {
       const { name, location_branch } = req.body;
 
