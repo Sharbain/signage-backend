@@ -1196,80 +1196,59 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
 
  
 
-        // DEVICE FETCHES ITS PENDING COMMANDS
-        app.get("/api/device/:deviceId/commands", async (req, res) => {
-          const { deviceId } = req.params;
+        // DEVICE FETCHES ITS PENDING COMMANDS (secure + status lifecycle)
+// IMPORTANT: authenticateDevice must be applied here because app.use() is lower in file.
+app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) => {
+  const { deviceId } = req.params;
 
-          try {
-            // 1️⃣ Fetch pending (unsent) commands
-            const result = await pool.query(
-              `
-              SELECT id, payload
-              FROM device_commands
-              WHERE device_id = $1
-                AND sent = false
-              ORDER BY created_at ASC
-              `,
-              [deviceId]
-            );
+  // Enforce: authenticated device can only fetch its own commands
+  if (!req.device || req.device.deviceId !== deviceId) {
+    return res.status(403).json({ error: "device_id_mismatch" });
+  }
 
-            // 2️⃣ Mark them as SENT (delivered to device)
-            if (result.rows.length > 0) {
-              const ids = result.rows.map((r) => r.id);
+  try {
+    // 1) Fetch queued commands (not expired)
+    const result = await pool.query(
+      `
+      SELECT id, payload, expires_at
+      FROM device_commands
+      WHERE device_id = $1
+        AND status = 'queued'
+        AND (expires_at IS NULL OR expires_at > NOW())
+      ORDER BY created_at ASC
+      LIMIT 20
+      `,
+      [deviceId],
+    );
 
-              await pool.query(
-                `
-                UPDATE device_commands
-                SET sent = true
-                WHERE id = ANY($1)
-                `,
-                [ids]
-              );
-            }
+    // 2) Mark them delivered
+    if (result.rows.length > 0) {
+      const ids = result.rows.map((r: any) => r.id);
 
-            // 3️⃣ Return payloads to device
-            res.json(
-              result.rows.map((r) => ({
-                id: r.id,
-                ...(typeof r.payload === "string"
-                  ? JSON.parse(r.payload)
-                  : r.payload),
-              }))
-            );
-          } catch (err) {
-            console.error("Error fetching commands:", err);
-            res.json([]);
-          }
-        });
-
-  // =====================================================
-  // DEVICE ACKNOWLEDGES COMMAND EXECUTION
-  // =====================================================
-  app.post("/api/device/:deviceId/commands/:commandId/ack", async (req, res) => {
-    const { deviceId, commandId } = req.params;
-
-    try {
-      const result = await pool.query(
+      await pool.query(
         `
         UPDATE device_commands
-        SET executed = true, executed_at = NOW()
-        WHERE id = $1 AND device_id = $2
-        RETURNING id
+        SET status = 'delivered',
+            delivered_at = NOW(),
+            attempts = attempts + 1
+        WHERE id = ANY($1)
         `,
-        [commandId, deviceId]
+        [ids],
       );
-
-      if (result.rowCount === 0) {
-        return res.status(404).json({ error: "Command not found" });
-      }
-
-      console.log(`Command ${commandId} acknowledged by device ${deviceId}`);
-      res.json({ success: true, commandId });
-    } catch (err) {
-      console.error("Error acknowledging command:", err);
-      res.status(500).json({ error: "Failed to acknowledge command" });
     }
-  });
+
+    // 3) Return payloads
+    return res.json(
+      result.rows.map((r: any) => ({
+        id: String(r.id),
+        ...(typeof r.payload === "string" ? JSON.parse(r.payload) : r.payload),
+      })),
+    );
+  } catch (err) {
+    console.error("Error fetching commands:", err);
+    return res.json([]);
+  }
+});
 
   // DEVICE UPLOADS SCREENSHOT
   app.post(
