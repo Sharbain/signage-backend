@@ -73,54 +73,31 @@ export async function authenticateJWT(req: Request, res: Response, next: NextFun
 }
 
 export async function authenticateDevice(req: Request, res: Response, next: NextFunction) {
-  const authHeader = getAuthHeader(req);
-  const headerToken = req.headers["x-device-token"];
-  const deviceToken =
-    (authHeader && authHeader.startsWith("Device ") ? authHeader.slice("Device ".length).trim() : undefined) ||
-    (typeof headerToken === "string" ? headerToken : Array.isArray(headerToken) ? headerToken[0] : undefined);
-
-  const deviceId = (req.params as any).deviceId || (req.body as any)?.deviceId;
-  if (!deviceId || typeof deviceId !== "string") {
-    return res.status(400).json({ error: "deviceId_required" });
-  }
-
-  // Strict allowlist to prevent path traversal and odd identifiers.
-  if (!/^[a-zA-Z0-9_-]{3,64}$/.test(deviceId)) {
-    return res.status(400).json({ error: "invalid_device_id" });
-  }
-
-  if (!deviceToken) {
-    return res.status(401).json({ error: "missing_device_token" });
-  }
-
-  try {
-    const tokenHash = sha256Hex(deviceToken);
-
-    // --------------------------------------------------
-    // Fast-path (v2): sha256 token lookup with an index
-    // NOTE: If the DB hasn't been migrated yet (missing column),
-    // we gracefully fall back to the legacy bcrypt path.
-    // --------------------------------------------------
+  // ✅ NEW: DeviceKey auth (no deviceId param required)
+  const rawDeviceKey = getDeviceKeyFromRequest(req);
+  if (rawDeviceKey) {
     try {
+      const tokenHash = sha256Hex(rawDeviceKey);
+
       const fast = await pool.query(
-        `SELECT id, device_id, api_key_hash, revoked_at
+        `SELECT id, device_id, revoked_at
          FROM screens
-         WHERE device_id = $1
-           AND api_key_hash = $2
+         WHERE api_key_hash = $1
          LIMIT 1`,
-        [deviceId, tokenHash],
+        [tokenHash],
       );
 
-      if (fast.rows.length) {
-        const screen = fast.rows[0] as { id: number; device_id: string; revoked_at: string | null };
-        if (screen.revoked_at) return res.status(401).json({ error: "device_revoked" });
-        req.device = { deviceId: screen.device_id, screenId: screen.id };
-        return next();
-      }
-    } catch (e: any) {
-      // 42703 = undefined_column (Postgres)
-      if (String(e?.code) !== "42703") throw e;
+      if (!fast.rows.length) return res.status(401).json({ error: "invalid_device_key" });
+      const screen = fast.rows[0] as { id: number; device_id: string; revoked_at: string | null };
+      if (screen.revoked_at) return res.status(401).json({ error: "device_revoked" });
+
+      req.device = { deviceId: screen.device_id, screenId: screen.id };
+      return next();
+    } catch (e) {
+      console.error("DeviceKey auth failed", e);
+      return res.status(500).json({ error: "device_auth_failed" });
     }
+  }
 
     // --------------------------------------------------
     // Legacy-path (v1): bcrypt compare against screens.password
