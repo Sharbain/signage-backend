@@ -329,57 +329,164 @@ export async function registerRoutes(
 
   // Device API must use device token when a specific deviceId is present
 // ✅ PUBLIC: Device activation must NOT require device token
-app.post("/api/device/activate", async (req, res) => {
-  try {
-    const pairingCode = String(req.body?.pairingCode || "")
-      .trim()
-      .toUpperCase();
+app.post("/api/device/activate", async (req: Request, res: Response) => {
+    try {
+      const { pairingCode } = req.body as { pairingCode?: string };
 
-    if (!pairingCode) {
-      return res.status(400).json({ error: "pairing_code_required" });
+      if (!pairingCode || typeof pairingCode !== "string") {
+        return res.status(400).json({ error: "pairingCode required" });
+      }
+
+      // Normalize: remove spaces, keep dashes, uppercase for display
+      const normalized = pairingCode.trim();
+      const last4 = normalized.replace(/[^A-Za-z0-9]/g, "").slice(-4);
+
+      if (!last4 || last4.length < 4) {
+        return res.status(400).json({ error: "Invalid pairing code format" });
+      }
+
+      // Narrow candidates by expiry + last4 (avoid scanning the whole table)
+      const { rows: candidates } = await pool.query(
+        `
+        SELECT
+          device_id,
+          pairing_code_hash,
+          pairing_expires_at,
+          pairing_status,
+          pairing_attempts,
+          pairing_locked_until,
+          revoked_at
+        FROM screens
+        WHERE pairing_expires_at IS NOT NULL
+          AND pairing_expires_at > NOW()
+          AND pairing_code_hash IS NOT NULL
+          AND api_key_last4 = $1
+        LIMIT 25
+        `,
+        [last4],
+      );
+
+      if (!candidates || candidates.length === 0) {
+        return res.status(400).json({ error: "Invalid or expired pairing code" });
+      }
+
+      const now = new Date();
+
+      // Reject immediately if any matching candidate is currently locked.
+      // (If multiple candidates share last4, locking one device shouldn't block others — so we only lock-check per matched device later.)
+      // We'll still perform compare, and if the matched device is locked we return a lock response.
+      let matched: any | null = null;
+      for (const c of candidates) {
+        // bcrypt compare against stored hash
+        const ok = await bcrypt.compare(normalized, c.pairing_code_hash);
+        if (ok) {
+          matched = c;
+          break;
+        }
+      }
+
+      // No match: if the last4 maps to exactly one candidate, treat as an attempt on that device (rate-limit brute force).
+      if (!matched) {
+        if (candidates.length === 1) {
+          const deviceId = candidates[0].device_id as string;
+          const attempts = Number(candidates[0].pairing_attempts ?? 0) + 1;
+
+          // Lock after 5 failed attempts for 15 minutes
+          const shouldLock = attempts >= 5;
+          const lockedUntil = shouldLock ? new Date(Date.now() + 15 * 60 * 1000) : null;
+
+          await pool.query(
+            `
+            UPDATE screens
+            SET pairing_attempts = $2,
+                pairing_locked_until = COALESCE($3, pairing_locked_until),
+                pairing_status = 'unpaired'
+            WHERE device_id = $1
+            `,
+            [deviceId, attempts, lockedUntil],
+          );
+
+          // Log failure
+          await pool.query(
+            `
+            INSERT INTO device_pairing_logs (device_id, success, ip_address, reason)
+            VALUES ($1, false, $2, $3)
+            `,
+            [deviceId, req.ip ?? null, "invalid_code"],
+          );
+
+          if (shouldLock) {
+            return res.status(429).json({ error: "Too many attempts. Device pairing temporarily locked." });
+          }
+        }
+
+        return res.status(400).json({ error: "Invalid or expired pairing code" });
+      }
+
+      // If device revoked, block pairing
+      if (matched.revoked_at) {
+        await pool.query(
+          `
+          INSERT INTO device_pairing_logs (device_id, success, ip_address, reason)
+          VALUES ($1, false, $2, $3)
+          `,
+          [matched.device_id, req.ip ?? null, "revoked"],
+        );
+        return res.status(403).json({ error: "Device revoked" });
+      }
+
+      // If locked, block
+      if (matched.pairing_locked_until && new Date(matched.pairing_locked_until) > now) {
+        await pool.query(
+          `
+          INSERT INTO device_pairing_logs (device_id, success, ip_address, reason)
+          VALUES ($1, false, $2, $3)
+          `,
+          [matched.device_id, req.ip ?? null, "locked"],
+        );
+        return res.status(429).json({ error: "Pairing locked. Try again later." });
+      }
+
+      const deviceId = matched.device_id as string;
+
+      // Issue device token (scoped role = "device")
+      const deviceToken = jwt.sign({ deviceId, role: "device" }, JWT_SECRET, { expiresIn: "30d" });
+
+      // Mark paired, clear one-time pairing hash+expiry, reset attempts/lock
+      await pool.query(
+        `
+        UPDATE screens
+        SET device_token = $2,
+            is_online = true,
+            last_seen = NOW(),
+            pairing_status = 'paired',
+            pairing_attempts = 0,
+            pairing_locked_until = NULL,
+            last_paired_at = NOW(),
+            pairing_code_hash = NULL,
+            pairing_expires_at = NULL
+        WHERE device_id = $1
+        `,
+        [deviceId, deviceToken],
+      );
+
+      await pool.query(
+        `
+        INSERT INTO device_pairing_logs (device_id, success, ip_address, reason)
+        VALUES ($1, true, $2, $3)
+        `,
+        [deviceId, req.ip ?? null, "paired"],
+      );
+
+      return res.json({
+        deviceToken,
+        deviceId,
+      });
+    } catch (err) {
+      console.error("Device activate error:", err);
+      return res.status(500).json({ error: "Internal server error" });
     }
-
-    const result = await pool.query(
-      `SELECT device_id, pairing_expires_at
-       FROM screens
-       WHERE pairing_code = $1`,
-      [pairingCode]
-    );
-
-    const row = result.rows[0];
-    if (!row) return res.status(404).json({ error: "invalid_pairing_code" });
-
-    if (!row.pairing_expires_at || new Date(row.pairing_expires_at).getTime() < Date.now()) {
-      return res.status(401).json({ error: "pairing_code_expired" });
-    }
-
-    // Clear code after successful activation
-    await pool.query(
-      `UPDATE screens
-       SET pairing_code = NULL,
-           pairing_expires_at = NULL,
-           is_online = true,
-           last_seen = NOW()
-       WHERE device_id = $1`,
-      [row.device_id]
-    );
-
-    const deviceToken = jwt.sign(
-      { deviceId: row.device_id, type: "device" },
-      JWT_SECRET,
-      { expiresIn: "30d" }
-    );
-
-    // ✅ IMPORTANT: return snake_case to match Android DTO (device_id/device_token)
-    return res.json({
-      device_id: row.device_id,
-      device_token: deviceToken,
-    });
-  } catch (e) {
-    console.error("activate error:", e);
-    return res.status(500).json({ error: "activate_failed" });
-  }
-});
+  });
 
   app.use("/api/device/:deviceId", authenticateDevice);
 
