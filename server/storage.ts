@@ -64,6 +64,24 @@ export interface IStorage {
   updateDeviceStatus(deviceId: string, status: DeviceStatusUpdate): Promise<Screen | undefined>;
   deleteScreen(id: number): Promise<boolean>;
 
+  // ✅ Secure pairing helpers
+  setDevicePairing(
+    deviceId: string,
+    pairingCodeHash: string,
+    pairingExpiresAt: Date,
+    pairingLast4: string,
+  ): Promise<void>;
+
+  getDevicePairing(deviceId: string): Promise<{
+    id: number;
+    deviceId: string;
+    pairingCodeHash: string | null;
+    pairingExpiresAt: Date | null;
+    tokenVersion?: number | null;
+  } | null>;
+
+  clearDevicePairing(deviceId: string): Promise<void>;
+
   getAllMedia(): Promise<Media[]>;
   getMedia(id: number): Promise<Media | undefined>;
   createMedia(media: InsertMedia): Promise<Media>;
@@ -164,7 +182,11 @@ export class DbStorage implements IStorage {
   }
 
   async updateScreen(id: number, screenUpdate: Partial<InsertScreen>): Promise<Screen | undefined> {
-    const result = await db.update(screens).set(screenUpdate as any).where(eq(screens.id, id)).returning();
+    const result = await db
+      .update(screens)
+      .set(screenUpdate as any)
+      .where(eq(screens.id, id))
+      .returning();
     return result[0];
   }
 
@@ -173,8 +195,12 @@ export class DbStorage implements IStorage {
     return result.length > 0;
   }
 
-  async updateDeviceStatus(deviceId: string, statusUpdate: DeviceStatusUpdate): Promise<Screen | undefined> {
+  async updateDeviceStatus(
+    deviceId: string,
+    statusUpdate: DeviceStatusUpdate
+  ): Promise<Screen | undefined> {
     const updateData: Record<string, unknown> = { lastSeen: new Date() };
+
     if (statusUpdate.status !== undefined) updateData.status = statusUpdate.status;
     if (statusUpdate.currentContent !== undefined) updateData.currentContent = statusUpdate.currentContent;
     if (statusUpdate.currentContentName !== undefined) updateData.currentContentName = statusUpdate.currentContentName;
@@ -194,6 +220,71 @@ export class DbStorage implements IStorage {
       .returning();
 
     return result[0];
+  }
+
+  // ⬇️ DO NOT add another class declaration below this.
+  // Secure Pairing (hash + expiry)
+  // -----------------------------
+
+  /**
+   * Stores hashed pairing code + expiry for a device.
+   * NOTE: never store the raw pairing code.
+   */
+  async setDevicePairing(
+    deviceId: string,
+    pairingCodeHash: string,
+    pairingExpiresAt: Date,
+    pairingLast4: string,
+  ): Promise<void> {
+    await db
+      .update(screens)
+      .set({
+        pairingCodeHash,
+        pairingExpiresAt,
+        apiKeyLast4: pairingLast4, // reuse existing column (last4) for display/debug
+        rotatedAt: new Date(),
+        // bump token version if your schema has it (safe even if undefined in DB? only if column exists)
+        // tokenVersion: sql`${(screens as any).tokenVersion} + 1`,
+      } as any)
+      .where(eq(screens.deviceId, deviceId));
+  }
+
+  /**
+   * Reads pairing info needed for claim verification.
+   */
+  async getDevicePairing(deviceId: string): Promise<{
+    id: number;
+    deviceId: string;
+    pairingCodeHash: string | null;
+    pairingExpiresAt: Date | null;
+    tokenVersion?: number | null;
+  } | null> {
+    const result = await db
+      .select({
+        id: screens.id,
+        deviceId: screens.deviceId,
+        pairingCodeHash: (screens as any).pairingCodeHash,
+        pairingExpiresAt: (screens as any).pairingExpiresAt,
+        tokenVersion: (screens as any).tokenVersion,
+      })
+      .from(screens)
+      .where(eq(screens.deviceId, deviceId))
+      .limit(1);
+
+    return (result[0] as any) ?? null;
+  }
+
+  /**
+   * Clears pairing so it becomes one-time use.
+   */
+  async clearDevicePairing(deviceId: string): Promise<void> {
+    await db
+      .update(screens)
+      .set({
+        pairingCodeHash: null,
+        pairingExpiresAt: null,
+      } as any)
+      .where(eq(screens.deviceId, deviceId));
   }
 
   async getAllMedia(): Promise<Media[]> {
