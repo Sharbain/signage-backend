@@ -39,6 +39,12 @@ function sha256Hex(input: string): string {
   return crypto.createHash("sha256").update(input).digest("hex");
 }
 
+function getDeviceKeyFromRequest(req: Request): string | undefined {
+  const authHeader = getAuthHeader(req);
+  if (authHeader?.startsWith("DeviceKey ")) return authHeader.slice("DeviceKey ".length).trim();
+  return undefined;
+}
+
 export async function authenticateJWT(req: Request, res: Response, next: NextFunction) {
   const authHeader = getAuthHeader(req);
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
