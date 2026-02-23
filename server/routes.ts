@@ -58,6 +58,47 @@ if (!fs.existsSync(deviceThumbnailsDir)) {
   fs.mkdirSync(deviceThumbnailsDir, { recursive: true });
 }
 
+/* --------------------------------------------------
+   PAIRING HELPERS (DB SOURCE OF TRUTH)
+   - pairing_code is stored in plaintext ONLY to display once in the CMS.
+   - pairing_code_hash is what /api/device/activate verifies (bcrypt).
+-------------------------------------------------- */
+async function setDevicePairingDirect(deviceId: string, pairingCode: string, expiresAt: Date) {
+  const pairingCodeHash = await bcrypt.hash(pairingCode, 10);
+
+  await pool.query(
+    `
+    UPDATE screens
+    SET pairing_code = $2,
+        pairing_code_hash = $3,
+        pairing_expires_at = $4,
+        pairing_status = 'unpaired',
+        pairing_attempts = 0,
+        pairing_locked_until = NULL
+    WHERE device_id = $1
+    `,
+    [deviceId, pairingCode, pairingCodeHash, expiresAt],
+  );
+
+  return { pairingCode, pairingCodeHash, expiresAt };
+}
+
+async function clearDevicePairingDirect(deviceId: string) {
+  await pool.query(
+    `
+    UPDATE screens
+    SET pairing_code = NULL,
+        pairing_code_hash = NULL,
+        pairing_expires_at = NULL,
+        pairing_status = 'unpaired',
+        pairing_attempts = 0,
+        pairing_locked_until = NULL
+    WHERE device_id = $1
+    `,
+    [deviceId],
+  );
+}
+
 const frontendDir = path.join(process.cwd(), "frontend");
 
 const multerStorage = multer.diskStorage({
@@ -328,6 +369,8 @@ export async function registerRoutes(
   });
 
  // ✅ PUBLIC: Device activation must NOT require device token
+
+// ✅ PUBLIC: Device activation must NOT require device token
 app.post("/api/device/activate", async (req: Request, res: Response) => {
   try {
     const { pairingCode } = req.body as { pairingCode?: string };
@@ -336,12 +379,11 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "pairingCode required" });
     }
 
-    // Normalize input (keep dashes; trim spaces)
-    const normalized = pairingCode.trim();
-
-    if (normalized.length < 6) {
-      return res.status(400).json({ error: "Invalid pairing code format" });
-    }
+    // Normalize user input to match how codes are generated/stored
+    // - remove ALL whitespace
+    // - uppercase
+    // - keep dashes (bcrypt compare is exact)
+    const normalized = pairingCode.trim().replace(/\s+/g, "").toUpperCase();
 
     // ✅ Only scan currently-valid pairing sessions (small set)
     const { rows: candidates } = await pool.query(
@@ -359,7 +401,7 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
         AND pairing_expires_at > NOW()
         AND pairing_code_hash IS NOT NULL
       ORDER BY pairing_expires_at ASC
-      LIMIT 50
+      LIMIT 100
       `,
     );
 
@@ -382,9 +424,7 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
       }
     }
 
-    // No match: log generic failure (cannot safely attribute to a single device without last4 column)
     if (!matched) {
-      // optional: log against a synthetic device id or skip DB logging
       console.warn("Pairing failed: no matching code");
       return res.status(400).json({ error: "Invalid or expired pairing code" });
     }
@@ -401,18 +441,6 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
       return res.status(403).json({ error: "Device revoked" });
     }
 
-    // If locked, block
-    if (matched.pairing_locked_until && new Date(matched.pairing_locked_until) > now) {
-      await pool.query(
-        `
-        INSERT INTO device_pairing_logs (device_id, success, ip_address, reason)
-        VALUES ($1, false, $2, $3)
-        `,
-        [matched.device_id, req.ip ?? null, "locked"],
-      );
-      return res.status(429).json({ error: "Pairing locked. Try again later." });
-    }
-
     const deviceId = matched.device_id as string;
 
     // ✅ Issue DeviceKey (API key). Raw key returned ONCE; only hash stored in DB.
@@ -420,12 +448,12 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
     const apiKeyHash = createHash("sha256").update(deviceKey).digest("hex");
     const apiKeyLast4 = deviceKey.slice(-4);
 
+    // Mark paired, clear one-time pairing hash+expiry, reset attempts/lock
     await pool.query(
       `
       UPDATE screens
       SET api_key_hash = $2,
           api_key_last4 = $3,
-          device_token = NULL,
           revoked_at = NULL,
           rotated_at = NOW(),
           is_online = true,
@@ -434,9 +462,9 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
           pairing_attempts = 0,
           pairing_locked_until = NULL,
           last_paired_at = NOW(),
+          pairing_code = NULL,
           pairing_code_hash = NULL,
-          pairing_expires_at = NULL,
-          pairing_code = NULL
+          pairing_expires_at = NULL
       WHERE device_id = $1
       `,
       [deviceId, apiKeyHash, apiKeyLast4],
@@ -450,17 +478,22 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
       [deviceId, req.ip ?? null, "paired"],
     );
 
+    // Return BOTH camelCase and snake_case to keep old clients working
     return res.json({
-      deviceKey,
       deviceId,
+      deviceKey,
       authScheme: "DeviceKey",
+      device_id: deviceId,
+      device_token: deviceKey,
     });
   } catch (err) {
     console.error("Device activate error:", err);
     return res.status(500).json({ error: "Internal server error" });
   }
 });
-  // --------------------------------------------------
+
+
+// --------------------------------------------------
   // Admin: rotate/revoke pairing for an existing device
   // --------------------------------------------------
   app.post(
@@ -485,18 +518,33 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
           .replace(/-/g, "")
           .slice(0, 4)
           .toUpperCase()}`;
+            const pairingExpiresAt = new Date(Date.now() + expiresMinutes * 60_000);
 
-        const pairingLast4 = pairingCode.slice(-4);
-        const pairingCodeHash = await bcrypt.hash(pairingCode, 10);
-        const pairingExpiresAt = new Date(Date.now() + expiresMinutes * 60_000);
+        
+        const expiresAt = new Date(Date.now() + expiresMinutes * 60_000);
 
-        await (storage as any).setDevicePairing(deviceId, pairingCodeHash, pairingExpiresAt, pairingLast4);
+        // Store pairing code + hash in DB so CMS can display it once
+        await setDevicePairingDirect(deviceId, pairingCode, expiresAt);
+
+        // Optional: if you want rotation to force a re-pair, clear existing device key:
+        await pool.query(
+          `
+          UPDATE screens
+          SET api_key_hash = NULL,
+              api_key_last4 = NULL
+          WHERE device_id = $1
+          `,
+          [deviceId],
+        );
 
         return res.json({
           deviceId,
           pairing_code: pairingCode,
-          pairing_expires_at: pairingExpiresAt.toISOString(),
+          pairingCode,
+          pairing_expires_at: expiresAt.toISOString(),
+          pairingExpiresAt: expiresAt.toISOString(),
         });
+
       } catch (err) {
         console.error("pairing/rotate failed:", err);
         return res.status(500).json({ message: "Failed to rotate pairing" });
@@ -513,9 +561,8 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
         const deviceId = req.params.deviceId;
         if (!deviceId) return res.status(400).json({ message: "deviceId is required" });
 
-        await (storage as any).clearDevicePairing(deviceId);
-
-        return res.json({ deviceId, revoked: true });
+        await clearDevicePairingDirect(deviceId);
+return res.json({ deviceId, revoked: true });
       } catch (err) {
         console.error("pairing/revoke failed:", err);
         return res.status(500).json({ message: "Failed to revoke pairing" });
@@ -1463,21 +1510,17 @@ app.post("/api/devices", authenticateJWT, requireRole("admin"), async (req, res)
 
     const pairingCodeHash = await bcrypt.hash(pairingCode, 10);
     const pairingExpiresAt = new Date(Date.now() + expiresMinutes * 60_000);
+    // Store pairing code + hash in DB so CMS can display it once
+    await setDevicePairingDirect(device.device_id, pairingCode, pairingExpiresAt);
 
-    // IMPORTANT: your schema uses api_key_last4 (no pairing_last4 column)
-    await (storage as any).setDevicePairing(
-      device.device_id,
-      pairingCodeHash,
-      pairingExpiresAt,
-      pairingLast4
-    );
-
-    // 3) Return device + pairing fields the frontend expects
+// 3) Return device + pairing fields the frontend expects
     return res.status(201).json({
       device: {
         ...device,
         pairing_code: pairingCode,
+        pairingCode,
         pairing_expires_at: pairingExpiresAt.toISOString(),
+        pairingExpiresAt: pairingExpiresAt.toISOString(),
       },
     });
   } catch (error) {
