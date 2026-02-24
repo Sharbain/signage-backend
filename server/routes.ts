@@ -1777,96 +1777,127 @@ const existingUser = await storage.getUserByEmail(email);
     }
   });
 
-  // Get playlist content for a device by deviceId (ULTRA-SAFE)
+  // Get playlist content for a device by deviceId (ASSIGNMENT-BASED, SAFE)
 app.get("/api/screens/:deviceId/playlist", async (req, res) => {
   const { deviceId } = req.params;
 
   try {
-    // Optional: if a Bearer token is provided, validate it as a display token bound to this deviceId.
-    // If no token is provided, we still allow playback (legacy mode) because /display/app.js may not yet pass token.
+    // (Optional token check can remain if you have it)
     if (verifyDisplayTokenOrFail(req, res, deviceId)) return;
 
-    // Find screen by deviceId
-    const screen = await storage.getScreenByDeviceId(deviceId);
-    if (!screen) {
+    // 1) find the screen
+    const screenRes = await pool.query(
+      `
+      SELECT id, device_id, name
+      FROM screens
+      WHERE device_id = $1 OR id::text = $1
+      LIMIT 1
+      `,
+      [deviceId]
+    );
+
+    if (screenRes.rowCount === 0) {
       return res.status(404).json({ error: "Device not found" });
     }
 
-    // Update last seen timestamp
-    await storage.updateScreen(screen.id, {
-      lastSeen: new Date(),
-      status: "online",
-    });
+    const screen = screenRes.rows[0];
 
-    // ---- ULTRA-SAFE MEDIA QUERY (no Drizzle dependency) ----
-    // We query information_schema to know which columns exist,
-    // then build a SELECT that won't crash if columns are missing.
-    const colsRes = await pool.query(
+    // 2) find the most recent playlist assignment for that screen
+    // NOTE: your table is `playlist_assignments` (from your DB screenshot)
+    const assignRes = await pool.query(
       `
-      SELECT column_name
-      FROM information_schema.columns
-      WHERE table_schema = 'public' AND table_name = 'media'
-      `
+      SELECT playlist_id
+      FROM playlist_assignments
+      WHERE screen_id = $1
+      ORDER BY created_at DESC NULLS LAST, id DESC
+      LIMIT 1
+      `,
+      [screen.id]
     );
 
-    const cols = new Set<string>(colsRes.rows.map((r: any) => r.column_name));
-
-    // required-ish columns (id/name/type/url) – if any are missing, we still avoid 500 and return empty playlist
-    const hasId = cols.has("id");
-    const hasName = cols.has("name");
-    const hasType = cols.has("type");
-    const hasUrl = cols.has("url");
-    const hasDuration = cols.has("duration");
-
-    if (!hasId || !hasName || !hasType || !hasUrl) {
-      // DB schema mismatch: don't crash playback, return empty playlist with info
+    // No assignment => empty playlist (player shows "No content assigned")
+    if (assignRes.rowCount === 0) {
       return res.json({
-        screen: {
-          id: screen.id,
-          deviceId: screen.deviceId,
-          name: screen.name,
-          resolution: screen.resolution,
-        },
+        screen: { id: screen.id, deviceId: screen.device_id, name: screen.name },
         playlist: [],
         refreshInterval: 60,
-        warning: "media table schema missing required columns (id/name/type/url)",
+      });
+    }
+
+    const playlistId = assignRes.rows[0].playlist_id;
+
+    // 3) pull items in that playlist
+    // playlist_items table exists (your DB screenshot)
+    const itemsRes = await pool.query(
+      `
+      SELECT
+        pi.id,
+        pi.media_id,
+        pi.duration,
+        pi.order_index
+      FROM playlist_items pi
+      WHERE pi.playlist_id = $1
+      ORDER BY pi.order_index ASC NULLS LAST, pi.id ASC
+      `,
+      [playlistId]
+    );
+
+    if (itemsRes.rowCount === 0) {
+      return res.json({
+        screen: { id: screen.id, deviceId: screen.device_id, name: screen.name },
+        playlist: [],
+        refreshInterval: 60,
+        warning: "playlist has no items",
+      });
+    }
+
+    // 4) join to media to get url/type/name
+    // media table exists (your DB screenshot)
+    const mediaIds = itemsRes.rows.map((r: any) => r.media_id).filter(Boolean);
+
+    if (mediaIds.length === 0) {
+      return res.json({
+        screen: { id: screen.id, deviceId: screen.device_id, name: screen.name },
+        playlist: [],
+        refreshInterval: 60,
+        warning: "playlist items missing media_id",
       });
     }
 
     const mediaRes = await pool.query(
       `
-      SELECT
-        id,
-        name,
-        type,
-        url
-        ${hasDuration ? ", duration" : ""}
+      SELECT id, name, type, url
       FROM media
-      ORDER BY id DESC
-      `
+      WHERE id = ANY($1::int[])
+      `,
+      [mediaIds]
     );
 
-    const playlist = mediaRes.rows.map((item: any) => ({
-      id: item.id,
-      type: item.type,
-      url: item.url,
-      name: item.name,
-      duration: hasDuration ? (item.duration ?? 10) : 10,
-    }));
+    const mediaMap = new Map<number, any>();
+    for (const m of mediaRes.rows) mediaMap.set(Number(m.id), m);
+
+    const playlist = itemsRes.rows
+      .map((it: any) => {
+        const m = mediaMap.get(Number(it.media_id));
+        if (!m) return null;
+        return {
+          id: String(it.id),
+          type: m.type,
+          url: m.url,
+          name: m.name,
+          duration: Number(it.duration ?? 10),
+        };
+      })
+      .filter(Boolean);
 
     return res.json({
-      screen: {
-        id: screen.id,
-        deviceId: screen.deviceId,
-        name: screen.name,
-        resolution: screen.resolution,
-      },
+      screen: { id: screen.id, deviceId: screen.device_id, name: screen.name },
       playlist,
       refreshInterval: 300,
     });
   } catch (error) {
     console.error("Playlist fetch error:", error);
-    // SaaS-grade: never hard-fail playback if DB has issues
+    // never 500 the player
     return res.status(200).json({
       screen: { deviceId },
       playlist: [],
