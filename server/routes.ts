@@ -58,32 +58,6 @@ if (!fs.existsSync(deviceThumbnailsDir)) {
   fs.mkdirSync(deviceThumbnailsDir, { recursive: true });
 }
 
-// Default/fallback content (shown when a device has no playlist yet)
-const defaultsDir = path.join(process.cwd(), "uploads", "defaults");
-if (!fs.existsSync(defaultsDir)) {
-  fs.mkdirSync(defaultsDir, { recursive: true });
-}
-
-const fallbackLogoStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, defaultsDir),
-  filename: (_req, file, cb) => {
-    // Keep stable filename so devices can cache it
-    cb(null, `fallback-logo${path.extname(file.originalname) || ".png"}`);
-  },
-});
-
-const fallbackLogoUpload = multer({
-  storage: fallbackLogoStorage,
-  limits: { fileSize: 10 * 1024 * 1024 },
-  fileFilter: (_req, file, cb) => {
-    const allowed = /jpeg|jpg|png|webp|gif/;
-    const ext = allowed.test(path.extname(file.originalname).toLowerCase());
-    const mime = /image\//.test(file.mimetype);
-    if (ext && mime) cb(null, true);
-    else cb(new Error("Only image files allowed for fallback logo"));
-  },
-});
-
 /* --------------------------------------------------
    PAIRING HELPERS (DB SOURCE OF TRUTH)
    - pairing_code is stored in plaintext ONLY to display once in the CMS.
@@ -320,8 +294,9 @@ const pendingCommands: {
   }>;
 } = {};
 
-// NOTE: We store last screenshot/recording paths in DB columns (screens.last_screenshot / last_recording)
-// so they survive restarts and work across multiple instances.
+// Track last uploaded screenshot/recording per device
+const lastScreenshot: { [deviceId: string]: string } = {};
+const lastRecording: { [deviceId: string]: string } = {};
 
 // In-memory playlist storage (legacy - device-level)
 // Structure: { [deviceId]: { deviceId, lastUpdated, items: [...] } }
@@ -903,7 +878,9 @@ app.get("/api/devices/:id/details", async (req, res) => {
         location,
         status,
         is_online,
-        last_seen
+        last_seen,
+        last_screenshot,
+        last_recording
       FROM screens
       WHERE id::text = $1 OR device_id = $1
       LIMIT 1
@@ -928,7 +905,9 @@ app.get("/api/devices/:id/details", async (req, res) => {
       currentContentName: null,
       templateName: null,
 
-      lastScreenshot: null,
+      // Use a stable, browser-friendly URL (no auth headers required).
+      // This endpoint serves the latest screenshot file directly.
+      lastScreenshot: s.last_screenshot ? `/api/device/${encodeURIComponent(s.device_id)}/screenshot/latest` : null,
       screenshotAt: null,
       thumbnail: null,
 
@@ -1454,12 +1433,12 @@ app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) =
   }
 });
 
-  // DEVICE UPLOADS SCREENSHOT (multipart/form-data)
+  // DEVICE UPLOADS SCREENSHOT
   app.post(
     "/api/device/:deviceId/screenshot",
     authenticateDevice,
     screenshotUpload.single("file"),
-    async (req, res) => {
+    (req, res) => {
       const { deviceId } = req.params;
 
       // Enforce: authenticated device can only upload for itself
@@ -1472,9 +1451,14 @@ app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) =
       }
 
       const filePath = `/uploads/screenshots/${req.file.filename}`;
-      await updateDeviceScreenshot(deviceId, filePath);
+      // Persist in DB (survives restarts)
+      updateDeviceScreenshot(deviceId, filePath).catch(() => {});
 
-      console.log(`Screenshot received from device ${deviceId}:`, req.file.filename);
+      console.log(
+        `Screenshot received from device ${deviceId}:`,
+        req.file.filename,
+      );
+
       res.json({ ok: true, filePath });
     },
   );
@@ -1482,21 +1466,16 @@ app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) =
   // DEVICE UPLOADS VIDEO RECORDING
   app.post(
     "/api/device/:deviceId/record",
-    authenticateDevice,
     recordingUpload.single("file"),
-    async (req, res) => {
+    (req, res) => {
       const { deviceId } = req.params;
-
-      if (!req.device || req.device.deviceId !== deviceId) {
-        return res.status(403).json({ error: "device_id_mismatch" });
-      }
 
       if (!req.file) {
         return res.status(400).json({ error: "No file uploaded" });
       }
 
       const filePath = `/uploads/recordings/${req.file.filename}`;
-      await updateDeviceRecording(deviceId, filePath);
+      lastRecording[deviceId] = filePath;
 
       console.log(
         `Recording received from device ${deviceId}:`,
@@ -1507,50 +1486,39 @@ app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) =
     },
   );
 
-  // GET LAST SCREENSHOT/RECORDING FOR A DEVICE (stored in DB)
-  app.get("/api/device/:deviceId/screenshot", authenticateUserOrDevice, async (req, res) => {
+  // GET LAST SCREENSHOT FOR A DEVICE (CMS uses this)
+  app.get("/api/device/:deviceId/screenshot", (req, res) => {
     const { deviceId } = req.params;
-    try {
-      const r = await pool.query(
-        `SELECT last_screenshot FROM screens WHERE device_id = $1 LIMIT 1`,
-        [deviceId],
-      );
-      const filePath = r.rows?.[0]?.last_screenshot ?? null;
-      if (!filePath) return res.status(404).json({ error: "No screenshot available" });
-      return res.json({ ok: true, filePath });
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "failed_to_load_screenshot" });
+    const filePath = lastScreenshot[deviceId];
+
+    if (!filePath) {
+      return res.status(404).json({ error: "No screenshot available" });
     }
+
+    res.json({ ok: true, filePath });
   });
 
-  app.get("/api/device/:deviceId/recording", authenticateUserOrDevice, async (req, res) => {
+  // GET LAST RECORDING FOR A DEVICE (CMS uses this)
+  app.get("/api/device/:deviceId/recording", (req, res) => {
     const { deviceId } = req.params;
-    try {
-      const r = await pool.query(
-        `SELECT last_recording FROM screens WHERE device_id = $1 LIMIT 1`,
-        [deviceId],
-      );
-      const filePath = r.rows?.[0]?.last_recording ?? null;
-      if (!filePath) return res.status(404).json({ error: "No recording available" });
-      return res.json({ ok: true, filePath });
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "failed_to_load_recording" });
+    const filePath = lastRecording[deviceId];
+
+    if (!filePath) {
+      return res.status(404).json({ error: "No recording available" });
     }
+
+    res.json({ ok: true, filePath });
   });
 
-  // Optional "null if missing" endpoints (simpler polling)
-  app.get("/api/device/:deviceId/last-screenshot", authenticateUserOrDevice, async (req, res) => {
+  // Alternative endpoints returning null if not found (simpler for Android)
+  app.get("/api/device/:deviceId/last-screenshot", (req, res) => {
     const { deviceId } = req.params;
-    const r = await pool.query(`SELECT last_screenshot FROM screens WHERE device_id = $1 LIMIT 1`, [deviceId]);
-    res.json({ file: r.rows?.[0]?.last_screenshot ?? null });
+    res.json({ file: lastScreenshot[deviceId] || null });
   });
 
-  app.get("/api/device/:deviceId/last-recording", authenticateUserOrDevice, async (req, res) => {
+  app.get("/api/device/:deviceId/last-recording", (req, res) => {
     const { deviceId } = req.params;
-    const r = await pool.query(`SELECT last_recording FROM screens WHERE device_id = $1 LIMIT 1`, [deviceId]);
-    res.json({ file: r.rows?.[0]?.last_recording ?? null });
+    res.json({ file: lastRecording[deviceId] || null });
   });
 
   // Serve latest screenshot image directly
@@ -1892,11 +1860,21 @@ app.get("/api/screens/:deviceId/playlist", async (req, res) => {
       [screen.id]
     );
 
-    // No assignment => empty playlist (player shows "No content assigned")
+    // No assignment => return a fallback (branding) item.
+    // This ensures new devices NEVER need a playlist to show something.
     if (assignRes.rowCount === 0) {
       return res.json({
         screen: { id: screen.id, deviceId: screen.device_id, name: screen.name },
-        playlist: [],
+        playlist: [
+          {
+            id: "fallback",
+            type: "image",
+            url: "/display/fallback-logo.svg",
+            name: "Default Logo",
+            duration: 15,
+            isFallback: true,
+          },
+        ],
         refreshInterval: 60,
       });
     }
@@ -1922,7 +1900,16 @@ app.get("/api/screens/:deviceId/playlist", async (req, res) => {
     if (itemsRes.rowCount === 0) {
       return res.json({
         screen: { id: screen.id, deviceId: screen.device_id, name: screen.name },
-        playlist: [],
+        playlist: [
+          {
+            id: "fallback",
+            type: "image",
+            url: "/display/fallback-logo.svg",
+            name: "Default Logo",
+            duration: 15,
+            isFallback: true,
+          },
+        ],
         refreshInterval: 60,
         warning: "playlist has no items",
       });
@@ -1967,9 +1954,23 @@ app.get("/api/screens/:deviceId/playlist", async (req, res) => {
       })
       .filter(Boolean);
 
+    // If joins produced zero valid media rows, still fall back.
+    const finalPlaylist = playlist.length
+      ? playlist
+      : [
+          {
+            id: "fallback",
+            type: "image",
+            url: "/display/fallback-logo.svg",
+            name: "Default Logo",
+            duration: 15,
+            isFallback: true,
+          },
+        ];
+
     return res.json({
       screen: { id: screen.id, deviceId: screen.device_id, name: screen.name },
-      playlist,
+      playlist: finalPlaylist,
       refreshInterval: 300,
     });
   } catch (error) {
@@ -1977,7 +1978,16 @@ app.get("/api/screens/:deviceId/playlist", async (req, res) => {
     // never 500 the player
     return res.status(200).json({
       screen: { deviceId },
-      playlist: [],
+      playlist: [
+        {
+          id: "fallback",
+          type: "image",
+          url: "/display/fallback-logo.svg",
+          name: "Default Logo",
+          duration: 15,
+          isFallback: true,
+        },
+      ],
       refreshInterval: 60,
       warning: "playlist temporarily unavailable",
     });
@@ -2191,23 +2201,31 @@ app.get("/api/screens/:deviceId/playlist", async (req, res) => {
   });
 
   // =====================================================
-  // DEVICE SCREENSHOT UPLOAD (base64 JSON)
+  // DEVICE SCREENSHOT UPLOAD
   // =====================================================
-  // NOTE: Kept for backward compatibility if your APK sends base64 strings.
-  // Preferred path is multipart upload to /api/device/:deviceId/screenshot
+  // Base64 upload kept for backward compatibility.
+  // Prefer multipart upload at POST /api/device/:deviceId/screenshot
   app.post("/api/device/:deviceId/screenshot/base64", authenticateDevice, async (req, res) => {
     const { deviceId } = req.params;
     const { screenshot } = req.body;
+
+    if (!req.device || req.device.deviceId !== deviceId) {
+      return res.status(403).json({ error: "device_id_mismatch" });
+    }
 
     if (!screenshot) {
       return res.status(400).json({ error: "screenshot_required" });
     }
 
     try {
-      // Store base64 in DB (not ideal for large images) – consider switching APK to multipart.
       await pool.query(
-        `UPDATE screens SET screenshot = $1, screenshot_at = NOW() WHERE device_id = $2`,
-        [screenshot, deviceId],
+        `
+        UPDATE screens SET
+          screenshot = $1,
+          screenshot_at = NOW()
+        WHERE device_id = $2
+        `,
+        [screenshot, deviceId]
       );
 
       res.json({ success: true });
@@ -2439,79 +2457,16 @@ if (verifyDisplayTokenOrFail(req, res, deviceId)) {
     }
   });
 
-  // =====================================================
-  // FALLBACK LOGO (shown when device has no playlist yet)
-  // =====================================================
-  const getFallbackLogoUrl = () => {
-    // Prefer explicit URL (e.g., CDN) if provided
-    if (process.env.DEFAULT_FALLBACK_IMAGE_URL) return process.env.DEFAULT_FALLBACK_IMAGE_URL;
-
-    // If an uploaded fallback logo exists, serve it
-    const files = fs
-      .readdirSync(defaultsDir)
-      .filter((f) => f.startsWith("fallback-logo"));
-    if (files.length > 0) {
-      // pick the first (stable name)
-      return `/uploads/defaults/${files[0]}`;
-    }
-
-    // No logo configured
-    return null;
-  };
-
-  app.get("/api/settings/fallback-logo", authenticateUserOrDevice, (_req, res) => {
-    res.json({ url: getFallbackLogoUrl() });
-  });
-
-  app.post(
-    "/api/admin/settings/fallback-logo",
-    authenticateJWT,
-    requireRole("admin"),
-    fallbackLogoUpload.single("file"),
-    (req, res) => {
-      if (!req.file) return res.status(400).json({ error: "file_required" });
-      return res.json({ ok: true, url: `/uploads/defaults/${req.file.filename}` });
-    },
-  );
-
   app.get("/api/device/:deviceId/playlist", (req, res) => {
     const { deviceId } = req.params;
 
     const playlist = playlists[deviceId];
 
     if (!playlist) {
-      const fallbackUrl = getFallbackLogoUrl();
       return res.json({
         deviceId,
         lastUpdated: null,
-        items: fallbackUrl
-          ? [
-              {
-                type: "image",
-                url: fallbackUrl,
-                durationMs: 15000,
-                isFallback: true,
-              },
-            ]
-          : [],
-      });
-    }
-
-    // If playlist exists but is empty, still show fallback
-    if (!Array.isArray(playlist.items) || playlist.items.length === 0) {
-      const fallbackUrl = getFallbackLogoUrl();
-      return res.json({
-        ...playlist,
-        items: fallbackUrl
-          ? [
-              {
-                type: "image",
-                url: fallbackUrl,
-                durationMs: 15000,
-                isFallback: true,
-              },
-            ]
-          : [],
+        items: [],
       });
     }
 
