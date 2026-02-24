@@ -1777,54 +1777,104 @@ const existingUser = await storage.getUserByEmail(email);
     }
   });
 
-  // Get playlist content for a device by deviceId
-  app.get("/api/screens/:deviceId/playlist", async (req, res) => {
-    try {
-      const { deviceId } = req.params;
+  // Get playlist content for a device by deviceId (ULTRA-SAFE)
+app.get("/api/screens/:deviceId/playlist", async (req, res) => {
+  const { deviceId } = req.params;
 
+  try {
+    // Optional: if a Bearer token is provided, validate it as a display token bound to this deviceId.
+    // If no token is provided, we still allow playback (legacy mode) because /display/app.js may not yet pass token.
+    if (verifyDisplayTokenOrFail(req, res, deviceId)) return;
 
-// Optional: if a Bearer token is provided, validate it as a display token bound to this deviceId.
-// If no token is provided, we still allow playback (legacy mode) because /display/app.js may not yet pass token.
-if (verifyDisplayTokenOrFail(req, res, deviceId)) {
-  return;
-}
+    // Find screen by deviceId
+    const screen = await storage.getScreenByDeviceId(deviceId);
+    if (!screen) {
+      return res.status(404).json({ error: "Device not found" });
+    }
 
-      // Find screen by deviceId
-      const screen = await storage.getScreenByDeviceId(deviceId);
-      if (!screen) {
-        return res.status(404).json({ error: "Device not found" });
-      }
+    // Update last seen timestamp
+    await storage.updateScreen(screen.id, {
+      lastSeen: new Date(),
+      status: "online",
+    });
 
-      // Update last seen timestamp
-      await storage.updateScreen(screen.id, {
-        lastSeen: new Date(),
-        status: "online",
-      });
+    // ---- ULTRA-SAFE MEDIA QUERY (no Drizzle dependency) ----
+    // We query information_schema to know which columns exist,
+    // then build a SELECT that won't crash if columns are missing.
+    const colsRes = await pool.query(
+      `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'media'
+      `
+    );
 
-      // Get all media as playlist content (can be enhanced with actual playlist assignments later)
-      const allMedia = await storage.getAllMedia();
-      const playlist = allMedia.map((item) => ({
-        id: item.id,
-        type: item.type,
-        url: item.url,
-        name: item.name,
-        duration: item.duration || 10,
-      }));
+    const cols = new Set<string>(colsRes.rows.map((r: any) => r.column_name));
 
-      res.json({
+    // required-ish columns (id/name/type/url) – if any are missing, we still avoid 500 and return empty playlist
+    const hasId = cols.has("id");
+    const hasName = cols.has("name");
+    const hasType = cols.has("type");
+    const hasUrl = cols.has("url");
+    const hasDuration = cols.has("duration");
+
+    if (!hasId || !hasName || !hasType || !hasUrl) {
+      // DB schema mismatch: don't crash playback, return empty playlist with info
+      return res.json({
         screen: {
           id: screen.id,
           deviceId: screen.deviceId,
           name: screen.name,
           resolution: screen.resolution,
         },
-        playlist,
-        refreshInterval: 300, // seconds until next playlist check
+        playlist: [],
+        refreshInterval: 60,
+        warning: "media table schema missing required columns (id/name/type/url)",
       });
-    } catch (error) {
-      res.status(500).json({ error: "Failed to fetch playlist" });
     }
-  });
+
+    const mediaRes = await pool.query(
+      `
+      SELECT
+        id,
+        name,
+        type,
+        url
+        ${hasDuration ? ", duration" : ""}
+      FROM media
+      ORDER BY id DESC
+      `
+    );
+
+    const playlist = mediaRes.rows.map((item: any) => ({
+      id: item.id,
+      type: item.type,
+      url: item.url,
+      name: item.name,
+      duration: hasDuration ? (item.duration ?? 10) : 10,
+    }));
+
+    return res.json({
+      screen: {
+        id: screen.id,
+        deviceId: screen.deviceId,
+        name: screen.name,
+        resolution: screen.resolution,
+      },
+      playlist,
+      refreshInterval: 300,
+    });
+  } catch (error) {
+    console.error("Playlist fetch error:", error);
+    // SaaS-grade: never hard-fail playback if DB has issues
+    return res.status(200).json({
+      screen: { deviceId },
+      playlist: [],
+      refreshInterval: 60,
+      warning: "playlist temporarily unavailable",
+    });
+  }
+});
 
   // Device API endpoints (for Android/player clients)
   app.post("/api/device/register", async (req, res) => {
