@@ -6,9 +6,28 @@ import rateLimit from "express-rate-limit";
 import { randomUUID } from "crypto";
 import { registerRoutes } from "./routes";
 import { createServer } from "http";
+import { fileURLToPath } from "url";
 
 const app = express();
-app.use("/display", express.static(path.join(process.cwd(), "public/display")));
+
+/* --------------------------------------------------
+   DISPLAY STATIC (MUST BE BEFORE /display/:screenId)
+   - Use absolute path so Render cwd doesn't break static serving
+-------------------------------------------------- */
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// /server/index.ts -> go up to project root -> public/display
+const DISPLAY_DIR = path.resolve(__dirname, "..", "public", "display");
+
+// ✅ Serve /display/* static files FIRST
+app.use("/display", express.static(DISPLAY_DIR));
+
+// ✅ Hard route so the logo is NEVER treated as :screenId
+app.get("/display/fallback-logo.svg", (_req, res) => {
+  res.sendFile(path.join(DISPLAY_DIR, "fallback-logo.svg"));
+});
+
 const httpServer = createServer(app);
 
 /* --------------------------------------------------
@@ -39,12 +58,6 @@ app.use(helmet());
 
 /* --------------------------------------------------
    CORS (SAAS-GRADE)
-   - Allows:
-     - localhost (dev)
-     - origins listed in CORS_ORIGIN (comma-separated)
-     - Vercel preview URLs matching your project prefix
-   - In production, if CORS_ORIGIN is empty, we still allow
-     vercel previews + localhost? (you can disable localhost if you want).
 -------------------------------------------------- */
 
 // Comma-separated allowlist from environment
@@ -57,14 +70,11 @@ const corsOrigins = (process.env.CORS_ORIGIN || "")
 const vercelPreviewRegex = /^https:\/\/signage-frontend-.*\.vercel\.app$/;
 
 const isAllowedOrigin = (origin: string) => {
-  // Explicit allowlist from env
   if (corsOrigins.includes(origin)) return true;
 
-  // Local dev
   if (origin === "http://localhost:5173") return true;
   if (origin === "http://localhost:3000") return true;
 
-  // Any preview deployment for this project
   if (vercelPreviewRegex.test(origin)) return true;
 
   return false;
@@ -72,18 +82,13 @@ const isAllowedOrigin = (origin: string) => {
 
 const corsMiddleware = cors({
   origin: (origin, cb) => {
-    // Allow non-browser clients (curl, server-to-server)
     if (!origin) return cb(null, true);
 
-    // If no env origins defined:
-    // - allow vercel previews + localhost (dev convenience)
-    // - block everything else (secure default)
     if (corsOrigins.length === 0) {
       if (isAllowedOrigin(origin)) return cb(null, true);
       return cb(new Error(`CORS blocked: ${origin}`));
     }
 
-    // If env allowlist exists, still allow vercel previews + localhost too
     if (isAllowedOrigin(origin)) return cb(null, true);
 
     return cb(new Error(`CORS blocked: ${origin}`));
@@ -93,17 +98,12 @@ const corsMiddleware = cors({
   allowedHeaders: ["Content-Type", "Authorization"],
 });
 
-// Apply CORS BEFORE routes
 app.use(corsMiddleware);
-
-// IMPORTANT: handle preflight requests
 app.options("*", corsMiddleware);
 
 /* --------------------------------------------------
    RATE LIMITING
 -------------------------------------------------- */
-
-// Global API limit
 app.use(
   "/api",
   rateLimit({
@@ -114,7 +114,6 @@ app.use(
   }),
 );
 
-// Stricter auth limit
 app.use(
   "/api/auth",
   rateLimit({
@@ -176,9 +175,7 @@ app.use((req, res, next) => {
   await registerRoutes(httpServer, app);
 
   /* --------------------------------------------------
-     PLAYER DISPLAY ROUTES (Android WebView / TV Browser)
-     - /display shows a helpful message
-     - /display/:screenId renders a simple player page
+     PLAYER DISPLAY ROUTES
   -------------------------------------------------- */
   app.get("/display", (_req, res) => {
     res
@@ -211,6 +208,7 @@ app.use((req, res, next) => {
       );
   });
 
+  // ✅ Player route stays as-is
   app.get("/display/:screenId", (req, res) => {
     const screenId = encodeURIComponent(req.params.screenId);
 
