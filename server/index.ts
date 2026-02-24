@@ -38,9 +38,13 @@ app.use((req, res, next) => {
 app.use(helmet());
 
 /* --------------------------------------------------
-   CORS (PRODUCTION-SAFE)
-   - In production: only allow origins in CORS_ORIGIN
-   - In non-production: allow all (for local dev)
+   CORS (SAAS-GRADE)
+   - Allows:
+     - localhost (dev)
+     - origins listed in CORS_ORIGIN (comma-separated)
+     - Vercel preview URLs matching your project prefix
+   - In production, if CORS_ORIGIN is empty, we still allow
+     vercel previews + localhost? (you can disable localhost if you want).
 -------------------------------------------------- */
 
 // Comma-separated allowlist from environment
@@ -49,32 +53,51 @@ const corsOrigins = (process.env.CORS_ORIGIN || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
+// Allow Vercel preview URLs for this project (adjust prefix if needed)
+const vercelPreviewRegex = /^https:\/\/signage-frontend-.*\.vercel\.app$/;
+
+const isAllowedOrigin = (origin: string) => {
+  // Explicit allowlist from env
+  if (corsOrigins.includes(origin)) return true;
+
+  // Local dev
+  if (origin === "http://localhost:5173") return true;
+  if (origin === "http://localhost:3000") return true;
+
+  // Any preview deployment for this project
+  if (vercelPreviewRegex.test(origin)) return true;
+
+  return false;
+};
+
 const corsMiddleware = cors({
   origin: (origin, cb) => {
     // Allow non-browser clients (curl, server-to-server)
     if (!origin) return cb(null, true);
 
     // If no env origins defined:
-    // - allow all in non-production (dev convenience)
-    // - block in production (secure default)
+    // - allow vercel previews + localhost (dev convenience)
+    // - block everything else (secure default)
     if (corsOrigins.length === 0) {
-      if (process.env.NODE_ENV !== "production") {
-        return cb(null, true);
-      }
-      return cb(new Error("CORS blocked"));
+      if (isAllowedOrigin(origin)) return cb(null, true);
+      return cb(new Error(`CORS blocked: ${origin}`));
     }
 
-    // Check allowlist
-    if (corsOrigins.includes(origin)) {
-      return cb(null, true);
-    }
+    // If env allowlist exists, still allow vercel previews + localhost too
+    if (isAllowedOrigin(origin)) return cb(null, true);
 
-    return cb(new Error("CORS blocked"));
+    return cb(new Error(`CORS blocked: ${origin}`));
   },
   credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
 });
 
+// Apply CORS BEFORE routes
 app.use(corsMiddleware);
+
+// IMPORTANT: handle preflight requests
+app.options("*", corsMiddleware);
 
 /* --------------------------------------------------
    RATE LIMITING
