@@ -826,74 +826,67 @@ app.post("/api/device/commands/:commandId/result", authenticateDevice, async (re
     }
   });
 
-  // =====================================================
-  // DEVICE DETAILS (for DeviceControlPage)
-  // =====================================================
-  app.get("/api/devices/:id/details", async (req, res) => {
-    const { id } = req.params;
+ // =====================================================
+// DEVICE DETAILS (for DeviceControlPage)
+// =====================================================
+app.get("/api/devices/:id/details", async (req, res) => {
+  const { id } = req.params;
 
-    try {
-      const result = await pool.query(
-        `
-        SELECT
-          s.id,
-          s.device_id,
-          s.name,
-          s.location,
-          s.status,
-          s.is_online,
-          s.last_seen AS "lastHeartbeat",
-          s.current_content_name AS "currentContentName",
-          s.screenshot,
-          s.screenshot_at AS "screenshotAt",
-          s.thumbnail,
-          s.signal_strength AS "signalStrength",
-          s.connection_type AS "connectionType",
-          s.free_storage AS "freeStorage",
-          s.last_offline AS "lastOffline",
-          s.assigned_template_id AS "assignedTemplateId",
-          s.latitude,
-          s.longitude,
-          s.brightness,
-          s.volume,
-          t.name AS "templateName"
-        FROM screens s
-        LEFT JOIN templates t ON s.assigned_template_id = t.id
-        WHERE s.id::text = $1 OR s.device_id = $1
-        LIMIT 1
-        `,
-        [id]
-      );
+  try {
+    // Only select columns that are very likely to exist based on your schema
+    // (screens + templates). Everything else is optional and will be defaulted.
+    const result = await pool.query(
+      `
+      SELECT
+        s.id,
+        s.device_id,
+        s.name,
+        s.location,
+        s.status,
+        s.is_online,
+        s.last_seen AS "lastHeartbeat",
+        s.latitude,
+        s.longitude,
+        t.name AS "templateName"
+      FROM screens s
+      LEFT JOIN templates t ON t.id = s.assigned_template_id
+      WHERE s.id::text = $1 OR s.device_id = $1
+      LIMIT 1
+      `,
+      [id],
+    );
 
-      if (result.rowCount === 0) {
-        return res.status(404).json({ error: "Device not found" });
-      }
-
-      const device = result.rows[0];
-      res.json({
-        id: device.device_id || device.id,
-        name: device.name,
-        status: device.is_online ? "Online" : "Offline",
-        lastHeartbeat: device.lastHeartbeat,
-        currentContentName: device.currentContentName,
-        templateName: device.templateName,
-        lastScreenshot: device.screenshot,
-        screenshotAt: device.screenshotAt,
-        thumbnail: device.thumbnail,
-        signalStrength: device.signalStrength,
-        connectionType: device.connectionType || "wifi",
-        freeStorage: device.freeStorage,
-        lastOffline: device.lastOffline,
-        latitude: device.latitude,
-        longitude: device.longitude,
-        brightness: device.brightness ?? 100,
-        volume: device.volume ?? 70,
-      });
-    } catch (err) {
-      console.error("Device details error:", err);
-      res.status(500).json({ error: "Failed to load device details" });
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Device not found" });
     }
-  });
+
+    const device = result.rows[0];
+
+    // SaaS-grade: stable response shape with safe defaults
+    res.json({
+      id: device.device_id || device.id,
+      name: device.name || `Device ${device.device_id || device.id}`,
+      status: device.is_online ? "Online" : "Offline",
+      lastHeartbeat: device.lastHeartbeat ?? null,
+      currentContentName: null, // optional feature; returned as null if not supported yet
+      templateName: device.templateName ?? null,
+      lastScreenshot: null,
+      screenshotAt: null,
+      thumbnail: null,
+      signalStrength: null,
+      connectionType: "wifi",
+      freeStorage: null,
+      lastOffline: null,
+      latitude: device.latitude ?? null,
+      longitude: device.longitude ?? null,
+      brightness: 100,
+      volume: 70,
+    });
+  } catch (err) {
+    console.error("Device details error:", err);
+    res.status(500).json({ error: "Failed to load device details" });
+  }
+});
 
   // =====================================================
   // DEVICE SETTINGS (brightness/volume)
