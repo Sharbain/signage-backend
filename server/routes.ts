@@ -628,7 +628,29 @@ return res.json({ deviceId, revoked: true });
 
 
 
-  app.use("/api/device/:deviceId", authenticateDevice);
+  // =====================================================
+// DEVICE ROUTE GATE
+// - Devices authenticate with their DeviceKey/Token (authenticateDevice)
+// - CMS/Admin can ALSO access these endpoints using JWT (authenticateJWT)
+//   but ONLY with admin/manager role, to avoid accidental logout/401 loops.
+// =====================================================
+const authenticateDeviceOrAdmin = (req: Request, res: Response, next: NextFunction) => {
+  const authHeader = req.headers.authorization;
+
+  // If a Bearer token exists, treat as CMS/admin call
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    return authenticateJWT(req, res, (err?: any) => {
+      if (err) return next(err);
+      // Only allow privileged CMS roles to use /api/device/* endpoints
+      return requireRole("admin", "manager")(req, res, next);
+    });
+  }
+
+  // Otherwise, treat as device call
+  return authenticateDevice(req, res, next);
+};
+
+app.use("/api/device/:deviceId", authenticateDeviceOrAdmin);
 
 // =====================================================
 // CANONICAL DEVICE COMMAND ROUTES (DeviceKey required)
