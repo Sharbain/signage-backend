@@ -250,6 +250,46 @@ if (!process.env.JWT_SECRET) {
 }
 const JWT_SECRET = process.env.JWT_SECRET;
 
+function verifyDisplayTokenOrFail(req: any, res: any, expectedDeviceId: string): boolean {
+  // Support either Authorization: Bearer <token> OR ?token=<token>
+  const authHeader = req.headers?.authorization as string | undefined;
+  const bearerToken =
+    authHeader && authHeader.toLowerCase().startsWith("bearer ")
+      ? authHeader.slice("bearer ".length).trim()
+      : undefined;
+
+  const token = bearerToken || (req.query?.token as string | undefined);
+
+  // If route is calling this function, we expect a token to exist.
+  if (!token) {
+    res.status(401).json({ error: "Missing display token" });
+    return false;
+  }
+
+  try {
+    const decoded: any = jwt.verify(token, JWT_SECRET);
+
+    // Must be a display token and must match the requested device
+    if (decoded?.role !== "display") {
+      res.status(403).json({ error: "Invalid token role" });
+      return false;
+    }
+
+    if (!decoded?.deviceId || decoded.deviceId !== expectedDeviceId) {
+      res.status(403).json({ error: "Token device mismatch" });
+      return false;
+    }
+
+    // optionally expose it to later handlers
+    (req as any).displayToken = decoded;
+
+    return true;
+  } catch (err) {
+    res.status(401).json({ error: "Invalid or expired display token" });
+    return false;
+  }
+}
+
 // Simple in-memory command queue: { [deviceId]: [ { id, command, value, createdAt } ] }
 const pendingCommands: {
   [deviceId: string]: Array<{
