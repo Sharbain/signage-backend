@@ -6,19 +6,15 @@ import rateLimit from "express-rate-limit";
 import { randomUUID } from "crypto";
 import { registerRoutes } from "./routes";
 import { createServer } from "http";
-import { fileURLToPath } from "url";
 
 const app = express();
 
 /* --------------------------------------------------
    DISPLAY STATIC (MUST BE BEFORE /display/:screenId)
-   - Use absolute path so Render cwd doesn't break static serving
+   - Use cwd (works in Render + CJS builds)
+   - Add explicit fallback route so it NEVER becomes :screenId
 -------------------------------------------------- */
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// /server/index.ts -> go up to project root -> public/display
-const DISPLAY_DIR = path.resolve(__dirname, "..", "public", "display");
+const DISPLAY_DIR = path.join(process.cwd(), "public", "display");
 
 // ✅ Serve /display/* static files FIRST
 app.use("/display", express.static(DISPLAY_DIR));
