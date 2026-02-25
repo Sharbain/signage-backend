@@ -34,23 +34,38 @@ const DISPLAY_DIR =
 // ✅ Serve /display/* static files FIRST
 app.use("/display", express.static(DISPLAY_DIR));
 
-// PUBLIC UPLOADS (Option A): serve media files without auth so display players can load them.
-const UPLOADS_DIR = path.join(process.cwd(), "uploads");
-app.use(
-  "/uploads",
-  express.static(UPLOADS_DIR, {
-    maxAge: "30d",
-    setHeaders(res) {
-      res.setHeader("Cache-Control", "public, max-age=2592000");
-    },
-  })
-);
-
-
 // ✅ Hard route so the logo is NEVER treated as :screenId
 app.get("/display/fallback-logo.svg", (_req, res) => {
   res.sendFile(path.join(DISPLAY_DIR, "fallback-logo.svg"));
 });
+
+/* --------------------------------------------------
+   UPLOADS STATIC (Option A: public /uploads)
+   This fixes 401s when the player loads media URLs like /uploads/<file>
+-------------------------------------------------- */
+
+const UPLOADS_CANDIDATES = [
+  path.resolve(process.cwd(), "uploads"),
+  path.resolve(process.cwd(), "public", "uploads"),
+  path.resolve(DIRNAME, "..", "uploads"),
+  path.resolve(DIRNAME, "..", "..", "uploads"),
+  path.resolve(DIRNAME, "..", "public", "uploads"),
+  path.resolve(DIRNAME, "..", "..", "public", "uploads"),
+];
+
+const UPLOADS_DIR =
+  UPLOADS_CANDIDATES.find((p) => fs.existsSync(p)) ?? UPLOADS_CANDIDATES[0];
+
+// ✅ Public static serving for uploaded media
+app.use(
+  "/uploads",
+  express.static(UPLOADS_DIR, {
+    fallthrough: false,
+    setHeaders: (res) => {
+      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    },
+  }),
+);
 
 const httpServer = createServer(app);
 
