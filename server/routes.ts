@@ -628,29 +628,62 @@ return res.json({ deviceId, revoked: true });
 
 
 
-  // =====================================================
-// DEVICE ROUTE GATE
-// - Devices authenticate with their DeviceKey/Token (authenticateDevice)
-// - CMS/Admin can ALSO access these endpoints using JWT (authenticateJWT)
-//   but ONLY with admin/manager role, to avoid accidental logout/401 loops.
+
+
 // =====================================================
-const authenticateDeviceOrAdmin = (req: Request, res: Response, next: NextFunction) => {
-  const authHeader = req.headers.authorization;
+// ADMIN DEVICE MEDIA (CMS)
+// These endpoints are for the CMS/admin panel ONLY.
+// They use JWT auth and must NOT depend on device tokens.
+// =====================================================
 
-  // If a Bearer token exists, treat as CMS/admin call
-  if (authHeader && authHeader.startsWith("Bearer ")) {
-    return authenticateJWT(req, res, (err?: any) => {
-      if (err) return next(err);
-      // Only allow privileged CMS roles to use /api/device/* endpoints
-      return requireRole("admin", "manager")(req, res, next);
-    });
-  }
+// Latest screenshot path (null if none) — CMS uses this
+app.get(
+  "/api/admin/devices/:deviceId/last-screenshot",
+  authenticateJWT,
+  requireRole("admin", "manager"),
+  (req, res) => {
+    const { deviceId } = req.params;
+    return res.json({ file: lastScreenshot[deviceId] || null });
+  },
+);
 
-  // Otherwise, treat as device call
-  return authenticateDevice(req, res, next);
-};
+// Latest recording path (null if none) — CMS uses this
+app.get(
+  "/api/admin/devices/:deviceId/last-recording",
+  authenticateJWT,
+  requireRole("admin", "manager"),
+  (req, res) => {
+    const { deviceId } = req.params;
+    return res.json({ file: lastRecording[deviceId] || null });
+  },
+);
 
-app.use("/api/device/:deviceId", authenticateDeviceOrAdmin);
+// Backward-compatible: return 404 if none
+app.get(
+  "/api/admin/devices/:deviceId/screenshot",
+  authenticateJWT,
+  requireRole("admin", "manager"),
+  (req, res) => {
+    const { deviceId } = req.params;
+    const filePath = lastScreenshot[deviceId];
+    if (!filePath) return res.status(404).json({ error: "No screenshot available" });
+    return res.json({ ok: true, filePath });
+  },
+);
+
+app.get(
+  "/api/admin/devices/:deviceId/recording",
+  authenticateJWT,
+  requireRole("admin", "manager"),
+  (req, res) => {
+    const { deviceId } = req.params;
+    const filePath = lastRecording[deviceId];
+    if (!filePath) return res.status(404).json({ error: "No recording available" });
+    return res.json({ ok: true, filePath });
+  },
+);
+
+  app.use("/api/device/:deviceId", authenticateDevice);
 
 // =====================================================
 // CANONICAL DEVICE COMMAND ROUTES (DeviceKey required)
