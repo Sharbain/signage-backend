@@ -1974,7 +1974,7 @@ app.get("/api/screens/:deviceId/playlist", async (req, res) => {
 
   try {
     // (Optional token check can remain if you have it)
-    if (verifyDisplayTokenOrFail(req, res, deviceId)) return;
+    if (!verifyDisplayTokenOrFail(req, res, deviceId)) return;
 
     // 1) find the screen
     const screenRes = await pool.query(
@@ -2561,7 +2561,7 @@ app.get("/api/screens/:deviceId/playlist", async (req, res) => {
 
 // Optional: if a Bearer token is provided, validate it as a display token bound to this deviceId.
 // If no token is provided, we still allow playback (legacy mode) because /display/app.js may not yet pass token.
-if (verifyDisplayTokenOrFail(req, res, deviceId)) {
+if (!verifyDisplayTokenOrFail(req, res, deviceId)) {
   return;
 }
       const validatedData = deviceStatusSchema.parse(req.body);
@@ -4910,7 +4910,7 @@ if (verifyDisplayTokenOrFail(req, res, deviceId)) {
 
 // Optional: if a Bearer token is provided, validate it as a display token bound to this deviceId.
 // If no token is provided, we still allow playback (legacy mode) because /display/app.js may not yet pass token.
-if (verifyDisplayTokenOrFail(req, res, deviceId)) {
+if (!verifyDisplayTokenOrFail(req, res, deviceId)) {
   return;
 }
 
