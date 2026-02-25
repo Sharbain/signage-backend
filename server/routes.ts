@@ -251,7 +251,6 @@ if (!process.env.JWT_SECRET) {
 const JWT_SECRET = process.env.JWT_SECRET;
 
 function verifyDisplayTokenOrFail(req: any, res: any, expectedDeviceId: string): boolean {
-  // Prefer Authorization: Bearer <displayAccessToken>
   const authHeader = (req.headers?.authorization as string | undefined) ?? "";
 
   const displayAccessToken =
@@ -259,22 +258,12 @@ function verifyDisplayTokenOrFail(req: any, res: any, expectedDeviceId: string):
       ? authHeader.slice("bearer ".length).trim()
       : undefined;
 
-  // 🚫 Query tokens are a security footgun (leaks in logs, caches, analytics).
-  // If you MUST keep it for debugging, only allow in dev with an explicit flag.
-  const allowQueryToken =
-    process.env.NODE_ENV !== "production" && process.env.ALLOW_DISPLAY_QUERY_TOKEN === "true";
-
-  const displayAccessToken = bearerToken;
-
-  const accessToken = displayAccessToken || queryToken;
-
   // ✅ LEGACY MODE: if no token provided, allow playback (don’t block devices)
-  if (!accessToken) return true;
+  if (!displayAccessToken) return true;
 
   try {
-    const decoded: any = jwt.verify(accessToken, JWT_SECRET);
+    const decoded: any = jwt.verify(displayAccessToken, JWT_SECRET);
 
-    // Must be a display token and must match the requested device
     if (decoded?.role !== "display") {
       res.status(403).json({ error: "invalid_display_token_role" });
       return false;
@@ -285,9 +274,7 @@ function verifyDisplayTokenOrFail(req: any, res: any, expectedDeviceId: string):
       return false;
     }
 
-    // Attach decoded payload for downstream handlers
     (req as any).displayAuth = decoded;
-
     return true;
   } catch {
     res.status(401).json({ error: "invalid_or_expired_display_access_token" });
