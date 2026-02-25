@@ -264,7 +264,7 @@ function verifyDisplayTokenOrFail(req: any, res: any, expectedDeviceId: string):
   const allowQueryToken =
     process.env.NODE_ENV !== "production" && process.env.ALLOW_DISPLAY_QUERY_TOKEN === "true";
 
-  const queryToken = allowQueryToken ? (req.query?.token as string | undefined) : undefined;
+  const displayAccessToken = bearerToken;
 
   const accessToken = displayAccessToken || queryToken;
 
