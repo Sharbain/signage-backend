@@ -32,6 +32,8 @@ import { pool } from "./db";
 import { z } from "zod";
 import { requireRole } from "./middleware/permissions";
 import { authenticateJWT, authenticateDevice, authenticateUserOrDevice } from "./middleware/auth";
+import { registerAuthRoutes } from "./routes/auth.routes";
+import { registerDeviceRoutes } from "./routes/device.routes";
 
 const uploadsDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadsDir)) {
@@ -293,6 +295,13 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express,
 ): Promise<Server> {
+
+  // --------------------------------------------------
+  // Register modular route groups (NEW)
+  // --------------------------------------------------
+  registerAuthRoutes(app);
+  registerDeviceRoutes(app);
+
   // --------------------------------------------------
   // Protect uploads (no public filesystem exposure)
   // Allow either admin/user JWT or a valid device token.
