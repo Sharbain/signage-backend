@@ -34,6 +34,19 @@ const DISPLAY_DIR =
 // ✅ Serve /display/* static files FIRST
 app.use("/display", express.static(DISPLAY_DIR));
 
+// PUBLIC UPLOADS (Option A): serve media files without auth so display players can load them.
+const UPLOADS_DIR = path.join(process.cwd(), "uploads");
+app.use(
+  "/uploads",
+  express.static(UPLOADS_DIR, {
+    maxAge: "30d",
+    setHeaders(res) {
+      res.setHeader("Cache-Control", "public, max-age=2592000");
+    },
+  })
+);
+
+
 // ✅ Hard route so the logo is NEVER treated as :screenId
 app.get("/display/fallback-logo.svg", (_req, res) => {
   res.sendFile(path.join(DISPLAY_DIR, "fallback-logo.svg"));
