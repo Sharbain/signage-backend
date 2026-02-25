@@ -251,19 +251,28 @@ if (!process.env.JWT_SECRET) {
 const JWT_SECRET = process.env.JWT_SECRET;
 
 function verifyDisplayTokenOrFail(req: any, res: any, expectedDeviceId: string): boolean {
-  // Support either Authorization: Bearer <token> OR ?token=<token>
+  // Prefer Authorization: Bearer <displayAccessToken>
   const authHeader = (req.headers?.authorization as string | undefined) ?? "";
-  const bearerToken = authHeader.toLowerCase().startsWith("bearer ")
-    ? authHeader.slice("bearer ".length).trim()
-    : undefined;
 
-  const token = bearerToken || (req.query?.token as string | undefined);
+  const displayAccessToken =
+    authHeader.toLowerCase().startsWith("bearer ")
+      ? authHeader.slice("bearer ".length).trim()
+      : undefined;
+
+  // 🚫 Query tokens are a security footgun (leaks in logs, caches, analytics).
+  // If you MUST keep it for debugging, only allow in dev with an explicit flag.
+  const allowQueryToken =
+    process.env.NODE_ENV !== "production" && process.env.ALLOW_DISPLAY_QUERY_TOKEN === "true";
+
+  const queryToken = allowQueryToken ? (req.query?.token as string | undefined) : undefined;
+
+  const accessToken = displayAccessToken || queryToken;
 
   // ✅ LEGACY MODE: if no token provided, allow playback (don’t block devices)
-  if (!token) return true;
+  if (!accessToken) return true;
 
   try {
-    const decoded: any = jwt.verify(token, JWT_SECRET);
+    const decoded: any = jwt.verify(accessToken, JWT_SECRET);
 
     // Must be a display token and must match the requested device
     if (decoded?.role !== "display") {
@@ -276,10 +285,12 @@ function verifyDisplayTokenOrFail(req: any, res: any, expectedDeviceId: string):
       return false;
     }
 
-    (req as any).displayToken = decoded;
+    // Attach decoded payload for downstream handlers
+    (req as any).displayAuth = decoded;
+
     return true;
   } catch {
-    res.status(401).json({ error: "invalid_or_expired_display_token" });
+    res.status(401).json({ error: "invalid_or_expired_display_access_token" });
     return false;
   }
 }
