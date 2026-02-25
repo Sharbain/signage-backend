@@ -1293,7 +1293,7 @@ app.get("/api/devices/:id/details", async (req, res) => {
   // =====================================================
   // DASHBOARD LIVE CONTENT
   // =====================================================
-  app.get("/api/dashboard/live-content", requireAuth, async (req, res) => {
+  app.get("/api/dashboard/live-content", authenticateJWT, requireRole("admin","manager"), async (req, res) => {
     try {
       const now = new Date();
       const currentTime = now.toTimeString().slice(0, 8); // HH:MM:SS
