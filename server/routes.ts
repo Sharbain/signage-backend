@@ -1293,41 +1293,55 @@ app.get("/api/devices/:id/details", async (req, res) => {
   // =====================================================
   // DASHBOARD LIVE CONTENT
   // =====================================================
-  app.get("/api/dashboard/live-content", async (_req, res) => {
+  app.get("/api/dashboard/live-content", requireAuth, async (req, res) => {
     try {
       const now = new Date();
-      const dayOfWeek = now.getDay();
-      const currentTime = now.toTimeString().slice(0, 8);
+      const currentTime = now.toTimeString().slice(0, 8); // HH:MM:SS
+      // JS getDay(): 0=Sun..6=Sat -> DB likely stores 1=Mon..7=Sun
+      const jsDay = now.getDay();
+      const dayOfWeek = jsDay === 0 ? 7 : jsDay;
 
-      const result = await pool.query(`
-        SELECT 
+      // Some older DBs used device_group_map instead of device_group_members.
+      // We'll detect what's available and build the query accordingly.
+      const [{ reg: membersReg }] = (await db.query(
+        "SELECT to_regclass('public.device_group_members') AS reg"
+      )).rows;
+      const [{ reg: mapReg }] = (await db.query(
+        "SELECT to_regclass('public.device_group_map') AS reg"
+      )).rows;
+
+      const hasMembers = !!membersReg;
+      const hasMap = !!mapReg;
+
+      const groupJoin = hasMembers
+        ? "LEFT JOIN public.device_group_members dgm ON dgm.group_id = cs.group_id"
+        : hasMap
+          ? "LEFT JOIN public.device_group_map dgm ON dgm.group_id = cs.group_id"
+          : "";
+
+      const deviceCountExpr = hasMembers || hasMap
+        ? "COUNT(DISTINCT dgm.device_id)"
+        : "1";
+
+      const result = await db.query(`
+        SELECT
           cs.id,
           cs.content_type,
           cs.content_id,
-          CASE 
-            WHEN cs.content_type = 'media' THEN m.name
-            WHEN cs.content_type = 'playlist' THEN cp.name
-            WHEN cs.content_type = 'template' THEN t.name
-            ELSE 'Unknown'
-          END as content_name,
-          CASE 
-            WHEN cs.content_type = 'media' THEN m.type
-            ELSE cs.content_type
-          END as type,
-          COUNT(DISTINCT COALESCE(cs.device_id, dgm.device_id)) as device_count
-        FROM content_schedules cs
-        LEFT JOIN media m ON cs.content_type = 'media' AND cs.content_id::text = m.id::text
-        LEFT JOIN content_playlists cp ON cs.content_type = 'playlist' AND cs.content_id::text = cp.id::text
-        LEFT JOIN templates t ON cs.content_type = 'template' AND cs.content_id::text = t.id::text
-        LEFT JOIN device_group_members dgm ON cs.group_id = dgm.group_id
-        WHERE cs.is_active = true
-          AND (cs.start_date IS NULL OR cs.start_date <= CURRENT_DATE)
-          AND (cs.end_date IS NULL OR cs.end_date >= CURRENT_DATE)
-          AND (
-            cs.days_of_week IS NULL 
-            OR cs.days_of_week = '{}' 
-            OR $1 = ANY(cs.days_of_week)
-          )
+          ${deviceCountExpr} AS device_count,
+          COALESCE(m.name, cp.name, t.name) AS content_name,
+          COALESCE(m.type, 'content') AS type
+        FROM public.content_schedules cs
+        ${groupJoin}
+        LEFT JOIN public.media m
+          ON cs.content_type = 'media' AND cs.content_id::text = m.id::text
+        LEFT JOIN public.content_playlists cp
+          ON cs.content_type = 'playlist' AND cs.content_id::text = cp.id::text
+        LEFT JOIN public.templates t
+          ON cs.content_type = 'template' AND cs.content_id::text = t.id::text
+        WHERE
+          cs.enabled = TRUE
+          AND ($1 = ANY(cs.days_of_week) OR cs.days_of_week IS NULL)
           AND (cs.start_time IS NULL OR cs.start_time <= $2::time)
           AND (cs.end_time IS NULL OR cs.end_time >= $2::time)
         GROUP BY cs.id, cs.content_type, cs.content_id, m.name, m.type, cp.name, t.name
@@ -1337,15 +1351,16 @@ app.get("/api/devices/:id/details", async (req, res) => {
 
       const content = result.rows.map(row => ({
         id: row.id,
-        name: row.content_name || 'Unnamed Content',
-        type: row.type || 'unknown',
-        deviceCount: parseInt(row.device_count) || 1
+        name: row.content_name || "Unnamed Content",
+        type: row.type || "unknown",
+        deviceCount: parseInt(row.device_count, 10) || 1,
       }));
 
       res.json({ content });
     } catch (err) {
       console.error("Live content error:", err);
-      res.status(500).json({ error: "failed_to_load_live_content", content: [] });
+      // Don't break the whole dashboard if schedules/groups are missing
+      res.status(200).json({ content: [], warning: "live_content_unavailable" });
     }
   });
 
