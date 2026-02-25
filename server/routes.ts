@@ -641,9 +641,19 @@ app.get(
   "/api/admin/devices/:deviceId/last-screenshot",
   authenticateJWT,
   requireRole("admin", "manager"),
-  (req, res) => {
+  async (req, res) => {
     const { deviceId } = req.params;
-    return res.json({ file: lastScreenshot[deviceId] || null });
+    try {
+      const r = await pool.query(
+        `SELECT last_screenshot FROM screens WHERE device_id = $1 LIMIT 1`,
+        [deviceId],
+      );
+      const file = r.rows?.[0]?.last_screenshot ?? null;
+      return res.json({ file });
+    } catch (err) {
+      console.error("last-screenshot error:", err);
+      return res.status(500).json({ error: "failed_to_fetch_last_screenshot" });
+    }
   },
 );
 
@@ -652,9 +662,19 @@ app.get(
   "/api/admin/devices/:deviceId/last-recording",
   authenticateJWT,
   requireRole("admin", "manager"),
-  (req, res) => {
+  async (req, res) => {
     const { deviceId } = req.params;
-    return res.json({ file: lastRecording[deviceId] || null });
+    try {
+      const r = await pool.query(
+        `SELECT last_recording FROM screens WHERE device_id = $1 LIMIT 1`,
+        [deviceId],
+      );
+      const file = r.rows?.[0]?.last_recording ?? null;
+      return res.json({ file });
+    } catch (err) {
+      console.error("last-recording error:", err);
+      return res.status(500).json({ error: "failed_to_fetch_last_recording" });
+    }
   },
 );
 
@@ -663,11 +683,20 @@ app.get(
   "/api/admin/devices/:deviceId/screenshot",
   authenticateJWT,
   requireRole("admin", "manager"),
-  (req, res) => {
+  async (req, res) => {
     const { deviceId } = req.params;
-    const filePath = lastScreenshot[deviceId];
-    if (!filePath) return res.status(404).json({ error: "No screenshot available" });
-    return res.json({ ok: true, filePath });
+    try {
+      const r = await pool.query(
+        `SELECT last_screenshot FROM screens WHERE device_id = $1 LIMIT 1`,
+        [deviceId],
+      );
+      const filePath = r.rows?.[0]?.last_screenshot ?? null;
+      if (!filePath) return res.status(404).json({ error: "No screenshot available" });
+      return res.json({ ok: true, filePath });
+    } catch (err) {
+      console.error("admin screenshot error:", err);
+      return res.status(500).json({ error: "failed_to_fetch_screenshot" });
+    }
   },
 );
 
@@ -675,11 +704,20 @@ app.get(
   "/api/admin/devices/:deviceId/recording",
   authenticateJWT,
   requireRole("admin", "manager"),
-  (req, res) => {
+  async (req, res) => {
     const { deviceId } = req.params;
-    const filePath = lastRecording[deviceId];
-    if (!filePath) return res.status(404).json({ error: "No recording available" });
-    return res.json({ ok: true, filePath });
+    try {
+      const r = await pool.query(
+        `SELECT last_recording FROM screens WHERE device_id = $1 LIMIT 1`,
+        [deviceId],
+      );
+      const filePath = r.rows?.[0]?.last_recording ?? null;
+      if (!filePath) return res.status(404).json({ error: "No recording available" });
+      return res.json({ ok: true, filePath });
+    } catch (err) {
+      console.error("admin recording error:", err);
+      return res.status(500).json({ error: "failed_to_fetch_recording" });
+    }
   },
 );
 
@@ -714,7 +752,7 @@ app.get("/api/device/commands", authenticateDevice, async (req, res) => {
         UPDATE device_commands
         SET status = 'delivered',
             delivered_at = NOW(),
-            attempts = attempts + 1
+            attempts = attempts + 1,
             sent = TRUE
         WHERE id = ANY($1)
         `,
@@ -745,7 +783,8 @@ app.post("/api/device/commands/:commandId/ack", authenticateDevice, async (req, 
       `
       UPDATE device_commands
       SET status = 'acked',
-          acked_at = NOW()
+          acked_at = NOW(),
+          sent = TRUE
       WHERE id = $1 AND device_id = $2
       RETURNING id
       `,
@@ -776,7 +815,8 @@ app.post("/api/device/commands/:commandId/result", authenticateDevice, async (re
       `
       UPDATE device_commands
       SET status = $3,
-          executed_at = NOW()
+          executed_at = NOW(),
+          executed = TRUE
       WHERE id = $1 AND device_id = $2
       `,
       [commandId, deviceId, status],
@@ -1312,37 +1352,56 @@ app.get("/api/devices/:id/details", async (req, res) => {
   // =====================================================
   // ACTIVE COMMANDS STATUS (for progress tracking)
   // =====================================================
-  app.get("/api/commands/active", async (req, res) => {
+  app.get("/api/commands/active", async (_req, res) => {
     try {
-      // Get commands from last 5 minutes that are not yet fully executed
+      // Commands from last 10 minutes for progress tracking in the CMS
       const result = await pool.query(`
         SELECT 
           dc.id,
           dc.device_id,
           dc.payload,
-          dc.sent,
+          dc.status,
+          dc.delivered_at,
+          dc.acked_at,
           dc.executed,
           dc.executed_at,
           dc.created_at,
           s.name as device_name
         FROM device_commands dc
         LEFT JOIN screens s ON dc.device_id = s.device_id
-        WHERE dc.created_at > NOW() - INTERVAL '5 minutes'
+        WHERE dc.created_at > NOW() - INTERVAL '10 minutes'
         ORDER BY dc.created_at DESC
-        LIMIT 20
+        LIMIT 50
       `);
 
-      const commands = result.rows.map(cmd => {
-        const payload = typeof cmd.payload === 'string' ? JSON.parse(cmd.payload) : cmd.payload;
-        let status = 'queued';
+      const commands = result.rows.map((cmd: any) => {
+        const payload = typeof cmd.payload === "string" ? JSON.parse(cmd.payload) : cmd.payload;
+
+        const s = (cmd.status || "queued") as string;
+        let statusLabel = s;
         let progress = 0;
-        
-        if (cmd.executed) {
-          status = 'completed';
+
+        // Canonical status pipeline:
+        // queued -> delivered -> acked -> succeeded|failed
+        if (s === "queued") {
+          statusLabel = "queued";
+          progress = 0;
+        } else if (s === "delivered") {
+          statusLabel = "delivered";
+          progress = 35;
+        } else if (s === "acked") {
+          statusLabel = "acked";
+          progress = 70;
+        } else if (s === "succeeded") {
+          statusLabel = "succeeded";
           progress = 100;
-        } else if (cmd.sent) {
-          status = 'delivering';
-          progress = 50;
+        } else if (s === "failed") {
+          statusLabel = "failed";
+          progress = 100;
+        } else {
+          // fallback for any unknown statuses
+          statusLabel = s;
+          progress = cmd.executed ? 100 : 10;
         }
 
         return {
@@ -1351,10 +1410,12 @@ app.get("/api/devices/:id/details", async (req, res) => {
           deviceName: cmd.device_name || cmd.device_id,
           type: payload.type,
           contentName: payload.contentName || payload.type,
-          status,
+          status: statusLabel,
           progress,
           createdAt: cmd.created_at,
-          executedAt: cmd.executed_at
+          deliveredAt: cmd.delivered_at,
+          ackedAt: cmd.acked_at,
+          executedAt: cmd.executed_at,
         };
       });
 
@@ -1364,6 +1425,7 @@ app.get("/api/devices/:id/details", async (req, res) => {
       res.status(500).json({ error: "failed_to_fetch_active_commands" });
     }
   });
+
 
   // =====================================================
   // COMMAND HISTORY FOR DEVICE (CMS)
@@ -1382,8 +1444,11 @@ app.get("/api/devices/:id/details", async (req, res) => {
           SELECT
             id,
             payload,
+            status,
             sent,
             executed,
+            delivered_at,
+            acked_at,
             executed_at,
             created_at
           FROM device_commands
@@ -1567,14 +1632,26 @@ app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) =
   });
 
   // Alternative endpoints returning null if not found (simpler for Android)
-  app.get("/api/device/:deviceId/last-screenshot", (req, res) => {
+  app.get("/api/device/:deviceId/last-screenshot", async (req, res) => {
     const { deviceId } = req.params;
-    res.json({ file: lastScreenshot[deviceId] || null });
+    try {
+      const r = await pool.query(`SELECT last_screenshot FROM screens WHERE device_id = $1 LIMIT 1`, [deviceId]);
+      res.json({ file: r.rows?.[0]?.last_screenshot ?? null });
+    } catch (err) {
+      console.error("device last-screenshot error:", err);
+      res.status(500).json({ error: "failed_to_fetch_last_screenshot" });
+    }
   });
 
-  app.get("/api/device/:deviceId/last-recording", (req, res) => {
+  app.get("/api/device/:deviceId/last-recording", async (req, res) => {
     const { deviceId } = req.params;
-    res.json({ file: lastRecording[deviceId] || null });
+    try {
+      const r = await pool.query(`SELECT last_recording FROM screens WHERE device_id = $1 LIMIT 1`, [deviceId]);
+      res.json({ file: r.rows?.[0]?.last_recording ?? null });
+    } catch (err) {
+      console.error("device last-recording error:", err);
+      res.status(500).json({ error: "failed_to_fetch_last_recording" });
+    }
   });
 
   // Serve latest screenshot image directly
@@ -4238,8 +4315,8 @@ if (verifyDisplayTokenOrFail(req, res, deviceId)) {
       // Create command for each device
       for (const device of devices) {
         await pool.query(
-          `INSERT INTO device_commands (device_id, payload, sent, executed)
-           VALUES ($1, $2, false, false)`,
+          `INSERT INTO device_commands (device_id, payload, status, sent, executed, attempts, created_at)
+           VALUES ($1, $2, 'queued', false, false, 0, NOW())`,
           [device.device_id, JSON.stringify({
             type: "PLAY_CONTENT",
             contentId,
