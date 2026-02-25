@@ -1,14 +1,44 @@
 import express, { type Request, Response, NextFunction } from "express";
 import path from "path";
+import fs from "fs";
 import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { randomUUID } from "crypto";
 import { registerRoutes } from "./routes";
 import { createServer } from "http";
+import { fileURLToPath } from "url";
 
 const app = express();
-app.use("/display", express.static(path.join(process.cwd(), "public/display")));
+
+/* --------------------------------------------------
+   DISPLAY STATIC (robust on Render)
+-------------------------------------------------- */
+
+// Works for BOTH CJS build (dist/index.cjs) and ESM
+const DIRNAME =
+  typeof __dirname !== "undefined"
+    ? __dirname
+    : path.dirname(fileURLToPath(import.meta.url));
+
+// Try a few candidates depending on where Render runs from
+const DISPLAY_CANDIDATES = [
+  path.resolve(process.cwd(), "public", "display"),
+  path.resolve(DIRNAME, "..", "public", "display"),
+  path.resolve(DIRNAME, "..", "..", "public", "display"),
+];
+
+const DISPLAY_DIR =
+  DISPLAY_CANDIDATES.find((p) => fs.existsSync(p)) ?? DISPLAY_CANDIDATES[0];
+
+// ✅ Serve /display/* static files FIRST
+app.use("/display", express.static(DISPLAY_DIR));
+
+// ✅ Hard route so the logo is NEVER treated as :screenId
+app.get("/display/fallback-logo.svg", (_req, res) => {
+  res.sendFile(path.join(DISPLAY_DIR, "fallback-logo.svg"));
+});
+
 const httpServer = createServer(app);
 
 /* --------------------------------------------------
@@ -39,12 +69,6 @@ app.use(helmet());
 
 /* --------------------------------------------------
    CORS (SAAS-GRADE)
-   - Allows:
-     - localhost (dev)
-     - origins listed in CORS_ORIGIN (comma-separated)
-     - Vercel preview URLs matching your project prefix
-   - In production, if CORS_ORIGIN is empty, we still allow
-     vercel previews + localhost? (you can disable localhost if you want).
 -------------------------------------------------- */
 
 // Comma-separated allowlist from environment
@@ -53,37 +77,25 @@ const corsOrigins = (process.env.CORS_ORIGIN || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// Allow Vercel preview URLs for this project (adjust prefix if needed)
 const vercelPreviewRegex = /^https:\/\/signage-frontend-.*\.vercel\.app$/;
 
 const isAllowedOrigin = (origin: string) => {
-  // Explicit allowlist from env
   if (corsOrigins.includes(origin)) return true;
-
-  // Local dev
   if (origin === "http://localhost:5173") return true;
   if (origin === "http://localhost:3000") return true;
-
-  // Any preview deployment for this project
   if (vercelPreviewRegex.test(origin)) return true;
-
   return false;
 };
 
 const corsMiddleware = cors({
   origin: (origin, cb) => {
-    // Allow non-browser clients (curl, server-to-server)
     if (!origin) return cb(null, true);
 
-    // If no env origins defined:
-    // - allow vercel previews + localhost (dev convenience)
-    // - block everything else (secure default)
     if (corsOrigins.length === 0) {
       if (isAllowedOrigin(origin)) return cb(null, true);
       return cb(new Error(`CORS blocked: ${origin}`));
     }
 
-    // If env allowlist exists, still allow vercel previews + localhost too
     if (isAllowedOrigin(origin)) return cb(null, true);
 
     return cb(new Error(`CORS blocked: ${origin}`));
@@ -93,17 +105,12 @@ const corsMiddleware = cors({
   allowedHeaders: ["Content-Type", "Authorization"],
 });
 
-// Apply CORS BEFORE routes
 app.use(corsMiddleware);
-
-// IMPORTANT: handle preflight requests
 app.options("*", corsMiddleware);
 
 /* --------------------------------------------------
    RATE LIMITING
 -------------------------------------------------- */
-
-// Global API limit
 app.use(
   "/api",
   rateLimit({
@@ -114,7 +121,6 @@ app.use(
   }),
 );
 
-// Stricter auth limit
 app.use(
   "/api/auth",
   rateLimit({
@@ -175,16 +181,8 @@ app.use((req, res, next) => {
 (async () => {
   await registerRoutes(httpServer, app);
 
-  /* --------------------------------------------------
-     PLAYER DISPLAY ROUTES (Android WebView / TV Browser)
-     - /display shows a helpful message
-     - /display/:screenId renders a simple player page
-  -------------------------------------------------- */
   app.get("/display", (_req, res) => {
-    res
-      .status(200)
-      .send(
-        `<!doctype html>
+    res.status(200).send(`<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
@@ -203,21 +201,16 @@ app.use((req, res, next) => {
         <h1>Lumina Player</h1>
         <p>This endpoint expects a screen/device id.</p>
         <p>Try: <code>/display/&lt;id&gt;</code></p>
-        <p>If you scanned a QR but still see this, the Android app is not passing the id.</p>
       </div>
     </div>
   </body>
-</html>`,
-      );
+</html>`);
   });
 
   app.get("/display/:screenId", (req, res) => {
     const screenId = encodeURIComponent(req.params.screenId);
 
-    res
-      .status(200)
-      .send(
-        `<!doctype html>
+    res.status(200).send(`<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
@@ -233,24 +226,13 @@ app.use((req, res, next) => {
     <div id="root">Loading...</div>
     <script src="/display/app.js" defer></script>
   </body>
-</html>`,
-      );
+</html>`);
   });
 
-  /* --------------------------------------------------
-     HEALTH / ROOT
-  -------------------------------------------------- */
-  app.get("/", (_req, res) => {
-    res.send("Signage API running");
-  });
+  app.get("/", (_req, res) => res.send("Signage API running"));
+  app.get("/api/ping", (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
-  app.get("/api/ping", (_req, res) => {
-    res.json({ ok: true, time: new Date().toISOString() });
-  });
-
-  app.use("/api", (_req, res) => {
-    res.status(404).json({ error: "API route not found" });
-  });
+  app.use("/api", (_req, res) => res.status(404).json({ error: "API route not found" }));
 
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
     const status = err.status || err.statusCode || 500;
@@ -260,15 +242,8 @@ app.use((req, res, next) => {
   });
 
   const port = parseInt(process.env.PORT || "5000", 10);
-
-  httpServer.listen(
-    {
-      port,
-      host: "0.0.0.0",
-      reusePort: true,
-    },
-    () => {
-      log(`API listening on port ${port}`);
-    },
-  );
+  httpServer.listen({ port, host: "0.0.0.0", reusePort: true }, () => {
+    log(`API listening on port ${port}`);
+    log(`Display dir = ${DISPLAY_DIR}`);
+  });
 })();
