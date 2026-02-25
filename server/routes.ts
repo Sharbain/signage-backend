@@ -1343,9 +1343,18 @@ app.get("/api/devices/:id/details", async (req, res) => {
       }));
 
       res.json({ content });
-    } catch (err) {
+    } catch (err: any) {
+      // If an optional table doesn't exist yet (e.g. older DB), don't break the dashboard.
+      const pgCode = err?.code;
+      const msg = String(err?.message ?? "");
+
+      if (pgCode === "42P01" && msg.includes("device_group_members")) {
+        console.warn("Live content fallback: missing device_group_members; returning empty content.");
+        return res.json({ content: [] });
+      }
+
       console.error("Live content error:", err);
-      res.status(500).json({ error: "failed_to_load_live_content", content: [] });
+      return res.status(500).json({ error: "failed_to_load_live_content", content: [] });
     }
   });
 
