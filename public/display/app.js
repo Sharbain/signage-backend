@@ -16,32 +16,26 @@
   // Served by backend static route: /display/fallback-logo.svg
   const FALLBACK_URL = "/display/fallback-logo.svg";
 
-  function normalizeMediaUrl(raw) {
-    const u = String(raw || "").trim();
-    if (!u) return u;
+  // Normalize URLs coming from the backend.
+  // Fixes cases where DB rows were created locally and still contain localhost URLs.
+  function normalizeUrl(u) {
+    if (!u || typeof u !== "string") return "";
 
-    // If backend accidentally stored localhost URLs from dev, rewrite to current origin.
     try {
-      const parsed = new URL(u, location.origin);
-      const host = parsed.hostname;
-      const isLocalhost =
-        host === "localhost" ||
-        host === "127.0.0.1" ||
-        host === "0.0.0.0";
-
-      if (isLocalhost) {
-        // keep pathname + search + hash, but use current origin
-        return location.origin + parsed.pathname + parsed.search + parsed.hash;
+      if (
+        u.startsWith("http://localhost") ||
+        u.startsWith("https://localhost") ||
+        u.startsWith("http://127.0.0.1") ||
+        u.startsWith("https://127.0.0.1")
+      ) {
+        const parsed = new URL(u);
+        return window.location.origin + parsed.pathname;
       }
 
-      // For relative URLs, URL() will resolve against current origin already.
-      // Return absolute for consistency.
-      if (!/^https?:/i.test(u)) {
-        return parsed.href;
-      }
+      if (u.startsWith("/")) return window.location.origin + u;
 
       return u;
-    } catch (_) {
+    } catch {
       return u;
     }
   }
@@ -94,7 +88,7 @@
     if (!root) return;
 
     const img = document.createElement("img");
-    img.src = FALLBACK_URL;
+    img.src = normalizeUrl(FALLBACK_URL);
     img.alt = "Fallback";
     img.style.maxWidth = "100%";
     img.style.maxHeight = "100%";
@@ -156,7 +150,7 @@
 
     if (!root) return;
 
-    const url = normalizeMediaUrl(item?.url);
+    const url = normalizeUrl(String(item?.url || ""));
     const name = String(item?.name || "media");
 
     if (isVideo(item)) {
