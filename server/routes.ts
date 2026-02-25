@@ -29,6 +29,9 @@ import {
   insertTemplatePlaylistItemSchema,
 } from "@shared/schema";
 import { pool } from "./db";
+
+// Alias for legacy code paths that expect `db.query(...)`
+const db = pool;
 import { z } from "zod";
 import { requireRole } from "./middleware/permissions";
 import { authenticateJWT, authenticateDevice, authenticateUserOrDevice } from "./middleware/auth";
