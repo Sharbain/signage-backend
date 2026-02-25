@@ -2172,9 +2172,17 @@ app.get("/api/screens/:deviceId/playlist", async (req, res) => {
 
           const result = await pool.query(
             `
-            INSERT INTO device_commands (device_id, payload, sent, executed)
-            VALUES ($1, $2, false, false)
-            RETURNING id, created_at
+            INSERT INTO device_commands (
+               device_id,
+               payload,
+               status,
+               sent,
+               executed,
+               attempts,
+               created_at
+             )
+             VALUES ($1, $2, 'queued', false, false, 0, NOW())
+             RETURNING id, created_at
             `,
             [deviceId, JSON.stringify(payload)],
           );
