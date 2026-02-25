@@ -715,6 +715,7 @@ app.get("/api/device/commands", authenticateDevice, async (req, res) => {
         SET status = 'delivered',
             delivered_at = NOW(),
             attempts = attempts + 1
+            sent = TRUE
         WHERE id = ANY($1)
         `,
         [ids],
