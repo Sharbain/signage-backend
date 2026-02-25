@@ -763,7 +763,7 @@ app.get("/api/device/commands", authenticateDevice, async (req, res) => {
     return res.json(
       result.rows.map((r: any) => ({
         id: String(r.id),
-        ...(typeof r.payload === "string" ? JSON.parse(r.payload) : r.payload),
+        payload: typeof r.payload === "string" ? JSON.parse(r.payload) : r.payload,
       })),
     );
   } catch (err) {
@@ -1343,18 +1343,9 @@ app.get("/api/devices/:id/details", async (req, res) => {
       }));
 
       res.json({ content });
-    } catch (err: any) {
-      // If an optional table doesn't exist yet (e.g. older DB), don't break the dashboard.
-      const pgCode = err?.code;
-      const msg = String(err?.message ?? "");
-
-      if (pgCode === "42P01" && msg.includes("device_group_members")) {
-        console.warn("Live content fallback: missing device_group_members; returning empty content.");
-        return res.json({ content: [] });
-      }
-
+    } catch (err) {
       console.error("Live content error:", err);
-      return res.status(500).json({ error: "failed_to_load_live_content", content: [] });
+      res.status(500).json({ error: "failed_to_load_live_content", content: [] });
     }
   });
 
@@ -1554,7 +1545,7 @@ app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) =
     return res.json(
       result.rows.map((r: any) => ({
         id: String(r.id),
-        ...(typeof r.payload === "string" ? JSON.parse(r.payload) : r.payload),
+        payload: typeof r.payload === "string" ? JSON.parse(r.payload) : r.payload,
       })),
     );
   } catch (err) {
