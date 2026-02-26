@@ -12,6 +12,12 @@ import { fileURLToPath } from "url";
 const app = express();
 
 /* --------------------------------------------------
+   TRUST PROXY (Render/Cloudflare)
+   Fixes: ERR_ERL_UNEXPECTED_X_FORWARDED_FOR (express-rate-limit)
+-------------------------------------------------- */
+app.set("trust proxy", 1);
+
+/* --------------------------------------------------
    DISPLAY STATIC (robust on Render)
 -------------------------------------------------- */
 
@@ -41,7 +47,6 @@ app.get("/display/fallback-logo.svg", (_req, res) => {
 
 /* --------------------------------------------------
    UPLOADS STATIC (Option A: public /uploads)
-   This fixes 401s when the player loads media URLs like /uploads/<file>
 -------------------------------------------------- */
 
 const UPLOADS_CANDIDATES = [
@@ -91,9 +96,44 @@ app.use((req, res, next) => {
 });
 
 /* --------------------------------------------------
-   SECURITY BASELINE
+   SECURITY BASELINE (CSP FIX FOR SUPABASE)
 -------------------------------------------------- */
-app.use(helmet());
+
+// Allow images/media from Supabase Storage (and your own domain)
+const SUPABASE_URL = process.env.SUPABASE_URL?.trim();
+const supabaseOrigin = SUPABASE_URL ? new URL(SUPABASE_URL).origin : null;
+
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      useDefaults: true,
+      directives: {
+        // Keep defaults + add what we need
+        "img-src": [
+          "'self'",
+          "data:",
+          "blob:",
+          ...(supabaseOrigin ? [supabaseOrigin] : []),
+          "https://*.supabase.co",
+        ],
+        "media-src": [
+          "'self'",
+          "data:",
+          "blob:",
+          ...(supabaseOrigin ? [supabaseOrigin] : []),
+          "https://*.supabase.co",
+        ],
+        // If later you add video players or fetch blobs etc, this avoids random breakage
+        "connect-src": [
+          "'self'",
+          ...(supabaseOrigin ? [supabaseOrigin] : []),
+          "https://*.supabase.co",
+        ],
+      },
+    },
+    // leave other helmet protections on
+  }),
+);
 
 /* --------------------------------------------------
    CORS (SAAS-GRADE)
@@ -258,9 +298,13 @@ app.use((req, res, next) => {
   });
 
   app.get("/", (_req, res) => res.send("Signage API running"));
-  app.get("/api/ping", (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+  app.get("/api/ping", (_req, res) =>
+    res.json({ ok: true, time: new Date().toISOString() }),
+  );
 
-  app.use("/api", (_req, res) => res.status(404).json({ error: "API route not found" }));
+  app.use("/api", (_req, res) =>
+    res.status(404).json({ error: "API route not found" }),
+  );
 
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
     const status = err.status || err.statusCode || 500;
@@ -273,5 +317,6 @@ app.use((req, res, next) => {
   httpServer.listen({ port, host: "0.0.0.0", reusePort: true }, () => {
     log(`API listening on port ${port}`);
     log(`Display dir = ${DISPLAY_DIR}`);
+    if (SUPABASE_URL) log(`Supabase origin allowed in CSP = ${supabaseOrigin}`);
   });
 })();
