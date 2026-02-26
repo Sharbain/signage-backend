@@ -22,8 +22,12 @@ async function upsertDeviceScreenshotPath(deviceId: string, filePath: string) {
     }
   };
 
-  if (await tryUpsert("screenshot")) return;
-  if (await tryUpsert("last_screenshot")) return;
+  // Some DBs/branches use `screenshot`, others use `last_screenshot`.
+  // To avoid stale CMS previews, we attempt to write BOTH (best-effort).
+  // If only one column exists, the other attempt will fail and be ignored.
+  const upsertScreenshotOk = await tryUpsert("screenshot");
+  const upsertLastScreenshotOk = await tryUpsert("last_screenshot");
+  if (upsertScreenshotOk || upsertLastScreenshotOk) return;
 
   const tryUpdateThenInsert = async (col: "screenshot" | "last_screenshot") => {
     try {
@@ -49,8 +53,9 @@ async function upsertDeviceScreenshotPath(deviceId: string, filePath: string) {
     }
   };
 
-  if (await tryUpdateThenInsert("screenshot")) return;
-  if (await tryUpdateThenInsert("last_screenshot")) return;
+  const updScreenshotOk = await tryUpdateThenInsert("screenshot");
+  const updLastScreenshotOk = await tryUpdateThenInsert("last_screenshot");
+  if (updScreenshotOk || updLastScreenshotOk) return;
 
   throw new Error("Could not persist screenshot (no matching column)");
 }
@@ -748,10 +753,14 @@ app.get(
     const { deviceId } = req.params;
     try {
       const r = await pool.query(
-        `SELECT last_screenshot FROM screens WHERE device_id = $1 LIMIT 1`,
+        `SELECT COALESCE(last_screenshot, screenshot) AS file
+         FROM screens
+         WHERE device_id = $1
+         ORDER BY screenshot_at DESC NULLS LAST, last_seen DESC NULLS LAST, id DESC
+         LIMIT 1`,
         [deviceId],
       );
-      const file = r.rows?.[0]?.last_screenshot ?? null;
+      const file = r.rows?.[0]?.file ?? null;
       return res.json({ file });
     } catch (err) {
       console.error("last-screenshot error:", err);
@@ -790,10 +799,14 @@ app.get(
     const { deviceId } = req.params;
     try {
       const r = await pool.query(
-        `SELECT last_screenshot FROM screens WHERE device_id = $1 LIMIT 1`,
+        `SELECT COALESCE(last_screenshot, screenshot) AS filePath
+         FROM screens
+         WHERE device_id = $1
+         ORDER BY screenshot_at DESC NULLS LAST, last_seen DESC NULLS LAST, id DESC
+         LIMIT 1`,
         [deviceId],
       );
-      const filePath = r.rows?.[0]?.last_screenshot ?? null;
+      const filePath = r.rows?.[0]?.filepath ?? r.rows?.[0]?.filePath ?? null;
       if (!filePath) return res.status(404).json({ error: "No screenshot available" });
       return res.json({ ok: true, filePath });
     } catch (err) {
