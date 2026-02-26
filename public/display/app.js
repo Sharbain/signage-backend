@@ -11,6 +11,7 @@
     playlist: [],
     index: 0,
     showingFallback: false,
+    lastBrightness: null,
   };
 
   // Served by backend static route: /display/fallback-logo.svg
@@ -79,6 +80,56 @@
     }
 
     return "";
+  }
+
+  // ---- Brightness helpers ----
+
+  function pickBrightnessFromPayload(data) {
+    // Accept a few possible shapes so we don't break if your backend field name differs.
+    const candidates = [
+      data?.brightness,
+      data?.screen?.brightness,
+      data?.screenSettings?.brightness,
+      data?.settings?.brightness,
+    ];
+
+    for (const v of candidates) {
+      const n = Number(v);
+      if (!Number.isNaN(n)) return n;
+    }
+    return null;
+  }
+
+  function applyBrightness(percent) {
+    const n = Number(percent);
+    if (Number.isNaN(n)) return;
+
+    const clamped = Math.max(0, Math.min(100, n));
+
+    // Avoid spamming native bridge every refresh if unchanged
+    if (state.lastBrightness === clamped) return;
+    state.lastBrightness = clamped;
+
+    // Native (Android WebView) path:
+    try {
+      if (window.PlayerBridge && typeof window.PlayerBridge.setBrightness === "function") {
+        window.PlayerBridge.setBrightness(clamped);
+        console.log("[PLAYER] Brightness sent to Android:", clamped);
+        return;
+      }
+    } catch (e) {
+      console.warn("[PLAYER] Brightness bridge error:", e);
+    }
+
+    // Fallback for browser testing only (does NOT change device brightness):
+    try {
+      if (root) {
+        // Keep it subtle so content remains readable
+        const factor = Math.max(0.1, clamped / 100);
+        root.style.filter = `brightness(${factor})`;
+      }
+      console.log("[PLAYER] Brightness applied via CSS fallback:", clamped);
+    } catch (_) {}
   }
 
   function showFallbackLogo(reason) {
@@ -264,6 +315,11 @@
 
     try {
       const data = await fetchPlaylist();
+
+      // ✅ Apply brightness as soon as we have payload (before showing media)
+      const b = pickBrightnessFromPayload(data);
+      if (b != null) applyBrightness(b);
+
       const playlist = Array.isArray(data?.playlist) ? data.playlist : [];
 
       state.playlist = playlist;
