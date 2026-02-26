@@ -1,3 +1,60 @@
+
+/**
+ * Upsert screenshot path for a device.
+ */
+async function upsertDeviceScreenshotPath(deviceId: string, filePath: string) {
+  const tryUpsert = async (col: "screenshot" | "last_screenshot") => {
+    try {
+      await pool.query(
+        `INSERT INTO screens (device_id, ${col}, screenshot_at, last_seen, is_online)
+         VALUES ($1, $2, NOW(), NOW(), TRUE)
+         ON CONFLICT (device_id)
+         DO UPDATE SET
+           ${col}         = EXCLUDED.${col},
+           screenshot_at  = EXCLUDED.screenshot_at,
+           last_seen      = EXCLUDED.last_seen,
+           is_online      = EXCLUDED.is_online`,
+        [deviceId, filePath],
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  if (await tryUpsert("screenshot")) return;
+  if (await tryUpsert("last_screenshot")) return;
+
+  const tryUpdateThenInsert = async (col: "screenshot" | "last_screenshot") => {
+    try {
+      const upd = await pool.query(
+        `UPDATE screens
+           SET ${col} = $2,
+               screenshot_at = NOW(),
+               last_seen = NOW(),
+               is_online = TRUE
+         WHERE device_id = $1`,
+        [deviceId, filePath],
+      );
+      if ((upd.rowCount ?? 0) > 0) return true;
+
+      await pool.query(
+        `INSERT INTO screens (device_id, ${col}, screenshot_at, last_seen, is_online)
+         VALUES ($1, $2, NOW(), NOW(), TRUE)`,
+        [deviceId, filePath],
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  if (await tryUpdateThenInsert("screenshot")) return;
+  if (await tryUpdateThenInsert("last_screenshot")) return;
+
+  throw new Error("Could not persist screenshot (no matching column)");
+}
+
 import type { Express, Request, Response, NextFunction } from "express";
 import { createServer, type Server } from "http";
 import { randomUUID, randomBytes, createHash } from "crypto";
@@ -1650,7 +1707,14 @@ app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) =
       }
 
       // Persist in DB
-      updateDeviceScreenshot(deviceId, filePath).catch(() => {});
+      
+      try {
+        await upsertDeviceScreenshotPath(deviceId, filePath);
+      } catch (e) {
+        console.error("[screenshot] DB persist failed:", e);
+        return res.status(500).json({ error: "db_persist_failed" });
+      }
+
 
       console.log(
         `Screenshot received from device ${deviceId}:`,
