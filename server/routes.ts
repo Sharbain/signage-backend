@@ -1106,7 +1106,11 @@ app.get("/api/devices/:id/details", async (req, res) => {
 
       // Use a stable, browser-friendly URL (no auth headers required).
       // This endpoint serves the latest screenshot file directly.
-      lastScreenshot: s.last_screenshot ? `/api/device/${encodeURIComponent(s.device_id)}/screenshot/latest` : null,
+      // Prefer the new `screenshot` column, but keep compatibility with `last_screenshot`
+/// Return a stable URL that always redirects to the newest file (with cache-buster).
+      lastScreenshot: (s.screenshot || s.last_screenshot)
+        ? `/api/device/${encodeURIComponent(s.device_id)}/screenshot/latest?v=${encodeURIComponent(String(s.screenshot_at || Date.now()))}`
+        : null,
       screenshotAt: null,
       thumbnail: null,
 
@@ -1810,24 +1814,40 @@ app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) =
   });
 
   // Serve latest screenshot image directly
-  app.get("/api/device/:deviceId/screenshot/latest", (req, res) => {
-    const { deviceId } = req.params;
-    const screenshotPath = path.join(screenshotsDir, `${deviceId}_latest.png`);
+  app.get("/api/device/:deviceId/screenshot/latest", async (req, res) => {
+  // Prevent browser caching of the "latest" screenshot URL
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
 
-    if (!fs.existsSync(screenshotPath)) {
-      // Try to find any screenshot for this device
-      const files = fs
-        .readdirSync(screenshotsDir)
-        .filter((f) => f.startsWith(deviceId));
-      if (files.length > 0) {
-        files.sort().reverse();
-        return res.sendFile(path.join(screenshotsDir, files[0]));
-      }
-      return res.status(404).send("No screenshot available");
+  const deviceId = decodeURIComponent(req.params.deviceId || "");
+
+  try {
+    const { rows } = await pool.query(
+      "SELECT screenshot, last_screenshot, screenshot_at FROM screens WHERE device_id = $1 LIMIT 1",
+      [deviceId],
+    );
+
+    const row = rows[0];
+    const url: string | null =
+      (row?.screenshot as string | null) || (row?.last_screenshot as string | null);
+
+    if (!url) {
+      return res.status(404).send("No screenshot");
     }
 
-    res.sendFile(screenshotPath);
-  });
+    const ts = row?.screenshot_at
+      ? new Date(row.screenshot_at as string).getTime()
+      : Date.now();
+    const sep = url.includes("?") ? "&" : "?";
+
+    // Redirect to the storage URL (Supabase public URL), with a cache-buster.
+    return res.redirect(302, `${url}${sep}v=${ts}`);
+  } catch (e) {
+    console.error("GET latest screenshot failed", e);
+    return res.status(500).send("Failed to load screenshot");
+  }
+});
 
 app.post("/api/devices", authenticateJWT, requireRole("admin"), async (req, res) => {
   try {
