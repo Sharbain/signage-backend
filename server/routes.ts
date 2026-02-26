@@ -22,6 +22,7 @@ import multer from "multer";
 import path from "path";
 import fs from "fs";
 import express from "express";
+import { createClient } from "@supabase/supabase-js";
 import {
   insertScreenSchema,
   insertMediaSchema,
@@ -363,6 +364,50 @@ const loginSchema = z.object({
 
 const updateScreenSchema = insertScreenSchema.partial();
 
+// --------------------------------------------------
+// Supabase Storage (Option A: store uploads in Supabase)
+// --------------------------------------------------
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "uploads";
+
+const supabase =
+  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    : null;
+
+function getRequestBaseUrl(req: Request): string {
+  const proto = (req.headers["x-forwarded-proto"] as string) || req.protocol;
+  const host = (req.headers["x-forwarded-host"] as string) || req.get("host");
+  return `${proto}://${host}`;
+}
+
+async function uploadToSupabase(opts: {
+  localPath: string;
+  bucketPath: string;
+  contentType?: string;
+}): Promise<string | null> {
+  if (!supabase) return null;
+
+  const fileBuffer = await fs.promises.readFile(opts.localPath);
+  const { error } = await supabase.storage
+    .from(SUPABASE_STORAGE_BUCKET)
+    .upload(opts.bucketPath, fileBuffer, {
+      contentType: opts.contentType,
+      upsert: false,
+    });
+  if (error) {
+    console.error("[supabase] upload error", error);
+    return null;
+  }
+
+  // Public URL (bucket must be public)
+  const { data } = supabase.storage
+    .from(SUPABASE_STORAGE_BUCKET)
+    .getPublicUrl(opts.bucketPath);
+  return data?.publicUrl || null;
+}
+
 // authMiddleware replaced by authenticateJWT in server/middleware/auth.ts
 
 export async function registerRoutes(
@@ -370,18 +415,18 @@ export async function registerRoutes(
   app: Express,
 ): Promise<Server> {
   // --------------------------------------------------
-  // Protect uploads (no public filesystem exposure)
-  // Allow either admin/user JWT or a valid device token.
+  // Local uploads (fallback)
+  // Option A uses Supabase Storage for new uploads, but we keep /uploads public
+  // so older media keeps working during the transition.
   // --------------------------------------------------
   if (process.env.NODE_ENV !== "test") {
     app.use(
       "/uploads",
-      authenticateUserOrDevice,
       (await import("express")).default.static(uploadsDir, {
         fallthrough: false,
         setHeaders: (res) => {
           res.setHeader("X-Content-Type-Options", "nosniff");
-          res.setHeader("Cache-Control", "private, max-age=300");
+          res.setHeader("Cache-Control", "public, max-age=86400");
         },
       }),
     );
@@ -1575,7 +1620,7 @@ app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) =
     "/api/device/:deviceId/screenshot",
     authenticateDevice,
     screenshotUpload.single("file"),
-    (req, res) => {
+    async (req, res) => {
       const { deviceId } = req.params;
 
       // Enforce: authenticated device can only upload for itself
@@ -1587,8 +1632,24 @@ app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) =
         return res.status(400).json({ error: "No file uploaded" });
       }
 
-      const filePath = `/uploads/screenshots/${req.file.filename}`;
-      // Persist in DB (survives restarts)
+      // Default to local path, but prefer Supabase (Option A)
+      let filePath = `/uploads/screenshots/${req.file.filename}`;
+      try {
+        const publicUrl = await uploadToSupabase({
+          localPath: req.file.path,
+          bucketPath: `screenshots/${req.file.filename}`,
+          contentType: req.file.mimetype,
+        });
+        if (publicUrl) {
+          filePath = publicUrl;
+          // Best-effort cleanup of local temp file
+          fs.promises.unlink(req.file.path).catch(() => {});
+        }
+      } catch (e) {
+        console.error("[screenshot] upload failed", e);
+      }
+
+      // Persist in DB
       updateDeviceScreenshot(deviceId, filePath).catch(() => {});
 
       console.log(
@@ -1604,14 +1665,28 @@ app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) =
   app.post(
     "/api/device/:deviceId/record",
     recordingUpload.single("file"),
-    (req, res) => {
+    async (req, res) => {
       const { deviceId } = req.params;
 
       if (!req.file) {
         return res.status(400).json({ error: "No file uploaded" });
       }
 
-      const filePath = `/uploads/recordings/${req.file.filename}`;
+      let filePath = `/uploads/recordings/${req.file.filename}`;
+      try {
+        const publicUrl = await uploadToSupabase({
+          localPath: req.file.path,
+          bucketPath: `recordings/${req.file.filename}`,
+          contentType: req.file.mimetype,
+        });
+        if (publicUrl) {
+          filePath = publicUrl;
+          fs.promises.unlink(req.file.path).catch(() => {});
+        }
+      } catch (e) {
+        console.error("[record] upload failed", e);
+      }
+
       lastRecording[deviceId] = filePath;
 
       console.log(
@@ -2374,8 +2449,21 @@ app.get("/api/screens/:deviceId/playlist", async (req, res) => {
         return res.status(400).json({ error: "No thumbnail file provided" });
       }
 
-      try {
-        const thumbnailUrl = `/uploads/device-thumbnails/${file.filename}`;
+	      try {
+	        let thumbnailUrl = `/uploads/device-thumbnails/${file.filename}`;
+	        try {
+	          const publicUrl = await uploadToSupabase({
+	            localPath: file.path,
+	            bucketPath: `device-thumbnails/${file.filename}`,
+	            contentType: file.mimetype,
+	          });
+	          if (publicUrl) {
+	            thumbnailUrl = publicUrl;
+	            fs.promises.unlink(file.path).catch(() => {});
+	          }
+	        } catch (e) {
+	          console.error("[thumbnail] supabase upload failed", e);
+	        }
         
         await pool.query(
           `UPDATE screens SET thumbnail = $1 WHERE device_id = $2`,
@@ -3307,10 +3395,21 @@ if (!verifyDisplayTokenOrFail(req, res, deviceId)) {
           return res.status(400).json({ error: "No file uploaded" });
         }
 
-        const baseUrl =
-          process.env.BASE_URL ||
-          `http://localhost:${process.env.PORT || 5000}`;
-        const fileUrl = `${baseUrl}/uploads/${req.file.filename}`;
+	      // Default to local URL, but prefer Supabase Storage (Option A)
+	      let fileUrl = `${getRequestBaseUrl(req)}/uploads/${req.file.filename}`;
+	      try {
+	        const publicUrl = await uploadToSupabase({
+	          localPath: req.file.path,
+	          bucketPath: `media/${req.file.filename}`,
+	          contentType: req.file.mimetype,
+	        });
+	        if (publicUrl) {
+	          fileUrl = publicUrl;
+	          fs.promises.unlink(req.file.path).catch(() => {});
+	        }
+	      } catch (e) {
+	        console.error("[media] supabase upload failed", e);
+	      }
         const fileType = req.file.mimetype.startsWith("video")
           ? "video"
           : "image";
@@ -4170,7 +4269,20 @@ if (!verifyDisplayTokenOrFail(req, res, deviceId)) {
         return res.status(400).json({ error: "No file uploaded" });
       }
 
-      const iconUrl = `/uploads/group-icons/${req.file.filename}`;
+	      let iconUrl = `/uploads/group-icons/${req.file.filename}`;
+	      try {
+	        const publicUrl = await uploadToSupabase({
+	          localPath: req.file.path,
+	          bucketPath: `group-icons/${req.file.filename}`,
+	          contentType: req.file.mimetype,
+	        });
+	        if (publicUrl) {
+	          iconUrl = publicUrl;
+	          fs.promises.unlink(req.file.path).catch(() => {});
+	        }
+	      } catch (e) {
+	        console.error("[group-icon] supabase upload failed", e);
+	      }
 
       try {
         await storage.updateGroupIcon(id, iconUrl);
@@ -4195,7 +4307,20 @@ if (!verifyDisplayTokenOrFail(req, res, deviceId)) {
         return res.status(400).json({ error: "No file uploaded" });
       }
 
-      const iconUrl = `/uploads/group-icons/${req.file.filename}`;
+	      let iconUrl = `/uploads/group-icons/${req.file.filename}`;
+	      try {
+	        const publicUrl = await uploadToSupabase({
+	          localPath: req.file.path,
+	          bucketPath: `group-icons/${req.file.filename}`,
+	          contentType: req.file.mimetype,
+	        });
+	        if (publicUrl) {
+	          iconUrl = publicUrl;
+	          fs.promises.unlink(req.file.path).catch(() => {});
+	        }
+	      } catch (e) {
+	        console.error("[group-icon] supabase upload failed", e);
+	      }
 
       try {
         await storage.updateGroupIcon(id, iconUrl);
