@@ -643,6 +643,8 @@ app.post("/api/device/activate", async (req: Request, res: Response) => {
     return res.status(500).json({ error: "Internal server error" });
   }
 
+});
+
 // --------------------------------------------------
 // Device: mint short-lived Display Token for WebView player
 // - Android calls this after pairing (DeviceKey auth)
@@ -662,7 +664,6 @@ app.post("/api/device/display-token", authenticateDevice, async (req: Request, r
   }
 });
 
-});
 
 
 // --------------------------------------------------
