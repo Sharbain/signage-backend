@@ -40,6 +40,12 @@ const DISPLAY_DIR =
 // ✅ Serve /display/* static files FIRST
 app.use("/display", express.static(DISPLAY_DIR));
 
+// ✅ Player route: /display/:deviceId -> serves the display SPA
+app.get("/display/:deviceId", (_req, res) => {
+  res.sendFile(path.join(DISPLAY_DIR, "index.html"));
+});
+
+
 // ✅ Hard route so the logo is NEVER treated as :screenId
 app.get("/display/fallback-logo.svg", (_req, res) => {
   res.sendFile(path.join(DISPLAY_DIR, "fallback-logo.svg"));

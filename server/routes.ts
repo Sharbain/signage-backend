@@ -317,15 +317,23 @@ if (!process.env.JWT_SECRET) {
 const JWT_SECRET = process.env.JWT_SECRET;
 
 function verifyDisplayTokenOrFail(req: any, res: any, expectedDeviceId: string): boolean {
+  // Support either Authorization: Bearer <token> OR ?token=<token>
   const authHeader = (req.headers?.authorization as string | undefined) ?? "";
-
-  const displayAccessToken =
+  const bearerToken =
     authHeader.toLowerCase().startsWith("bearer ")
       ? authHeader.slice("bearer ".length).trim()
       : undefined;
 
-  // ✅ LEGACY MODE: if no token provided, allow playback (don’t block devices)
-  if (!displayAccessToken) return true;
+  const qTokenRaw = (req.query?.token as string | undefined) ?? (req.query?.t as string | undefined);
+  const qToken = qTokenRaw && typeof qTokenRaw === "string" ? qTokenRaw.trim() : undefined;
+
+  const displayAccessToken = bearerToken || qToken;
+
+  // ✅ HARDENED: token is REQUIRED
+  if (!displayAccessToken) {
+    res.status(401).json({ error: "display_access_token_required" });
+    return false;
+  }
 
   try {
     const decoded: any = jwt.verify(displayAccessToken, JWT_SECRET);
@@ -2148,6 +2156,10 @@ app.get("/api/screens/:deviceId/playlist", async (req, res) => {
   try {
     const deviceId = String(req.params.deviceId || "").trim();
     if (!deviceId) return res.status(400).json({ error: "Missing deviceId" });
+
+    // ✅ Require display access token (Bearer or ?token=)
+    if (!verifyDisplayTokenOrFail(req, res, deviceId)) return;
+
 
     // 1) Screen lookup (deviceId is stored in screens.device_id)
     const screenResult = await db.query(
