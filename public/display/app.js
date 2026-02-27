@@ -66,12 +66,13 @@
   }
 
   function getToken() {
-    // Optional (future hardening). For now, signage works without a token.
+    // ✅ Token is now REQUIRED (backend hardening)
     const qs = new URLSearchParams(location.search || "");
     const qToken = qs.get("token") || qs.get("t");
     if (qToken && qToken.trim()) return qToken.trim();
 
-    const keys = ["screenToken", "deviceToken", "device_token"]; // avoid CMS accessToken
+    // Keep localStorage fallback for browser testing only (optional)
+    const keys = ["screenToken", "deviceToken", "device_token"];
     for (const k of keys) {
       try {
         const v = localStorage.getItem(k);
@@ -124,7 +125,6 @@
     // Fallback for browser testing only (does NOT change device brightness):
     try {
       if (root) {
-        // Keep it subtle so content remains readable
         const factor = Math.max(0.1, clamped / 100);
         root.style.filter = `brightness(${factor})`;
       }
@@ -159,11 +159,21 @@
   async function fetchPlaylist() {
     const token = getToken();
 
-    const headers = {};
-    if (token) headers["Authorization"] = `Bearer ${token}`;
+    // ✅ Fail fast with a clear on-screen message if token is missing
+    if (!token) {
+      const err = new Error("missing_display_token");
+      err.status = 401;
+      err.body = "No token in URL. Expected /display/<deviceId>?token=<jwt>";
+      throw err;
+    }
+
+    // Send token BOTH ways: header + query param (most robust)
+    const headers = { Authorization: `Bearer ${token}` };
 
     // Canonical: screenId here is actually your deviceId (DEV-xxxx)
-    const url = `/api/screens/${encodeURIComponent(state.screenId)}/playlist`;
+    const url =
+      `/api/screens/${encodeURIComponent(state.screenId)}/playlist` +
+      `?token=${encodeURIComponent(token)}`;
 
     const res = await fetch(url, {
       method: "GET",
@@ -291,6 +301,7 @@
   }
 
   function computeBackoffMs(status) {
+    if (status === 401 || status === 403) return 8000;
     if (status === 500 || status === 502 || status === 503) return 15000;
     return 5000;
   }
@@ -335,6 +346,13 @@
       console.error("Playlist load failed:", e);
 
       const status = e && typeof e === "object" ? e.status : null;
+
+      // If missing token, show a very direct message
+      if (e && typeof e === "object" && e.message === "missing_display_token") {
+        setText("Missing token. Open:\n/display/<deviceId>?token=<jwt>");
+        return;
+      }
+
       showFallbackLogo(`playlist_error_${status || "unknown"}`);
 
       state.retryTimer = setTimeout(
