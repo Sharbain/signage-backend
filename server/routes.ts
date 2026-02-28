@@ -525,38 +525,73 @@ app.post("/api/device/activate", async (req, res) => {
   app.get("/api/devices/:id/details", async (req, res) => {
     const { id } = req.params;
 
+    // Postgres: screens.id is UUID, while UI often uses device_id like "DEV-XXXX".
+    // If we compare uuid = varchar, Postgres throws: "operator does not exist: uuid = character varying".
+    // So we branch safely: when id looks like a UUID, query by UUID; otherwise query by device_id.
+    const looksLikeUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      id,
+    );
+
     try {
-      const result = await pool.query(
+      const sql = looksLikeUuid
+        ? `
+          SELECT
+            s.id,
+            s.device_id,
+            s.name,
+            s.location,
+            s.status,
+            s.is_online,
+            s.last_seen AS "lastHeartbeat",
+            s.current_content_name AS "currentContentName",
+            s.screenshot,
+            s.screenshot_at AS "screenshotAt",
+            s.thumbnail,
+            s.signal_strength AS "signalStrength",
+            s.connection_type AS "connectionType",
+            s.free_storage AS "freeStorage",
+            s.last_offline AS "lastOffline",
+            s.assigned_template_id AS "assignedTemplateId",
+            s.latitude,
+            s.longitude,
+            s.brightness,
+            s.volume,
+            t.name AS "templateName"
+          FROM screens s
+          LEFT JOIN templates t ON s.assigned_template_id = t.id
+          WHERE s.id = $1::uuid OR s.device_id = $1
+          LIMIT 1
         `
-        SELECT
-          s.id,
-          s.device_id,
-          s.name,
-          s.location,
-          s.status,
-          s.is_online,
-          s.last_seen AS "lastHeartbeat",
-          s.current_content_name AS "currentContentName",
-          s.screenshot,
-          s.screenshot_at AS "screenshotAt",
-          s.thumbnail,
-          s.signal_strength AS "signalStrength",
-          s.connection_type AS "connectionType",
-          s.free_storage AS "freeStorage",
-          s.last_offline AS "lastOffline",
-          s.assigned_template_id AS "assignedTemplateId",
-          s.latitude,
-          s.longitude,
-          s.brightness,
-          s.volume,
-          t.name AS "templateName"
-        FROM screens s
-        LEFT JOIN templates t ON s.assigned_template_id = t.id
-        WHERE s.id::text = $1 OR s.device_id = $1
-        LIMIT 1
-        `,
-        [id]
-      );
+        : `
+          SELECT
+            s.id,
+            s.device_id,
+            s.name,
+            s.location,
+            s.status,
+            s.is_online,
+            s.last_seen AS "lastHeartbeat",
+            s.current_content_name AS "currentContentName",
+            s.screenshot,
+            s.screenshot_at AS "screenshotAt",
+            s.thumbnail,
+            s.signal_strength AS "signalStrength",
+            s.connection_type AS "connectionType",
+            s.free_storage AS "freeStorage",
+            s.last_offline AS "lastOffline",
+            s.assigned_template_id AS "assignedTemplateId",
+            s.latitude,
+            s.longitude,
+            s.brightness,
+            s.volume,
+            t.name AS "templateName"
+          FROM screens s
+          LEFT JOIN templates t ON s.assigned_template_id = t.id
+          WHERE s.device_id = $1
+          LIMIT 1
+        `;
+
+      const result = await pool.query(sql, [id]);
 
       if (result.rowCount === 0) {
         return res.status(404).json({ error: "Device not found" });
@@ -586,6 +621,19 @@ app.post("/api/device/activate", async (req, res) => {
       console.error("Device details error:", err);
       res.status(500).json({ error: "Failed to load device details" });
     }
+  });
+
+  // =====================================================
+  // LEGACY DEVICE COMMANDS ENDPOINT (backwards compatibility)
+  // Old APKs hit /api/device/commands (without :deviceId). We respond with a
+  // clear error so you can diagnose quickly instead of silent 401 loops.
+  // =====================================================
+  app.get("/api/device/commands", (_req, res) => {
+    return res.status(410).json({
+      error: "moved",
+      message:
+        "This endpoint moved. Use GET /api/device/:deviceId/commands with Authorization: Device <deviceKey>.",
+    });
   });
 
   // =====================================================
