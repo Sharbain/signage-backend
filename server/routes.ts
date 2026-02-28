@@ -342,7 +342,8 @@ export async function registerRoutes(
 // - Does NOT require user JWT
 // - Does NOT require a prior device token
 // - Generates/rotates a device token stored as sha256 in screens.api_key_hash
-app.post("/api/device/activate", async (req, res) => {
+// Pairing / activation handler (mounted on multiple paths for backward compatibility)
+async function handleDeviceActivate(req: any, res: any) {
   try {
     // Accept multiple client field names + tolerate formatting like "123-456" / "123 456"
     const pairingCodeRaw =
@@ -402,16 +403,26 @@ app.post("/api/device/activate", async (req, res) => {
       [row.id, tokenHash, last4],
     );
 
-    // ✅ IMPORTANT: snake_case for Android convenience
+    // ✅ Return BOTH snake_case and camelCase for client compatibility
     return res.json({
+      // snake_case
       device_id: row.device_id,
       device_key: deviceToken,
+      // camelCase (older clients)
+      deviceId: row.device_id,
+      deviceKey: deviceToken,
     });
   } catch (err) {
     console.error("activateDevice error:", err);
     return res.status(500).json({ error: "activation_failed" });
   }
-});
+}
+
+// New canonical route
+app.post("/api/device/activate", handleDeviceActivate);
+
+// Backward-compatible alias (some clients call plural)
+app.post("/api/devices/activate", handleDeviceActivate);
 
   app.use("/api/device/:deviceId", authenticateDevice);
 
