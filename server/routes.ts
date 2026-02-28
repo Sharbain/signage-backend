@@ -344,22 +344,38 @@ export async function registerRoutes(
 // - Generates/rotates a device token stored as sha256 in screens.api_key_hash
 app.post("/api/device/activate", async (req, res) => {
   try {
-    const pairingCode = String(req.body?.pairingCode || "")
+    // Accept multiple client field names + tolerate formatting like "123-456" / "123 456"
+    const pairingCodeRaw =
+      req.body?.pairing_code ??
+      req.body?.pairingCode ??
+      req.body?.code ??
+      req.body?.pairing ??
+      "";
+
+    const pairingCode = String(pairingCodeRaw)
       .trim()
+      .replace(/[-\s]/g, "")
       .toUpperCase();
 
     if (!pairingCode) {
       return res.status(400).json({ error: "pairing_code_required" });
     }
 
+    // Pairing codes are stored as SHA-256 hashes in pairing_code_hash
+    const pairingCodeHash = crypto.createHash("sha256").update(pairingCode).digest("hex");
+
     const result = await pool.query(
       `SELECT id, device_id, pairing_expires_at
        FROM screens
-       WHERE pairing_code = $1`,
-      [pairingCode],
+       WHERE pairing_code_hash = $1
+       LIMIT 1`,
+      [pairingCodeHash],
     );
 
-    const row = result.rows[0] as { id: number; device_id: string; pairing_expires_at: string | null } | undefined;
+    const row = result.rows[0] as
+      | { id: number; device_id: string; pairing_expires_at: string | null }
+      | undefined;
+
     if (!row) return res.status(404).json({ error: "invalid_pairing_code" });
 
     if (!row.pairing_expires_at || new Date(row.pairing_expires_at).getTime() < Date.now()) {
@@ -373,7 +389,7 @@ app.post("/api/device/activate", async (req, res) => {
 
     await pool.query(
       `UPDATE screens
-       SET pairing_code = NULL,
+       SET pairing_code_hash = NULL,
            pairing_expires_at = NULL,
            is_online = true,
            last_seen = NOW(),
@@ -390,11 +406,10 @@ app.post("/api/device/activate", async (req, res) => {
     return res.json({
       device_id: row.device_id,
       device_key: deviceToken,
-      device_key_last4: last4,
     });
-  } catch (e) {
-    console.error("activate error:", e);
-    return res.status(500).json({ error: "activate_failed" });
+  } catch (err) {
+    console.error("activateDevice error:", err);
+    return res.status(500).json({ error: "activation_failed" });
   }
 });
 
