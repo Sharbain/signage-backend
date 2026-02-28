@@ -1,68 +1,6 @@
-
-/**
- * Upsert screenshot path for a device.
- */
-async function upsertDeviceScreenshotPath(deviceId: string, filePath: string) {
-  const tryUpsert = async (col: "screenshot" | "last_screenshot") => {
-    try {
-      await pool.query(
-        `INSERT INTO screens (device_id, ${col}, screenshot_at, last_seen, is_online)
-         VALUES ($1, $2, NOW(), NOW(), TRUE)
-         ON CONFLICT (device_id)
-         DO UPDATE SET
-           ${col}         = EXCLUDED.${col},
-           screenshot_at  = EXCLUDED.screenshot_at,
-           last_seen      = EXCLUDED.last_seen,
-           is_online      = EXCLUDED.is_online`,
-        [deviceId, filePath],
-      );
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  // Some DBs/branches use `screenshot`, others use `last_screenshot`.
-  // To avoid stale CMS previews, we attempt to write BOTH (best-effort).
-  // If only one column exists, the other attempt will fail and be ignored.
-  const upsertScreenshotOk = await tryUpsert("screenshot");
-  const upsertLastScreenshotOk = await tryUpsert("last_screenshot");
-  if (upsertScreenshotOk || upsertLastScreenshotOk) return;
-
-  const tryUpdateThenInsert = async (col: "screenshot" | "last_screenshot") => {
-    try {
-      const upd = await pool.query(
-        `UPDATE screens
-           SET ${col} = $2,
-               screenshot_at = NOW(),
-               last_seen = NOW(),
-               is_online = TRUE
-         WHERE device_id = $1`,
-        [deviceId, filePath],
-      );
-      if ((upd.rowCount ?? 0) > 0) return true;
-
-      await pool.query(
-        `INSERT INTO screens (device_id, ${col}, screenshot_at, last_seen, is_online)
-         VALUES ($1, $2, NOW(), NOW(), TRUE)`,
-        [deviceId, filePath],
-      );
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  const updScreenshotOk = await tryUpdateThenInsert("screenshot");
-  const updLastScreenshotOk = await tryUpdateThenInsert("last_screenshot");
-  if (updScreenshotOk || updLastScreenshotOk) return;
-
-  throw new Error("Could not persist screenshot (no matching column)");
-}
-
 import type { Express, Request, Response, NextFunction } from "express";
 import { createServer, type Server } from "http";
-import { randomUUID, randomBytes, createHash } from "crypto";
+import crypto, { randomUUID } from "crypto";
 import {
   storage,
   saveDeviceStatus,
@@ -84,7 +22,6 @@ import multer from "multer";
 import path from "path";
 import fs from "fs";
 import express from "express";
-import { createClient } from "@supabase/supabase-js";
 import {
   insertScreenSchema,
   insertMediaSchema,
@@ -92,12 +29,11 @@ import {
   insertTemplatePlaylistItemSchema,
 } from "@shared/schema";
 import { pool } from "./db";
-
-// Alias for legacy code paths that expect `db.query(...)`
-const db = pool;
 import { z } from "zod";
 import { requireRole } from "./middleware/permissions";
 import { authenticateJWT, authenticateDevice, authenticateUserOrDevice } from "./middleware/auth";
+import { registerAuthRoutes } from "./routes/auth.routes";
+import { registerDeviceRoutes } from "./routes/device.routes";
 
 const uploadsDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadsDir)) {
@@ -122,47 +58,6 @@ if (!fs.existsSync(groupIconsDir)) {
 const deviceThumbnailsDir = path.join(process.cwd(), "uploads", "device-thumbnails");
 if (!fs.existsSync(deviceThumbnailsDir)) {
   fs.mkdirSync(deviceThumbnailsDir, { recursive: true });
-}
-
-/* --------------------------------------------------
-   PAIRING HELPERS (DB SOURCE OF TRUTH)
-   - pairing_code is stored in plaintext ONLY to display once in the CMS.
-   - pairing_code_hash is what /api/device/activate verifies (bcrypt).
--------------------------------------------------- */
-async function setDevicePairingDirect(deviceId: string, pairingCode: string, expiresAt: Date) {
-  const pairingCodeHash = await bcrypt.hash(pairingCode, 10);
-
-  await pool.query(
-    `
-    UPDATE screens
-    SET pairing_code = $2,
-        pairing_code_hash = $3,
-        pairing_expires_at = $4,
-        pairing_status = 'unpaired',
-        pairing_attempts = 0,
-        pairing_locked_until = NULL
-    WHERE device_id = $1
-    `,
-    [deviceId, pairingCode, pairingCodeHash, expiresAt],
-  );
-
-  return { pairingCode, pairingCodeHash, expiresAt };
-}
-
-async function clearDevicePairingDirect(deviceId: string) {
-  await pool.query(
-    `
-    UPDATE screens
-    SET pairing_code = NULL,
-        pairing_code_hash = NULL,
-        pairing_expires_at = NULL,
-        pairing_status = 'unpaired',
-        pairing_attempts = 0,
-        pairing_locked_until = NULL
-    WHERE device_id = $1
-    `,
-    [deviceId],
-  );
 }
 
 const frontendDir = path.join(process.cwd(), "frontend");
@@ -316,46 +211,6 @@ if (!process.env.JWT_SECRET) {
 }
 const JWT_SECRET = process.env.JWT_SECRET;
 
-function verifyDisplayTokenOrFail(req: any, res: any, expectedDeviceId: string): boolean {
-  // Support either Authorization: Bearer <token> OR ?token=<token>
-  const authHeader = (req.headers?.authorization as string | undefined) ?? "";
-  const bearerToken =
-    authHeader.toLowerCase().startsWith("bearer ")
-      ? authHeader.slice("bearer ".length).trim()
-      : undefined;
-
-  const qTokenRaw = (req.query?.token as string | undefined) ?? (req.query?.t as string | undefined);
-  const qToken = qTokenRaw && typeof qTokenRaw === "string" ? qTokenRaw.trim() : undefined;
-
-  const displayAccessToken = bearerToken || qToken;
-
-  // ✅ HARDENED: token is REQUIRED
-  if (!displayAccessToken) {
-    res.status(401).json({ error: "display_access_token_required" });
-    return false;
-  }
-
-  try {
-    const decoded: any = jwt.verify(displayAccessToken, JWT_SECRET);
-
-    if (decoded?.role !== "display") {
-      res.status(403).json({ error: "invalid_display_token_role" });
-      return false;
-    }
-
-    if (!decoded?.deviceId || decoded.deviceId !== expectedDeviceId) {
-      res.status(403).json({ error: "display_token_device_mismatch" });
-      return false;
-    }
-
-    (req as any).displayAuth = decoded;
-    return true;
-  } catch {
-    res.status(401).json({ error: "invalid_or_expired_display_access_token" });
-    return false;
-  }
-}
-
 // Simple in-memory command queue: { [deviceId]: [ { id, command, value, createdAt } ] }
 const pendingCommands: {
   [deviceId: string]: Array<{
@@ -434,69 +289,32 @@ const loginSchema = z.object({
 
 const updateScreenSchema = insertScreenSchema.partial();
 
-// --------------------------------------------------
-// Supabase Storage (Option A: store uploads in Supabase)
-// --------------------------------------------------
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const SUPABASE_STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "uploads";
-
-const supabase =
-  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
-    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-    : null;
-
-function getRequestBaseUrl(req: Request): string {
-  const proto = (req.headers["x-forwarded-proto"] as string) || req.protocol;
-  const host = (req.headers["x-forwarded-host"] as string) || req.get("host");
-  return `${proto}://${host}`;
-}
-
-async function uploadToSupabase(opts: {
-  localPath: string;
-  bucketPath: string;
-  contentType?: string;
-}): Promise<string | null> {
-  if (!supabase) return null;
-
-  const fileBuffer = await fs.promises.readFile(opts.localPath);
-  const { error } = await supabase.storage
-    .from(SUPABASE_STORAGE_BUCKET)
-    .upload(opts.bucketPath, fileBuffer, {
-      contentType: opts.contentType,
-      upsert: false,
-    });
-  if (error) {
-    console.error("[supabase] upload error", error);
-    return null;
-  }
-
-  // Public URL (bucket must be public)
-  const { data } = supabase.storage
-    .from(SUPABASE_STORAGE_BUCKET)
-    .getPublicUrl(opts.bucketPath);
-  return data?.publicUrl || null;
-}
-
 // authMiddleware replaced by authenticateJWT in server/middleware/auth.ts
 
 export async function registerRoutes(
   httpServer: Server,
   app: Express,
 ): Promise<Server> {
+
   // --------------------------------------------------
-  // Local uploads (fallback)
-  // Option A uses Supabase Storage for new uploads, but we keep /uploads public
-  // so older media keeps working during the transition.
+  // Register modular route groups (NEW)
+  // --------------------------------------------------
+  registerAuthRoutes(app);
+  registerDeviceRoutes(app);
+
+  // --------------------------------------------------
+  // Protect uploads (no public filesystem exposure)
+  // Allow either admin/user JWT or a valid device token.
   // --------------------------------------------------
   if (process.env.NODE_ENV !== "test") {
     app.use(
       "/uploads",
+      authenticateUserOrDevice,
       (await import("express")).default.static(uploadsDir, {
         fallthrough: false,
         setHeaders: (res) => {
           res.setHeader("X-Content-Type-Options", "nosniff");
-          res.setHeader("Cache-Control", "public, max-age=86400");
+          res.setHeader("Cache-Control", "private, max-age=300");
         },
       }),
     );
@@ -512,456 +330,76 @@ export async function registerRoutes(
     if (p.startsWith("/auth/")) return next();
     if (p === "/ping") return next();
     if (p === "/screens/register") return next();
-    // ✅ Public display playlist endpoint (WebView player)
-    if (p.startsWith("/screens/") && p.endsWith("/playlist")) return next();
     // Device claim (pairing) should not require user JWT
     if (p === "/device/claim") return next();
     if (p.startsWith("/device/")) return next();
     return authenticateJWT(req, res, next);
   });
 
- // ✅ PUBLIC: Device activation must NOT require device token
-
+  // Device API must use device token when a specific deviceId is present
 // ✅ PUBLIC: Device activation must NOT require device token
-app.post("/api/device/activate", async (req: Request, res: Response) => {
+// ✅ PUBLIC: Device activation (pairing) - returns a device API key (token)
+// - Does NOT require user JWT
+// - Does NOT require a prior device token
+// - Generates/rotates a device token stored as sha256 in screens.api_key_hash
+app.post("/api/device/activate", async (req, res) => {
   try {
-    const { pairingCode } = req.body as { pairingCode?: string };
+    const pairingCode = String(req.body?.pairingCode || "")
+      .trim()
+      .toUpperCase();
 
-    if (!pairingCode || typeof pairingCode !== "string") {
-      return res.status(400).json({ error: "pairingCode required" });
+    if (!pairingCode) {
+      return res.status(400).json({ error: "pairing_code_required" });
     }
 
-    // Normalize user input to match how codes are generated/stored
-    // - remove ALL whitespace
-    // - uppercase
-    // - keep dashes (bcrypt compare is exact)
-    const normalized = pairingCode.trim().replace(/\s+/g, "").toUpperCase();
-
-    // ✅ Only scan currently-valid pairing sessions (small set)
-    const { rows: candidates } = await pool.query(
-      `
-      SELECT
-        device_id,
-        pairing_code_hash,
-        pairing_expires_at,
-        pairing_status,
-        pairing_attempts,
-        pairing_locked_until,
-        revoked_at
-      FROM screens
-      WHERE pairing_expires_at IS NOT NULL
-        AND pairing_expires_at > NOW()
-        AND pairing_code_hash IS NOT NULL
-      ORDER BY pairing_expires_at ASC
-      LIMIT 100
-      `,
+    const result = await pool.query(
+      `SELECT id, device_id, pairing_expires_at
+       FROM screens
+       WHERE pairing_code = $1`,
+      [pairingCode],
     );
 
-    if (!candidates || candidates.length === 0) {
-      return res.status(400).json({ error: "Invalid or expired pairing code" });
+    const row = result.rows[0] as { id: number; device_id: string; pairing_expires_at: string | null } | undefined;
+    if (!row) return res.status(404).json({ error: "invalid_pairing_code" });
+
+    if (!row.pairing_expires_at || new Date(row.pairing_expires_at).getTime() < Date.now()) {
+      return res.status(401).json({ error: "pairing_code_expired" });
     }
 
-    const now = new Date();
-
-    // ✅ Find match by bcrypt compare
-    let matched: any | null = null;
-    for (const c of candidates) {
-      // If locked, skip comparing (avoid giving attacker feedback)
-      if (c.pairing_locked_until && new Date(c.pairing_locked_until) > now) continue;
-
-      const ok = await bcrypt.compare(normalized, c.pairing_code_hash);
-      if (ok) {
-        matched = c;
-        break;
-      }
-    }
-
-    if (!matched) {
-      console.warn("Pairing failed: no matching code");
-      return res.status(400).json({ error: "Invalid or expired pairing code" });
-    }
-
-    // If device revoked, block pairing
-    if (matched.revoked_at) {
-      await pool.query(
-        `
-        INSERT INTO device_pairing_logs (device_id, success, ip_address, reason)
-        VALUES ($1, false, $2, $3)
-        `,
-        [matched.device_id, req.ip ?? null, "revoked"],
-      );
-      return res.status(403).json({ error: "Device revoked" });
-    }
-
-    const deviceId = matched.device_id as string;
-
-    // ✅ Issue DeviceKey (API key). Raw key returned ONCE; only hash stored in DB.
-    const deviceKey = randomBytes(32).toString("base64url");
-    const apiKeyHash = createHash("sha256").update(deviceKey).digest("hex");
-    const apiKeyLast4 = deviceKey.slice(-4);
-
-    // Mark paired, clear one-time pairing hash+expiry, reset attempts/lock
-    await pool.query(
-      `
-      UPDATE screens
-      SET api_key_hash = $2,
-          api_key_last4 = $3,
-          revoked_at = NULL,
-          rotated_at = NOW(),
-          is_online = true,
-          last_seen = NOW(),
-          pairing_status = 'paired',
-          pairing_attempts = 0,
-          pairing_locked_until = NULL,
-          last_paired_at = NOW(),
-          pairing_code = NULL,
-          pairing_code_hash = NULL,
-          pairing_expires_at = NULL
-      WHERE device_id = $1
-      `,
-      [deviceId, apiKeyHash, apiKeyLast4],
-    );
+    // Rotate token on every successful activation
+    const deviceToken = randomUUID();
+    const tokenHash = crypto.createHash("sha256").update(deviceToken).digest("hex");
+    const last4 = deviceToken.slice(-4);
 
     await pool.query(
-      `
-      INSERT INTO device_pairing_logs (device_id, success, ip_address, reason)
-      VALUES ($1, true, $2, $3)
-      `,
-      [deviceId, req.ip ?? null, "paired"],
+      `UPDATE screens
+       SET pairing_code = NULL,
+           pairing_expires_at = NULL,
+           is_online = true,
+           last_seen = NOW(),
+           api_key_hash = $2,
+           api_key_last4 = $3,
+           revoked_at = NULL,
+           rotated_at = NOW(),
+           password = NULL
+       WHERE id = $1`,
+      [row.id, tokenHash, last4],
     );
 
-    // Return BOTH camelCase and snake_case to keep old clients working
+    // ✅ IMPORTANT: snake_case for Android convenience
     return res.json({
-      deviceId,
-      deviceKey,
-      authScheme: "DeviceKey",
-      device_id: deviceId,
-      device_token: deviceKey,
+      device_id: row.device_id,
+      device_key: deviceToken,
+      device_key_last4: last4,
     });
-  } catch (err) {
-    console.error("Device activate error:", err);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-
-});
-
-// --------------------------------------------------
-// Device: mint short-lived Display Token for WebView player
-// - Android calls this after pairing (DeviceKey auth)
-// - WebView loads /display/:deviceId?token=<displayToken>
-// - public/display/app.js sends Authorization: Bearer <token>
-// --------------------------------------------------
-app.post("/api/device/display-token", authenticateDevice, async (req: Request, res: Response) => {
-  try {
-    const deviceId = req.device?.deviceId;
-    if (!deviceId) return res.status(401).json({ error: "device_auth_required" });
-
-    const displayToken = jwt.sign({ deviceId, role: "display" }, JWT_SECRET, { expiresIn: "6h" });
-    return res.json({ deviceId, displayToken, token: displayToken, expiresInSeconds: 6 * 60 * 60 });
-  } catch (err) {
-    console.error("display-token failed:", err);
-    return res.status(500).json({ error: "display_token_failed" });
+  } catch (e) {
+    console.error("activate error:", e);
+    return res.status(500).json({ error: "activate_failed" });
   }
 });
-
-
-
-// --------------------------------------------------
-  // Admin: rotate/revoke pairing for an existing device
-  // --------------------------------------------------
-  app.post(
-    "/api/devices/:deviceId/pairing/rotate",
-    authenticateJWT,
-    requireRole("admin"),
-    async (req: Request, res: Response) => {
-      try {
-        const deviceId = req.params.deviceId;
-        const expiresMinutesRaw = (req.body?.expiresMinutes ?? 15) as unknown;
-        const expiresMinutes =
-          typeof expiresMinutesRaw === "number"
-            ? expiresMinutesRaw
-            : Number.parseInt(String(expiresMinutesRaw), 10) || 15;
-
-        if (!deviceId) return res.status(400).json({ message: "deviceId is required" });
-        if (expiresMinutes < 1 || expiresMinutes > 24 * 60) {
-          return res.status(400).json({ message: "expiresMinutes must be between 1 and 1440" });
-        }
-
-        const pairingCode = `LUM-${randomUUID().replace(/-/g, "").slice(0, 4).toUpperCase()}-${randomUUID()
-          .replace(/-/g, "")
-          .slice(0, 4)
-          .toUpperCase()}`;
-            const pairingExpiresAt = new Date(Date.now() + expiresMinutes * 60_000);
-
-        
-        const expiresAt = new Date(Date.now() + expiresMinutes * 60_000);
-
-        // Store pairing code + hash in DB so CMS can display it once
-        await setDevicePairingDirect(deviceId, pairingCode, expiresAt);
-
-        // Optional: if you want rotation to force a re-pair, clear existing device key:
-        await pool.query(
-          `
-          UPDATE screens
-          SET api_key_hash = NULL,
-              api_key_last4 = NULL
-          WHERE device_id = $1
-          `,
-          [deviceId],
-        );
-
-        return res.json({
-          deviceId,
-          pairing_code: pairingCode,
-          pairingCode,
-          pairing_expires_at: expiresAt.toISOString(),
-          pairingExpiresAt: expiresAt.toISOString(),
-        });
-
-      } catch (err) {
-        console.error("pairing/rotate failed:", err);
-        return res.status(500).json({ message: "Failed to rotate pairing" });
-      }
-    },
-  );
-
-  app.post(
-    "/api/devices/:deviceId/pairing/revoke",
-    authenticateJWT,
-    requireRole("admin"),
-    async (req: Request, res: Response) => {
-      try {
-        const deviceId = req.params.deviceId;
-        if (!deviceId) return res.status(400).json({ message: "deviceId is required" });
-
-        await clearDevicePairingDirect(deviceId);
-return res.json({ deviceId, revoked: true });
-      } catch (err) {
-        console.error("pairing/revoke failed:", err);
-        return res.status(500).json({ message: "Failed to revoke pairing" });
-      }
-    },
-  );
-
-
-
-
-
-// =====================================================
-// ADMIN DEVICE MEDIA (CMS)
-// These endpoints are for the CMS/admin panel ONLY.
-// They use JWT auth and must NOT depend on device tokens.
-// =====================================================
-
-// Latest screenshot path (null if none) — CMS uses this
-app.get(
-  "/api/admin/devices/:deviceId/last-screenshot",
-  authenticateJWT,
-  requireRole("admin", "manager"),
-  async (req, res) => {
-    const { deviceId } = req.params;
-    try {
-      const r = await pool.query(
-        `SELECT COALESCE(last_screenshot, screenshot) AS file
-         FROM screens
-         WHERE device_id = $1
-         ORDER BY screenshot_at DESC NULLS LAST, last_seen DESC NULLS LAST, id DESC
-         LIMIT 1`,
-        [deviceId],
-      );
-      const file = r.rows?.[0]?.file ?? null;
-      return res.json({ file });
-    } catch (err) {
-      console.error("last-screenshot error:", err);
-      return res.status(500).json({ error: "failed_to_fetch_last_screenshot" });
-    }
-  },
-);
-
-// Latest recording path (null if none) — CMS uses this
-app.get(
-  "/api/admin/devices/:deviceId/last-recording",
-  authenticateJWT,
-  requireRole("admin", "manager"),
-  async (req, res) => {
-    const { deviceId } = req.params;
-    try {
-      const r = await pool.query(
-        `SELECT last_recording FROM screens WHERE device_id = $1 LIMIT 1`,
-        [deviceId],
-      );
-      const file = r.rows?.[0]?.last_recording ?? null;
-      return res.json({ file });
-    } catch (err) {
-      console.error("last-recording error:", err);
-      return res.status(500).json({ error: "failed_to_fetch_last_recording" });
-    }
-  },
-);
-
-// Backward-compatible: return 404 if none
-app.get(
-  "/api/admin/devices/:deviceId/screenshot",
-  authenticateJWT,
-  requireRole("admin", "manager"),
-  async (req, res) => {
-    const { deviceId } = req.params;
-    try {
-      const r = await pool.query(
-        `SELECT COALESCE(last_screenshot, screenshot) AS filePath
-         FROM screens
-         WHERE device_id = $1
-         ORDER BY screenshot_at DESC NULLS LAST, last_seen DESC NULLS LAST, id DESC
-         LIMIT 1`,
-        [deviceId],
-      );
-      const filePath = r.rows?.[0]?.filepath ?? r.rows?.[0]?.filePath ?? null;
-      if (!filePath) return res.status(404).json({ error: "No screenshot available" });
-      return res.json({ ok: true, filePath });
-    } catch (err) {
-      console.error("admin screenshot error:", err);
-      return res.status(500).json({ error: "failed_to_fetch_screenshot" });
-    }
-  },
-);
-
-app.get(
-  "/api/admin/devices/:deviceId/recording",
-  authenticateJWT,
-  requireRole("admin", "manager"),
-  async (req, res) => {
-    const { deviceId } = req.params;
-    try {
-      const r = await pool.query(
-        `SELECT last_recording FROM screens WHERE device_id = $1 LIMIT 1`,
-        [deviceId],
-      );
-      const filePath = r.rows?.[0]?.last_recording ?? null;
-      if (!filePath) return res.status(404).json({ error: "No recording available" });
-      return res.json({ ok: true, filePath });
-    } catch (err) {
-      console.error("admin recording error:", err);
-      return res.status(500).json({ error: "failed_to_fetch_recording" });
-    }
-  },
-);
 
   app.use("/api/device/:deviceId", authenticateDevice);
 
-// =====================================================
-// CANONICAL DEVICE COMMAND ROUTES (DeviceKey required)
-// =====================================================
-
-app.get("/api/device/commands", authenticateDevice, async (req, res) => {
-  const deviceId = req.device?.deviceId;
-  if (!deviceId) return res.status(401).json({ error: "device_auth_required" });
-
-  try {
-    const result = await pool.query(
-      `
-      SELECT id, payload, expires_at
-      FROM device_commands
-      WHERE device_id = $1
-        AND status = 'queued'
-        AND (expires_at IS NULL OR expires_at > NOW())
-      ORDER BY created_at ASC
-      LIMIT 20
-      `,
-      [deviceId],
-    );
-
-    if (result.rows.length > 0) {
-      const ids = result.rows.map((r: any) => r.id);
-      await pool.query(
-        `
-        UPDATE device_commands
-        SET status = 'delivered',
-            delivered_at = NOW(),
-            attempts = attempts + 1,
-            sent = TRUE
-        WHERE id = ANY($1)
-        `,
-        [ids],
-      );
-    }
-
-    return res.json(
-      result.rows.map((r: any) => ({
-        id: String(r.id),
-        payload: typeof r.payload === "string" ? JSON.parse(r.payload) : r.payload,
-      })),
-    );
-  } catch (err) {
-    console.error("Device commands error:", err);
-    return res.json([]);
-  }
-});
-
-app.post("/api/device/commands/:commandId/ack", authenticateDevice, async (req, res) => {
-  const deviceId = req.device?.deviceId;
-  if (!deviceId) return res.status(401).json({ error: "device_auth_required" });
-
-  const { commandId } = req.params;
-
-  try {
-    const result = await pool.query(
-      `
-      UPDATE device_commands
-      SET status = 'acked',
-          acked_at = NOW(),
-          sent = TRUE
-      WHERE id = $1 AND device_id = $2
-      RETURNING id
-      `,
-      [commandId, deviceId],
-    );
-
-    if (result.rowCount === 0) return res.status(404).json({ error: "Command not found" });
-    return res.json({ success: true, commandId });
-  } catch (err) {
-    console.error("ACK error:", err);
-    return res.status(500).json({ error: "Failed to acknowledge command" });
-  }
-});
-
-app.post("/api/device/commands/:commandId/result", authenticateDevice, async (req, res) => {
-  const deviceId = req.device?.deviceId;
-  if (!deviceId) return res.status(401).json({ error: "device_auth_required" });
-
-  const { commandId } = req.params;
-  const { status, output } = req.body ?? {};
-
-  if (status !== "succeeded" && status !== "failed") {
-    return res.status(400).json({ error: "status must be succeeded|failed" });
-  }
-
-  try {
-    await pool.query(
-      `
-      UPDATE device_commands
-      SET status = $3,
-          executed_at = NOW(),
-          executed = TRUE
-      WHERE id = $1 AND device_id = $2
-      `,
-      [commandId, deviceId, status],
-    );
-
-    await pool.query(
-      `
-      INSERT INTO device_command_results (command_id, device_id, status, output)
-      VALUES ($1, $2, $3, $4)
-      `,
-      [commandId, deviceId, status, output ?? null],
-    );
-
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("result error:", err);
-    return res.status(500).json({ error: "failed_to_record_result" });
-  }
-});
-  
       // =====================================================
       // DASHBOARD SUMMARY
       // =====================================================
@@ -1081,77 +519,74 @@ app.post("/api/device/commands/:commandId/result", authenticateDevice, async (re
     }
   });
 
- // =====================================================
-// DEVICE DETAILS (ULTRA-SAFE: no dependency on optional columns)
-// =====================================================
-app.get("/api/devices/:id/details", async (req, res) => {
-  const { id } = req.params;
+  // =====================================================
+  // DEVICE DETAILS (for DeviceControlPage)
+  // =====================================================
+  app.get("/api/devices/:id/details", async (req, res) => {
+    const { id } = req.params;
 
-  try {
-    // Ultra-safe: only rely on columns that almost certainly exist
-    // in your `screens` table based on your DB list.
-    const result = await pool.query(
-      `
-      SELECT
-        id,
-        device_id,
-        name,
-        location,
-        status,
-        is_online,
-        last_seen,
-        last_screenshot,
-        last_recording
-      FROM screens
-      WHERE id::text = $1 OR device_id = $1
-      LIMIT 1
-      `,
-      [id]
-    );
+    try {
+      const result = await pool.query(
+        `
+        SELECT
+          s.id,
+          s.device_id,
+          s.name,
+          s.location,
+          s.status,
+          s.is_online,
+          s.last_seen AS "lastHeartbeat",
+          s.current_content_name AS "currentContentName",
+          s.screenshot,
+          s.screenshot_at AS "screenshotAt",
+          s.thumbnail,
+          s.signal_strength AS "signalStrength",
+          s.connection_type AS "connectionType",
+          s.free_storage AS "freeStorage",
+          s.last_offline AS "lastOffline",
+          s.assigned_template_id AS "assignedTemplateId",
+          s.latitude,
+          s.longitude,
+          s.brightness,
+          s.volume,
+          t.name AS "templateName"
+        FROM screens s
+        LEFT JOIN templates t ON s.assigned_template_id = t.id
+        WHERE s.id::text = $1 OR s.device_id = $1
+        LIMIT 1
+        `,
+        [id]
+      );
 
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: "Device not found" });
+      if (result.rowCount === 0) {
+        return res.status(404).json({ error: "Device not found" });
+      }
+
+      const device = result.rows[0];
+      res.json({
+        id: device.device_id || device.id,
+        name: device.name,
+        status: device.is_online ? "Online" : "Offline",
+        lastHeartbeat: device.lastHeartbeat,
+        currentContentName: device.currentContentName,
+        templateName: device.templateName,
+        lastScreenshot: device.screenshot,
+        screenshotAt: device.screenshotAt,
+        thumbnail: device.thumbnail,
+        signalStrength: device.signalStrength,
+        connectionType: device.connectionType || "wifi",
+        freeStorage: device.freeStorage,
+        lastOffline: device.lastOffline,
+        latitude: device.latitude,
+        longitude: device.longitude,
+        brightness: device.brightness ?? 100,
+        volume: device.volume ?? 70,
+      });
+    } catch (err) {
+      console.error("Device details error:", err);
+      res.status(500).json({ error: "Failed to load device details" });
     }
-
-    const s = result.rows[0];
-
-    // Return a stable JSON shape the frontend expects
-    res.json({
-      id: s.device_id || s.id,
-      name: s.name || `Device ${s.device_id || s.id}`,
-      status: s.is_online ? "Online" : "Offline",
-      lastHeartbeat: s.last_seen ?? null,
-
-      // Optional fields returned as null/defaults so frontend never breaks
-      currentContentName: null,
-      templateName: null,
-
-      // Use a stable, browser-friendly URL (no auth headers required).
-      // This endpoint serves the latest screenshot file directly.
-      // Prefer the new `screenshot` column, but keep compatibility with `last_screenshot`
-/// Return a stable URL that always redirects to the newest file (with cache-buster).
-      lastScreenshot: (s.screenshot || s.last_screenshot)
-        ? `/api/device/${encodeURIComponent(s.device_id)}/screenshot/latest?v=${encodeURIComponent(String(s.screenshot_at || Date.now()))}`
-        : null,
-      screenshotAt: null,
-      thumbnail: null,
-
-      signalStrength: null,
-      connectionType: "wifi",
-      freeStorage: null,
-      lastOffline: null,
-
-      latitude: null,
-      longitude: null,
-
-      brightness: 100,
-      volume: 70,
-    });
-  } catch (err) {
-    console.error("Device details error:", err);
-    res.status(500).json({ error: "Failed to load device details" });
-  }
-});
+  });
 
   // =====================================================
   // DEVICE SETTINGS (brightness/volume)
@@ -1422,55 +857,41 @@ app.get("/api/devices/:id/details", async (req, res) => {
   // =====================================================
   // DASHBOARD LIVE CONTENT
   // =====================================================
-  app.get("/api/dashboard/live-content", authenticateJWT, requireRole("admin","manager"), async (req, res) => {
+  app.get("/api/dashboard/live-content", async (_req, res) => {
     try {
       const now = new Date();
-      const currentTime = now.toTimeString().slice(0, 8); // HH:MM:SS
-      // JS getDay(): 0=Sun..6=Sat -> DB likely stores 1=Mon..7=Sun
-      const jsDay = now.getDay();
-      const dayOfWeek = jsDay === 0 ? 7 : jsDay;
+      const dayOfWeek = now.getDay();
+      const currentTime = now.toTimeString().slice(0, 8);
 
-      // Some older DBs used device_group_map instead of device_group_members.
-      // We'll detect what's available and build the query accordingly.
-      const [{ reg: membersReg }] = (await db.query(
-        "SELECT to_regclass('public.device_group_members') AS reg"
-      )).rows;
-      const [{ reg: mapReg }] = (await db.query(
-        "SELECT to_regclass('public.device_group_map') AS reg"
-      )).rows;
-
-      const hasMembers = !!membersReg;
-      const hasMap = !!mapReg;
-
-      const groupJoin = hasMembers
-        ? "LEFT JOIN public.device_group_members dgm ON dgm.group_id = cs.group_id"
-        : hasMap
-          ? "LEFT JOIN public.device_group_map dgm ON dgm.group_id = cs.group_id"
-          : "";
-
-      const deviceCountExpr = hasMembers || hasMap
-        ? "COUNT(DISTINCT dgm.device_id)"
-        : "1";
-
-      const result = await db.query(`
-        SELECT
+      const result = await pool.query(`
+        SELECT 
           cs.id,
           cs.content_type,
           cs.content_id,
-          ${deviceCountExpr} AS device_count,
-          COALESCE(m.name, cp.name, t.name) AS content_name,
-          COALESCE(m.type, 'content') AS type
-        FROM public.content_schedules cs
-        ${groupJoin}
-        LEFT JOIN public.media m
-          ON cs.content_type = 'media' AND cs.content_id::text = m.id::text
-        LEFT JOIN public.content_playlists cp
-          ON cs.content_type = 'playlist' AND cs.content_id::text = cp.id::text
-        LEFT JOIN public.templates t
-          ON cs.content_type = 'template' AND cs.content_id::text = t.id::text
-        WHERE
-          cs.enabled = TRUE
-          AND ($1 = ANY(cs.days_of_week) OR cs.days_of_week IS NULL)
+          CASE 
+            WHEN cs.content_type = 'media' THEN m.name
+            WHEN cs.content_type = 'playlist' THEN cp.name
+            WHEN cs.content_type = 'template' THEN t.name
+            ELSE 'Unknown'
+          END as content_name,
+          CASE 
+            WHEN cs.content_type = 'media' THEN m.type
+            ELSE cs.content_type
+          END as type,
+          COUNT(DISTINCT COALESCE(cs.device_id, dgm.device_id)) as device_count
+        FROM content_schedules cs
+        LEFT JOIN media m ON cs.content_type = 'media' AND cs.content_id::text = m.id::text
+        LEFT JOIN content_playlists cp ON cs.content_type = 'playlist' AND cs.content_id::text = cp.id::text
+        LEFT JOIN templates t ON cs.content_type = 'template' AND cs.content_id::text = t.id::text
+        LEFT JOIN device_group_members dgm ON cs.group_id = dgm.group_id
+        WHERE cs.is_active = true
+          AND (cs.start_date IS NULL OR cs.start_date <= CURRENT_DATE)
+          AND (cs.end_date IS NULL OR cs.end_date >= CURRENT_DATE)
+          AND (
+            cs.days_of_week IS NULL 
+            OR cs.days_of_week = '{}' 
+            OR $1 = ANY(cs.days_of_week)
+          )
           AND (cs.start_time IS NULL OR cs.start_time <= $2::time)
           AND (cs.end_time IS NULL OR cs.end_time >= $2::time)
         GROUP BY cs.id, cs.content_type, cs.content_id, m.name, m.type, cp.name, t.name
@@ -1480,72 +901,52 @@ app.get("/api/devices/:id/details", async (req, res) => {
 
       const content = result.rows.map(row => ({
         id: row.id,
-        name: row.content_name || "Unnamed Content",
-        type: row.type || "unknown",
-        deviceCount: parseInt(row.device_count, 10) || 1,
+        name: row.content_name || 'Unnamed Content',
+        type: row.type || 'unknown',
+        deviceCount: parseInt(row.device_count) || 1
       }));
 
       res.json({ content });
     } catch (err) {
       console.error("Live content error:", err);
-      // Don't break the whole dashboard if schedules/groups are missing
-      res.status(200).json({ content: [], warning: "live_content_unavailable" });
+      res.status(500).json({ error: "failed_to_load_live_content", content: [] });
     }
   });
 
   // =====================================================
   // ACTIVE COMMANDS STATUS (for progress tracking)
   // =====================================================
-  app.get("/api/commands/active", async (_req, res) => {
+  app.get("/api/commands/active", async (req, res) => {
     try {
-      // Commands from last 10 minutes for progress tracking in the CMS
+      // Get commands from last 5 minutes that are not yet fully executed
       const result = await pool.query(`
         SELECT 
           dc.id,
           dc.device_id,
           dc.payload,
-          dc.status,
-          dc.delivered_at,
-          dc.acked_at,
+          dc.sent,
           dc.executed,
           dc.executed_at,
           dc.created_at,
           s.name as device_name
         FROM device_commands dc
         LEFT JOIN screens s ON dc.device_id = s.device_id
-        WHERE dc.created_at > NOW() - INTERVAL '10 minutes'
+        WHERE dc.created_at > NOW() - INTERVAL '5 minutes'
         ORDER BY dc.created_at DESC
-        LIMIT 50
+        LIMIT 20
       `);
 
-      const commands = result.rows.map((cmd: any) => {
-        const payload = typeof cmd.payload === "string" ? JSON.parse(cmd.payload) : cmd.payload;
-
-        const s = (cmd.status || "queued") as string;
-        let statusLabel = s;
+      const commands = result.rows.map(cmd => {
+        const payload = typeof cmd.payload === 'string' ? JSON.parse(cmd.payload) : cmd.payload;
+        let status = 'queued';
         let progress = 0;
-
-        // Canonical status pipeline:
-        // queued -> delivered -> acked -> succeeded|failed
-        if (s === "queued") {
-          statusLabel = "queued";
-          progress = 0;
-        } else if (s === "delivered") {
-          statusLabel = "delivered";
-          progress = 35;
-        } else if (s === "acked") {
-          statusLabel = "acked";
-          progress = 70;
-        } else if (s === "succeeded") {
-          statusLabel = "succeeded";
+        
+        if (cmd.executed) {
+          status = 'completed';
           progress = 100;
-        } else if (s === "failed") {
-          statusLabel = "failed";
-          progress = 100;
-        } else {
-          // fallback for any unknown statuses
-          statusLabel = s;
-          progress = cmd.executed ? 100 : 10;
+        } else if (cmd.sent) {
+          status = 'delivering';
+          progress = 50;
         }
 
         return {
@@ -1554,12 +955,10 @@ app.get("/api/devices/:id/details", async (req, res) => {
           deviceName: cmd.device_name || cmd.device_id,
           type: payload.type,
           contentName: payload.contentName || payload.type,
-          status: statusLabel,
+          status,
           progress,
           createdAt: cmd.created_at,
-          deliveredAt: cmd.delivered_at,
-          ackedAt: cmd.acked_at,
-          executedAt: cmd.executed_at,
+          executedAt: cmd.executed_at
         };
       });
 
@@ -1569,7 +968,6 @@ app.get("/api/devices/:id/details", async (req, res) => {
       res.status(500).json({ error: "failed_to_fetch_active_commands" });
     }
   });
-
 
   // =====================================================
   // COMMAND HISTORY FOR DEVICE (CMS)
@@ -1588,11 +986,8 @@ app.get("/api/devices/:id/details", async (req, res) => {
           SELECT
             id,
             payload,
-            status,
             sent,
             executed,
-            delivered_at,
-            acked_at,
             executed_at,
             created_at
           FROM device_commands
@@ -1644,103 +1039,94 @@ app.get("/api/devices/:id/details", async (req, res) => {
 
  
 
-        // DEVICE FETCHES ITS PENDING COMMANDS (secure + status lifecycle)
-// IMPORTANT: authenticateDevice must be applied here because app.use() is lower in file.
-app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) => {
-  const { deviceId } = req.params;
+        // DEVICE FETCHES ITS PENDING COMMANDS
+        app.get("/api/device/:deviceId/commands", async (req, res) => {
+          const { deviceId } = req.params;
 
-  // Enforce: authenticated device can only fetch its own commands
-  if (!req.device || req.device.deviceId !== deviceId) {
-    return res.status(403).json({ error: "device_id_mismatch" });
-  }
+          try {
+            // 1️⃣ Fetch pending (unsent) commands
+            const result = await pool.query(
+              `
+              SELECT id, payload
+              FROM device_commands
+              WHERE device_id = $1
+                AND sent = false
+              ORDER BY created_at ASC
+              `,
+              [deviceId]
+            );
 
-  try {
-    // 1) Fetch queued commands (not expired)
-    const result = await pool.query(
-      `
-      SELECT id, payload, expires_at
-      FROM device_commands
-      WHERE device_id = $1
-        AND status = 'queued'
-        AND (expires_at IS NULL OR expires_at > NOW())
-      ORDER BY created_at ASC
-      LIMIT 20
-      `,
-      [deviceId],
-    );
+            // 2️⃣ Mark them as SENT (delivered to device)
+            if (result.rows.length > 0) {
+              const ids = result.rows.map((r) => r.id);
 
-    // 2) Mark them delivered
-    if (result.rows.length > 0) {
-      const ids = result.rows.map((r: any) => r.id);
+              await pool.query(
+                `
+                UPDATE device_commands
+                SET sent = true
+                WHERE id = ANY($1)
+                `,
+                [ids]
+              );
+            }
 
-      await pool.query(
+            // 3️⃣ Return payloads to device
+            res.json(
+              result.rows.map((r) => ({
+                id: r.id,
+                ...(typeof r.payload === "string"
+                  ? JSON.parse(r.payload)
+                  : r.payload),
+              }))
+            );
+          } catch (err) {
+            console.error("Error fetching commands:", err);
+            res.json([]);
+          }
+        });
+
+  // =====================================================
+  // DEVICE ACKNOWLEDGES COMMAND EXECUTION
+  // =====================================================
+  app.post("/api/device/:deviceId/commands/:commandId/ack", async (req, res) => {
+    const { deviceId, commandId } = req.params;
+
+    try {
+      const result = await pool.query(
         `
         UPDATE device_commands
-        SET status = 'delivered',
-            delivered_at = NOW(),
-            attempts = attempts + 1
-        WHERE id = ANY($1)
+        SET executed = true, executed_at = NOW()
+        WHERE id = $1 AND device_id = $2
+        RETURNING id
         `,
-        [ids],
+        [commandId, deviceId]
       );
-    }
 
-    // 3) Return payloads
-    return res.json(
-      result.rows.map((r: any) => ({
-        id: String(r.id),
-        payload: typeof r.payload === "string" ? JSON.parse(r.payload) : r.payload,
-      })),
-    );
-  } catch (err) {
-    console.error("Error fetching commands:", err);
-    return res.json([]);
-  }
-});
+      if (result.rowCount === 0) {
+        return res.status(404).json({ error: "Command not found" });
+      }
+
+      console.log(`Command ${commandId} acknowledged by device ${deviceId}`);
+      res.json({ success: true, commandId });
+    } catch (err) {
+      console.error("Error acknowledging command:", err);
+      res.status(500).json({ error: "Failed to acknowledge command" });
+    }
+  });
 
   // DEVICE UPLOADS SCREENSHOT
   app.post(
     "/api/device/:deviceId/screenshot",
-    authenticateDevice,
     screenshotUpload.single("file"),
-    async (req, res) => {
+    (req, res) => {
       const { deviceId } = req.params;
-
-      // Enforce: authenticated device can only upload for itself
-      if (!req.device || req.device.deviceId !== deviceId) {
-        return res.status(403).json({ error: "device_id_mismatch" });
-      }
 
       if (!req.file) {
         return res.status(400).json({ error: "No file uploaded" });
       }
 
-      // Default to local path, but prefer Supabase (Option A)
-      let filePath = `/uploads/screenshots/${req.file.filename}`;
-      try {
-        const publicUrl = await uploadToSupabase({
-          localPath: req.file.path,
-          bucketPath: `screenshots/${req.file.filename}`,
-          contentType: req.file.mimetype,
-        });
-        if (publicUrl) {
-          filePath = publicUrl;
-          // Best-effort cleanup of local temp file
-          fs.promises.unlink(req.file.path).catch(() => {});
-        }
-      } catch (e) {
-        console.error("[screenshot] upload failed", e);
-      }
-
-      // Persist in DB
-      
-      try {
-        await upsertDeviceScreenshotPath(deviceId, filePath);
-      } catch (e) {
-        console.error("[screenshot] DB persist failed:", e);
-        return res.status(500).json({ error: "db_persist_failed" });
-      }
-
+      const filePath = `/uploads/screenshots/${req.file.filename}`;
+      lastScreenshot[deviceId] = filePath;
 
       console.log(
         `Screenshot received from device ${deviceId}:`,
@@ -1755,28 +1141,14 @@ app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) =
   app.post(
     "/api/device/:deviceId/record",
     recordingUpload.single("file"),
-    async (req, res) => {
+    (req, res) => {
       const { deviceId } = req.params;
 
       if (!req.file) {
         return res.status(400).json({ error: "No file uploaded" });
       }
 
-      let filePath = `/uploads/recordings/${req.file.filename}`;
-      try {
-        const publicUrl = await uploadToSupabase({
-          localPath: req.file.path,
-          bucketPath: `recordings/${req.file.filename}`,
-          contentType: req.file.mimetype,
-        });
-        if (publicUrl) {
-          filePath = publicUrl;
-          fs.promises.unlink(req.file.path).catch(() => {});
-        }
-      } catch (e) {
-        console.error("[record] upload failed", e);
-      }
-
+      const filePath = `/uploads/recordings/${req.file.filename}`;
       lastRecording[deviceId] = filePath;
 
       console.log(
@@ -1813,113 +1185,51 @@ app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) =
   });
 
   // Alternative endpoints returning null if not found (simpler for Android)
-  app.get("/api/device/:deviceId/last-screenshot", async (req, res) => {
+  app.get("/api/device/:deviceId/last-screenshot", (req, res) => {
     const { deviceId } = req.params;
-    try {
-      const r = await pool.query(`SELECT last_screenshot FROM screens WHERE device_id = $1 LIMIT 1`, [deviceId]);
-      res.json({ file: r.rows?.[0]?.last_screenshot ?? null });
-    } catch (err) {
-      console.error("device last-screenshot error:", err);
-      res.status(500).json({ error: "failed_to_fetch_last_screenshot" });
-    }
+    res.json({ file: lastScreenshot[deviceId] || null });
   });
 
-  app.get("/api/device/:deviceId/last-recording", async (req, res) => {
+  app.get("/api/device/:deviceId/last-recording", (req, res) => {
     const { deviceId } = req.params;
-    try {
-      const r = await pool.query(`SELECT last_recording FROM screens WHERE device_id = $1 LIMIT 1`, [deviceId]);
-      res.json({ file: r.rows?.[0]?.last_recording ?? null });
-    } catch (err) {
-      console.error("device last-recording error:", err);
-      res.status(500).json({ error: "failed_to_fetch_last_recording" });
-    }
+    res.json({ file: lastRecording[deviceId] || null });
   });
 
   // Serve latest screenshot image directly
-  app.get("/api/device/:deviceId/screenshot/latest", async (req, res) => {
-  // Prevent browser caching of the "latest" screenshot URL
-  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("Expires", "0");
+  app.get("/api/device/:deviceId/screenshot/latest", (req, res) => {
+    const { deviceId } = req.params;
+    const screenshotPath = path.join(screenshotsDir, `${deviceId}_latest.png`);
 
-  const deviceId = decodeURIComponent(req.params.deviceId || "");
-
-  try {
-    const { rows } = await pool.query(
-      "SELECT screenshot, last_screenshot, screenshot_at FROM screens WHERE device_id = $1 LIMIT 1",
-      [deviceId],
-    );
-
-    const row = rows[0];
-    const url: string | null =
-      (row?.screenshot as string | null) || (row?.last_screenshot as string | null);
-
-    if (!url) {
-      return res.status(404).send("No screenshot");
+    if (!fs.existsSync(screenshotPath)) {
+      // Try to find any screenshot for this device
+      const files = fs
+        .readdirSync(screenshotsDir)
+        .filter((f) => f.startsWith(deviceId));
+      if (files.length > 0) {
+        files.sort().reverse();
+        return res.sendFile(path.join(screenshotsDir, files[0]));
+      }
+      return res.status(404).send("No screenshot available");
     }
 
-    const ts = row?.screenshot_at
-      ? new Date(row.screenshot_at as string).getTime()
-      : Date.now();
-    const sep = url.includes("?") ? "&" : "?";
+    res.sendFile(screenshotPath);
+  });
 
-    // Redirect to the storage URL (Supabase public URL), with a cache-buster.
-    return res.redirect(302, `${url}${sep}v=${ts}`);
-  } catch (e) {
-    console.error("GET latest screenshot failed", e);
-    return res.status(500).send("Failed to load screenshot");
-  }
-});
+  app.post("/api/devices", async (req, res) => {
+    try {
+      const { name, location_branch } = req.body;
 
-app.post("/api/devices", authenticateJWT, requireRole("admin"), async (req, res) => {
-  try {
-    const { name, location_branch } = req.body;
+      if (!name) {
+        return res.status(400).json({ error: "Device name is required" });
+      }
 
-    if (!name || typeof name !== "string") {
-      return res.status(400).json({ error: "Device name is required" });
+      const device = await createDevice({ name, location_branch });
+      return res.status(201).json({ device });
+    } catch (error) {
+      console.error("Error creating device:", error);
+      return res.status(500).json({ error: "Failed to create device" });
     }
-
-    // 1) Create the device row
-    const device = await createDevice({ name, location_branch });
-
-    // 2) Mint pairing code immediately (so CMS can display it)
-    const expiresMinutesRaw = (req.body?.expiresMinutes ?? 15) as unknown;
-    const expiresMinutes =
-      typeof expiresMinutesRaw === "number"
-        ? expiresMinutesRaw
-        : Number.parseInt(String(expiresMinutesRaw), 10) || 15;
-
-    if (expiresMinutes < 1 || expiresMinutes > 24 * 60) {
-      return res.status(400).json({ error: "expiresMinutes must be between 1 and 1440" });
-    }
-
-    const pairingCode =
-      `LUM-${randomUUID().replace(/-/g, "").slice(0, 4).toUpperCase()}` +
-      `-${randomUUID().replace(/-/g, "").slice(0, 4).toUpperCase()}`;
-
-    // last4 based on alnum only, consistent with activate endpoint normalization
-    const pairingLast4 = pairingCode.replace(/[^A-Za-z0-9]/g, "").slice(-4);
-
-    const pairingCodeHash = await bcrypt.hash(pairingCode, 10);
-    const pairingExpiresAt = new Date(Date.now() + expiresMinutes * 60_000);
-    // Store pairing code + hash in DB so CMS can display it once
-    await setDevicePairingDirect(device.device_id, pairingCode, pairingExpiresAt);
-
-// 3) Return device + pairing fields the frontend expects
-    return res.status(201).json({
-      device: {
-        ...device,
-        pairing_code: pairingCode,
-        pairingCode,
-        pairing_expires_at: pairingExpiresAt.toISOString(),
-        pairingExpiresAt: pairingExpiresAt.toISOString(),
-      },
-    });
-  } catch (error) {
-    console.error("Error creating device:", error);
-    return res.status(500).json({ error: "Failed to create device" });
-  }
-});
+  });
 
   // ❌ Disabled: minting long-lived device JWTs is insecure.
   // Use pairing + api_key_hash instead (see /api/device/claim + admin pairing endpoint).
@@ -2152,149 +1462,47 @@ const existingUser = await storage.getUserByEmail(email);
     }
   });
 
-  // Get playlist content for a device by deviceId (ASSIGNMENT-BASED, SAFE)
-app.get("/api/screens/:deviceId/playlist", async (req, res) => {
-  try {
-    const deviceId = String(req.params.deviceId || "").trim();
-    if (!deviceId) return res.status(400).json({ error: "Missing deviceId" });
+  // Get playlist content for a device by deviceId
+  app.get("/api/screens/:deviceId/playlist", async (req, res) => {
+    try {
+      const { deviceId } = req.params;
 
-    // ✅ Require display access token (Bearer or ?token=)
-    if (!verifyDisplayTokenOrFail(req, res, deviceId)) return;
+      // Find screen by deviceId
+      const screen = await storage.getScreenByDeviceId(deviceId);
+      if (!screen) {
+        return res.status(404).json({ error: "Device not found" });
+      }
 
-
-    // 1) Screen lookup (deviceId is stored in screens.device_id)
-    const screenResult = await db.query(
-      `SELECT id, device_id, name FROM screens WHERE device_id = $1 LIMIT 1`,
-      [deviceId]
-    );
-    const screen = screenResult.rows[0];
-    if (!screen) return res.status(404).json({ error: "Device not found" });
-
-    // Helper: get columns for a table (cached per request)
-    const columnCache = new Map<string, Set<string>>();
-    async function getColumns(tableName: string): Promise<Set<string>> {
-      if (columnCache.has(tableName)) return columnCache.get(tableName)!;
-      const r = await db.query(
-        `SELECT column_name
-           FROM information_schema.columns
-          WHERE table_schema = 'public'
-            AND table_name = $1`,
-        [tableName]
-      );
-      const s = new Set<string>(r.rows.map((x: any) => String(x.column_name)));
-      columnCache.set(tableName, s);
-      return s;
-    }
-
-    // 2) Find most recent playlist assignment for this device
-    const paCols = await getColumns("playlist_assignments");
-    const assignedAtCol = paCols.has("assigned_at")
-      ? "assigned_at"
-      : paCols.has("created_at")
-        ? "created_at"
-        : "id";
-
-    const assignmentResult = await db.query(
-      `SELECT playlist_id
-         FROM playlist_assignments
-        WHERE device_id = $1
-        ORDER BY ${assignedAtCol} DESC, id DESC
-        LIMIT 1`,
-      [deviceId]
-    );
-    const assignment = assignmentResult.rows[0];
-
-    // 3) Load playlist items
-    // New schema (preferred): playlist_items.playlist_id -> media
-    // Legacy fallback: playlists.screen_id -> media
-    let items: any[] = [];
-
-    const playlistItemsCols = await getColumns("playlist_items");
-    const canUsePlaylistItems = playlistItemsCols.has("playlist_id") && playlistItemsCols.has("media_id");
-
-    const legacyCols = await getColumns("playlists");
-    const canUseLegacyPlaylists = legacyCols.has("screen_id") && legacyCols.has("media_id");
-
-    async function loadItemsFrom(tableName: "playlist_items" | "playlists", filterCol: string, filterVal: any) {
-      const cols = await getColumns(tableName);
-
-      const orderCol = cols.has("position")
-        ? "position"
-        : cols.has("order_index")
-          ? "order_index"
-          : cols.has("sort_order")
-            ? "sort_order"
-            : "id";
-
-      const durationOverrideCol = cols.has("duration_override")
-        ? "duration_override"
-        : cols.has("duration_seconds")
-          ? "duration_seconds"
-          : null;
-
-      const durationExpr = durationOverrideCol
-        ? `COALESCE(${tableName}.${durationOverrideCol}, media.duration, 10)`
-        : `COALESCE(media.duration, 10)`;
-
-      const q = `
-        SELECT ${tableName}.id,
-               media.type,
-               media.url,
-               media.name,
-               ${durationExpr} AS duration
-          FROM ${tableName}
-          JOIN media ON media.id = ${tableName}.media_id
-         WHERE ${tableName}.${filterCol} = $1
-         ORDER BY ${tableName}.${orderCol} ASC, ${tableName}.id ASC
-      `;
-      const r = await db.query(q, [filterVal]);
-      return r.rows || [];
-    }
-
-    if (assignment?.playlist_id && canUsePlaylistItems) {
-      items = await loadItemsFrom("playlist_items", "playlist_id", assignment.playlist_id);
-    }
-
-    // If no items found via playlist_items, try legacy by screen_id
-    if ((!items || items.length === 0) && canUseLegacyPlaylists) {
-      items = await loadItemsFrom("playlists", "screen_id", screen.id);
-    }
-
-    // 4) If still empty, return the built-in fallback
-    if (!items || items.length === 0) {
-      return res.json({
-        screen: { deviceId: screen.device_id },
-        playlist: [
-          {
-            id: "fallback",
-            type: "image",
-            url: "/display/fallback-logo.svg",
-            name: "Default Logo",
-            duration: 15,
-            isFallback: true,
-          },
-        ],
-        refreshInterval: 60,
-        warning: "playlist temporarily unavailable",
+      // Update last seen timestamp
+      await storage.updateScreen(screen.id, {
+        lastSeen: new Date(),
+        status: "online",
       });
-    }
 
-    return res.json({
-      screen: { deviceId: screen.device_id },
-      playlist: items.map((it: any) => ({
-        id: String(it.id),
-        type: it.type,
-        url: it.url,
-        name: it.name,
-        duration: Number(it.duration) || 10,
-      })),
-      refreshInterval: 60,
-    });
-  } catch (err) {
-    console.error("playlist error", err);
-    return res.status(500).json({ error: "Failed to load playlist" });
-  }
-});
+      // Get all media as playlist content (can be enhanced with actual playlist assignments later)
+      const allMedia = await storage.getAllMedia();
+      const playlist = allMedia.map((item) => ({
+        id: item.id,
+        type: item.type,
+        url: item.url,
+        name: item.name,
+        duration: item.duration || 10,
+      }));
+
+      res.json({
+        screen: {
+          id: screen.id,
+          deviceId: screen.deviceId,
+          name: screen.name,
+          resolution: screen.resolution,
+        },
+        playlist,
+        refreshInterval: 300, // seconds until next playlist check
+      });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch playlist" });
+    }
+  });
 
   // Device API endpoints (for Android/player clients)
   app.post("/api/device/register", async (req, res) => {
@@ -2419,17 +1627,9 @@ app.get("/api/screens/:deviceId/playlist", async (req, res) => {
 
           const result = await pool.query(
             `
-            INSERT INTO device_commands (
-               device_id,
-               payload,
-               status,
-               sent,
-               executed,
-               attempts,
-               created_at
-             )
-             VALUES ($1, $2, 'queued', false, false, 0, NOW())
-             RETURNING id, created_at
+            INSERT INTO device_commands (device_id, payload, sent, executed)
+            VALUES ($1, $2, false, false)
+            RETURNING id, created_at
             `,
             [deviceId, JSON.stringify(payload)],
           );
@@ -2513,15 +1713,9 @@ app.get("/api/screens/:deviceId/playlist", async (req, res) => {
   // =====================================================
   // DEVICE SCREENSHOT UPLOAD
   // =====================================================
-  // Base64 upload kept for backward compatibility.
-  // Prefer multipart upload at POST /api/device/:deviceId/screenshot
-  app.post("/api/device/:deviceId/screenshot/base64", authenticateDevice, async (req, res) => {
+  app.post("/api/device/:deviceId/screenshot", async (req, res) => {
     const { deviceId } = req.params;
     const { screenshot } = req.body;
-
-    if (!req.device || req.device.deviceId !== deviceId) {
-      return res.status(403).json({ error: "device_id_mismatch" });
-    }
 
     if (!screenshot) {
       return res.status(400).json({ error: "screenshot_required" });
@@ -2559,21 +1753,8 @@ app.get("/api/screens/:deviceId/playlist", async (req, res) => {
         return res.status(400).json({ error: "No thumbnail file provided" });
       }
 
-	      try {
-	        let thumbnailUrl = `/uploads/device-thumbnails/${file.filename}`;
-	        try {
-	          const publicUrl = await uploadToSupabase({
-	            localPath: file.path,
-	            bucketPath: `device-thumbnails/${file.filename}`,
-	            contentType: file.mimetype,
-	          });
-	          if (publicUrl) {
-	            thumbnailUrl = publicUrl;
-	            fs.promises.unlink(file.path).catch(() => {});
-	          }
-	        } catch (e) {
-	          console.error("[thumbnail] supabase upload failed", e);
-	        }
+      try {
+        const thumbnailUrl = `/uploads/device-thumbnails/${file.filename}`;
         
         await pool.query(
           `UPDATE screens SET thumbnail = $1 WHERE device_id = $2`,
@@ -2726,13 +1907,6 @@ app.get("/api/screens/:deviceId/playlist", async (req, res) => {
   app.post("/api/device/:deviceId/status", async (req, res) => {
     try {
       const { deviceId } = req.params;
-
-
-// Optional: if a Bearer token is provided, validate it as a display token bound to this deviceId.
-// If no token is provided, we still allow playback (legacy mode) because /display/app.js may not yet pass token.
-if (!verifyDisplayTokenOrFail(req, res, deviceId)) {
-  return;
-}
       const validatedData = deviceStatusSchema.parse(req.body);
 
       const screen = await storage.getScreenByDeviceId(deviceId);
@@ -3505,21 +2679,10 @@ if (!verifyDisplayTokenOrFail(req, res, deviceId)) {
           return res.status(400).json({ error: "No file uploaded" });
         }
 
-	      // Default to local URL, but prefer Supabase Storage (Option A)
-	      let fileUrl = `${getRequestBaseUrl(req)}/uploads/${req.file.filename}`;
-	      try {
-	        const publicUrl = await uploadToSupabase({
-	          localPath: req.file.path,
-	          bucketPath: `media/${req.file.filename}`,
-	          contentType: req.file.mimetype,
-	        });
-	        if (publicUrl) {
-	          fileUrl = publicUrl;
-	          fs.promises.unlink(req.file.path).catch(() => {});
-	        }
-	      } catch (e) {
-	        console.error("[media] supabase upload failed", e);
-	      }
+        const baseUrl =
+          process.env.BASE_URL ||
+          `http://localhost:${process.env.PORT || 5000}`;
+        const fileUrl = `${baseUrl}/uploads/${req.file.filename}`;
         const fileType = req.file.mimetype.startsWith("video")
           ? "video"
           : "image";
@@ -4379,20 +3542,7 @@ if (!verifyDisplayTokenOrFail(req, res, deviceId)) {
         return res.status(400).json({ error: "No file uploaded" });
       }
 
-	      let iconUrl = `/uploads/group-icons/${req.file.filename}`;
-	      try {
-	        const publicUrl = await uploadToSupabase({
-	          localPath: req.file.path,
-	          bucketPath: `group-icons/${req.file.filename}`,
-	          contentType: req.file.mimetype,
-	        });
-	        if (publicUrl) {
-	          iconUrl = publicUrl;
-	          fs.promises.unlink(req.file.path).catch(() => {});
-	        }
-	      } catch (e) {
-	        console.error("[group-icon] supabase upload failed", e);
-	      }
+      const iconUrl = `/uploads/group-icons/${req.file.filename}`;
 
       try {
         await storage.updateGroupIcon(id, iconUrl);
@@ -4417,20 +3567,7 @@ if (!verifyDisplayTokenOrFail(req, res, deviceId)) {
         return res.status(400).json({ error: "No file uploaded" });
       }
 
-	      let iconUrl = `/uploads/group-icons/${req.file.filename}`;
-	      try {
-	        const publicUrl = await uploadToSupabase({
-	          localPath: req.file.path,
-	          bucketPath: `group-icons/${req.file.filename}`,
-	          contentType: req.file.mimetype,
-	        });
-	        if (publicUrl) {
-	          iconUrl = publicUrl;
-	          fs.promises.unlink(req.file.path).catch(() => {});
-	        }
-	      } catch (e) {
-	        console.error("[group-icon] supabase upload failed", e);
-	      }
+      const iconUrl = `/uploads/group-icons/${req.file.filename}`;
 
       try {
         await storage.updateGroupIcon(id, iconUrl);
@@ -4534,8 +3671,8 @@ if (!verifyDisplayTokenOrFail(req, res, deviceId)) {
       // Create command for each device
       for (const device of devices) {
         await pool.query(
-          `INSERT INTO device_commands (device_id, payload, status, sent, executed, attempts, created_at)
-           VALUES ($1, $2, 'queued', false, false, 0, NOW())`,
+          `INSERT INTO device_commands (device_id, payload, sent, executed)
+           VALUES ($1, $2, false, false)`,
           [device.device_id, JSON.stringify({
             type: "PLAY_CONTENT",
             contentId,
@@ -5112,13 +4249,6 @@ if (!verifyDisplayTokenOrFail(req, res, deviceId)) {
   app.get("/api/schedule/download/:deviceId", async (req, res) => {
     try {
       const { deviceId } = req.params;
-
-
-// Optional: if a Bearer token is provided, validate it as a display token bound to this deviceId.
-// If no token is provided, we still allow playback (legacy mode) because /display/app.js may not yet pass token.
-if (!verifyDisplayTokenOrFail(req, res, deviceId)) {
-  return;
-}
 
       // Get schedules for this device
       const deviceSchedules = await storage.getSchedulesByDevice(deviceId);

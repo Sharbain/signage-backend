@@ -223,6 +223,65 @@ export class DbStorage implements IStorage {
   }
 
   // ⬇️ DO NOT add another class declaration below this.
+}
+  async getAllScreensWithGroup(): Promise<(Screen & { groupId: string | null })[]> {
+    const result = await db.execute(sql`
+      SELECT s.*, m.group_id as "groupId"
+      FROM screens s
+      LEFT JOIN device_group_map m ON m.device_id = s.device_id
+    `);
+    return result.rows as (Screen & { groupId: string | null })[];
+  }
+
+  async getScreen(id: number): Promise<Screen | undefined> {
+    const result = await db.select().from(screens).where(eq(screens.id, id)).limit(1);
+    return result[0];
+  }
+
+  async getScreenByDeviceId(deviceId: string): Promise<Screen | undefined> {
+    const result = await db.select().from(screens).where(eq(screens.deviceId, deviceId)).limit(1);
+    return result[0];
+  }
+
+  async createScreen(screen: InsertScreen): Promise<Screen> {
+    const result = await db.insert(screens).values(screen as any).returning();
+    return result[0];
+  }
+
+  async updateScreen(id: number, screenUpdate: Partial<InsertScreen>): Promise<Screen | undefined> {
+    const result = await db.update(screens).set(screenUpdate as any).where(eq(screens.id, id)).returning();
+    return result[0];
+  }
+
+  async deleteScreen(id: number): Promise<boolean> {
+    const result = await db.delete(screens).where(eq(screens.id, id)).returning();
+    return result.length > 0;
+  }
+
+  async updateDeviceStatus(deviceId: string, statusUpdate: DeviceStatusUpdate): Promise<Screen | undefined> {
+    const updateData: Record<string, unknown> = { lastSeen: new Date() };
+    if (statusUpdate.status !== undefined) updateData.status = statusUpdate.status;
+    if (statusUpdate.currentContent !== undefined) updateData.currentContent = statusUpdate.currentContent;
+    if (statusUpdate.currentContentName !== undefined) updateData.currentContentName = statusUpdate.currentContentName;
+    if (statusUpdate.temperature !== undefined) updateData.temperature = statusUpdate.temperature;
+    if (statusUpdate.freeStorage !== undefined) updateData.freeStorage = statusUpdate.freeStorage;
+    if (statusUpdate.batteryLevel !== undefined) updateData.batteryLevel = statusUpdate.batteryLevel;
+    if (statusUpdate.signalStrength !== undefined) updateData.signalStrength = statusUpdate.signalStrength;
+    if (statusUpdate.isOnline !== undefined) updateData.isOnline = statusUpdate.isOnline;
+    if (statusUpdate.latitude !== undefined) updateData.latitude = statusUpdate.latitude;
+    if (statusUpdate.longitude !== undefined) updateData.longitude = statusUpdate.longitude;
+    if (statusUpdate.errors !== undefined) updateData.errors = statusUpdate.errors;
+
+    const result = await db
+      .update(screens)
+      .set(updateData)
+      .where(eq(screens.deviceId, deviceId))
+      .returning();
+
+    return result[0];
+  }
+
+  // -----------------------------
   // Secure Pairing (hash + expiry)
   // -----------------------------
 

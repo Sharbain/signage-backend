@@ -1,83 +1,14 @@
 import express, { type Request, Response, NextFunction } from "express";
 import path from "path";
-import fs from "fs";
 import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { randomUUID } from "crypto";
 import { registerRoutes } from "./routes";
 import { createServer } from "http";
-import { fileURLToPath } from "url";
 
 const app = express();
-
-/* --------------------------------------------------
-   TRUST PROXY (Render/Cloudflare)
-   Fixes: ERR_ERL_UNEXPECTED_X_FORWARDED_FOR (express-rate-limit)
--------------------------------------------------- */
-app.set("trust proxy", 1);
-
-/* --------------------------------------------------
-   DISPLAY STATIC (robust on Render)
--------------------------------------------------- */
-
-// Works for BOTH CJS build (dist/index.cjs) and ESM
-const DIRNAME =
-  typeof __dirname !== "undefined"
-    ? __dirname
-    : path.dirname(fileURLToPath(import.meta.url));
-
-// Try a few candidates depending on where Render runs from
-const DISPLAY_CANDIDATES = [
-  path.resolve(process.cwd(), "public", "display"),
-  path.resolve(DIRNAME, "..", "public", "display"),
-  path.resolve(DIRNAME, "..", "..", "public", "display"),
-];
-
-const DISPLAY_DIR =
-  DISPLAY_CANDIDATES.find((p) => fs.existsSync(p)) ?? DISPLAY_CANDIDATES[0];
-
-// ✅ Serve /display/* static files FIRST
-app.use("/display", express.static(DISPLAY_DIR));
-
-// ✅ Player route: /display/:deviceId -> serves the display SPA
-app.get("/display/:deviceId", (_req, res) => {
-  res.sendFile(path.join(DISPLAY_DIR, "index.html"));
-});
-
-
-// ✅ Hard route so the logo is NEVER treated as :screenId
-app.get("/display/fallback-logo.svg", (_req, res) => {
-  res.sendFile(path.join(DISPLAY_DIR, "fallback-logo.svg"));
-});
-
-/* --------------------------------------------------
-   UPLOADS STATIC (Option A: public /uploads)
--------------------------------------------------- */
-
-const UPLOADS_CANDIDATES = [
-  path.resolve(process.cwd(), "uploads"),
-  path.resolve(process.cwd(), "public", "uploads"),
-  path.resolve(DIRNAME, "..", "uploads"),
-  path.resolve(DIRNAME, "..", "..", "uploads"),
-  path.resolve(DIRNAME, "..", "public", "uploads"),
-  path.resolve(DIRNAME, "..", "..", "public", "uploads"),
-];
-
-const UPLOADS_DIR =
-  UPLOADS_CANDIDATES.find((p) => fs.existsSync(p)) ?? UPLOADS_CANDIDATES[0];
-
-// ✅ Public static serving for uploaded media
-app.use(
-  "/uploads",
-  express.static(UPLOADS_DIR, {
-    fallthrough: false,
-    setHeaders: (res) => {
-      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
-    },
-  }),
-);
-
+app.use("/display", express.static(path.join(process.cwd(), "public/display")));
 const httpServer = createServer(app);
 
 /* --------------------------------------------------
@@ -102,47 +33,12 @@ app.use((req, res, next) => {
 });
 
 /* --------------------------------------------------
-   SECURITY BASELINE (CSP FIX FOR SUPABASE)
+   SECURITY BASELINE
 -------------------------------------------------- */
-
-// Allow images/media from Supabase Storage (and your own domain)
-const SUPABASE_URL = process.env.SUPABASE_URL?.trim();
-const supabaseOrigin = SUPABASE_URL ? new URL(SUPABASE_URL).origin : null;
-
-app.use(
-  helmet({
-    contentSecurityPolicy: {
-      useDefaults: true,
-      directives: {
-        // Keep defaults + add what we need
-        "img-src": [
-          "'self'",
-          "data:",
-          "blob:",
-          ...(supabaseOrigin ? [supabaseOrigin] : []),
-          "https://*.supabase.co",
-        ],
-        "media-src": [
-          "'self'",
-          "data:",
-          "blob:",
-          ...(supabaseOrigin ? [supabaseOrigin] : []),
-          "https://*.supabase.co",
-        ],
-        // If later you add video players or fetch blobs etc, this avoids random breakage
-        "connect-src": [
-          "'self'",
-          ...(supabaseOrigin ? [supabaseOrigin] : []),
-          "https://*.supabase.co",
-        ],
-      },
-    },
-    // leave other helmet protections on
-  }),
-);
+app.use(helmet());
 
 /* --------------------------------------------------
-   CORS (SAAS-GRADE)
+   CORS (PRODUCTION-SAFE + VERCEL AUTO SUPPORT)
 -------------------------------------------------- */
 
 // Comma-separated allowlist from environment
@@ -151,40 +47,41 @@ const corsOrigins = (process.env.CORS_ORIGIN || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
-const vercelPreviewRegex = /^https:\/\/signage-frontend-.*\.vercel\.app$/;
-
-const isAllowedOrigin = (origin: string) => {
-  if (corsOrigins.includes(origin)) return true;
-  if (origin === "http://localhost:5173") return true;
-  if (origin === "http://localhost:3000") return true;
-  if (vercelPreviewRegex.test(origin)) return true;
-  return false;
-};
-
 const corsMiddleware = cors({
   origin: (origin, cb) => {
+    // Allow non-browser clients (curl, server-to-server)
     if (!origin) return cb(null, true);
 
-    if (corsOrigins.length === 0) {
-      if (isAllowedOrigin(origin)) return cb(null, true);
-      return cb(new Error(`CORS blocked: ${origin}`));
+    // Allow ALL Vercel deployments automatically
+    if (origin.endsWith(".vercel.app")) {
+      return cb(null, true);
     }
 
-    if (isAllowedOrigin(origin)) return cb(null, true);
+    // If no env origins defined
+    if (corsOrigins.length === 0) {
+      if (process.env.NODE_ENV !== "production") {
+        return cb(null, true);
+      }
+      return cb(new Error("CORS blocked"));
+    }
 
-    return cb(new Error(`CORS blocked: ${origin}`));
+    // Check allowlist
+    if (corsOrigins.includes(origin)) {
+      return cb(null, true);
+    }
+
+    return cb(new Error("CORS blocked"));
   },
   credentials: true,
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
 });
 
 app.use(corsMiddleware);
-app.options("*", corsMiddleware);
 
 /* --------------------------------------------------
    RATE LIMITING
 -------------------------------------------------- */
+
+// Global API limit
 app.use(
   "/api",
   rateLimit({
@@ -195,6 +92,7 @@ app.use(
   }),
 );
 
+// Stricter auth limit
 app.use(
   "/api/auth",
   rateLimit({
@@ -210,7 +108,7 @@ app.use(
 -------------------------------------------------- */
 app.use(
   express.json({
-    limit: "10mb",
+    limit: "1mb",
     verify: (req, _res, buf) => {
       req.rawBody = buf;
     },
@@ -234,14 +132,14 @@ export function log(message: string, source = "express") {
 
 app.use((req, res, next) => {
   const start = Date.now();
-  const reqPath = req.path;
+  const path = req.path;
 
   res.on("finish", () => {
     const duration = Date.now() - start;
-    if (reqPath.startsWith("/api")) {
+    if (path.startsWith("/api")) {
       const requestId = (req as any).requestId;
       log(
-        `${req.method} ${reqPath} ${res.statusCode} in ${duration}ms (rid=${requestId})`,
+        `${req.method} ${path} ${res.statusCode} in ${duration}ms (rid=${requestId})`,
       );
     }
   });
@@ -255,8 +153,16 @@ app.use((req, res, next) => {
 (async () => {
   await registerRoutes(httpServer, app);
 
+  /* --------------------------------------------------
+     PLAYER DISPLAY ROUTES (Android WebView / TV Browser)
+     - /display shows a helpful message
+     - /display/:screenId renders a simple player page
+  -------------------------------------------------- */
   app.get("/display", (_req, res) => {
-    res.status(200).send(`<!doctype html>
+    res
+      .status(200)
+      .send(
+        `<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
@@ -275,16 +181,21 @@ app.use((req, res, next) => {
         <h1>Lumina Player</h1>
         <p>This endpoint expects a screen/device id.</p>
         <p>Try: <code>/display/&lt;id&gt;</code></p>
+        <p>If you scanned a QR but still see this, the Android app is not passing the id.</p>
       </div>
     </div>
   </body>
-</html>`);
+</html>`,
+      );
   });
 
   app.get("/display/:screenId", (req, res) => {
     const screenId = encodeURIComponent(req.params.screenId);
 
-    res.status(200).send(`<!doctype html>
+    res
+      .status(200)
+      .send(
+        `<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
@@ -297,20 +208,27 @@ app.use((req, res, next) => {
     </style>
   </head>
   <body>
-    <div id="root">Loading...</div>
+    <div id="root">Loading…</div>
     <script src="/display/app.js" defer></script>
   </body>
-</html>`);
+</html>`,
+      );
   });
 
-  app.get("/", (_req, res) => res.send("Signage API running"));
-  app.get("/api/ping", (_req, res) =>
-    res.json({ ok: true, time: new Date().toISOString() }),
-  );
+  /* --------------------------------------------------
+     HEALTH / ROOT
+  -------------------------------------------------- */
+  app.get("/", (_req, res) => {
+    res.send("Signage API running");
+  });
 
-  app.use("/api", (_req, res) =>
-    res.status(404).json({ error: "API route not found" }),
-  );
+  app.get("/api/ping", (_req, res) => {
+    res.json({ ok: true, time: new Date().toISOString() });
+  });
+
+  app.use("/api", (_req, res) => {
+    res.status(404).json({ error: "API route not found" });
+  });
 
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
     const status = err.status || err.statusCode || 500;
@@ -320,9 +238,15 @@ app.use((req, res, next) => {
   });
 
   const port = parseInt(process.env.PORT || "5000", 10);
-  httpServer.listen({ port, host: "0.0.0.0", reusePort: true }, () => {
-    log(`API listening on port ${port}`);
-    log(`Display dir = ${DISPLAY_DIR}`);
-    if (SUPABASE_URL) log(`Supabase origin allowed in CSP = ${supabaseOrigin}`);
-  });
+
+  httpServer.listen(
+    {
+      port,
+      host: "0.0.0.0",
+      reusePort: true,
+    },
+    () => {
+      log(`API listening on port ${port}`);
+    },
+  );
 })();
