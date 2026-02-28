@@ -525,73 +525,38 @@ app.post("/api/device/activate", async (req, res) => {
   app.get("/api/devices/:id/details", async (req, res) => {
     const { id } = req.params;
 
-    // Postgres: screens.id is UUID, while UI often uses device_id like "DEV-XXXX".
-    // If we compare uuid = varchar, Postgres throws: "operator does not exist: uuid = character varying".
-    // So we branch safely: when id looks like a UUID, query by UUID; otherwise query by device_id.
-    const looksLikeUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-      id,
-    );
-
     try {
-      const sql = looksLikeUuid
-        ? `
-          SELECT
-            s.id,
-            s.device_id,
-            s.name,
-            s.location,
-            s.status,
-            s.is_online,
-            s.last_seen AS "lastHeartbeat",
-            s.current_content_name AS "currentContentName",
-            s.screenshot,
-            s.screenshot_at AS "screenshotAt",
-            s.thumbnail,
-            s.signal_strength AS "signalStrength",
-            s.connection_type AS "connectionType",
-            s.free_storage AS "freeStorage",
-            s.last_offline AS "lastOffline",
-            s.assigned_template_id AS "assignedTemplateId",
-            s.latitude,
-            s.longitude,
-            s.brightness,
-            s.volume,
-            t.name AS "templateName"
-          FROM screens s
-          LEFT JOIN templates t ON s.assigned_template_id = t.id
-          WHERE s.id = $1::uuid OR s.device_id = $1
-          LIMIT 1
+      const result = await pool.query(
         `
-        : `
-          SELECT
-            s.id,
-            s.device_id,
-            s.name,
-            s.location,
-            s.status,
-            s.is_online,
-            s.last_seen AS "lastHeartbeat",
-            s.current_content_name AS "currentContentName",
-            s.screenshot,
-            s.screenshot_at AS "screenshotAt",
-            s.thumbnail,
-            s.signal_strength AS "signalStrength",
-            s.connection_type AS "connectionType",
-            s.free_storage AS "freeStorage",
-            s.last_offline AS "lastOffline",
-            s.assigned_template_id AS "assignedTemplateId",
-            s.latitude,
-            s.longitude,
-            s.brightness,
-            s.volume,
-            t.name AS "templateName"
-          FROM screens s
-          LEFT JOIN templates t ON s.assigned_template_id = t.id
-          WHERE s.device_id = $1
-          LIMIT 1
-        `;
-
-      const result = await pool.query(sql, [id]);
+        SELECT
+          s.id,
+          s.device_id,
+          s.name,
+          s.location,
+          s.status,
+          s.is_online,
+          s.last_seen AS "lastHeartbeat",
+          s.current_content_name AS "currentContentName",
+          s.screenshot,
+          s.screenshot_at AS "screenshotAt",
+          s.thumbnail,
+          s.signal_strength AS "signalStrength",
+          s.connection_type AS "connectionType",
+          s.free_storage AS "freeStorage",
+          s.last_offline AS "lastOffline",
+          s.assigned_template_id AS "assignedTemplateId",
+          s.latitude,
+          s.longitude,
+          s.brightness,
+          s.volume,
+          t.name AS "templateName"
+        FROM screens s
+        LEFT JOIN templates t ON s.assigned_template_id = t.id
+        WHERE s.id::text = $1 OR s.device_id = $1
+        LIMIT 1
+        `,
+        [id]
+      );
 
       if (result.rowCount === 0) {
         return res.status(404).json({ error: "Device not found" });
@@ -621,19 +586,6 @@ app.post("/api/device/activate", async (req, res) => {
       console.error("Device details error:", err);
       res.status(500).json({ error: "Failed to load device details" });
     }
-  });
-
-  // =====================================================
-  // LEGACY DEVICE COMMANDS ENDPOINT (backwards compatibility)
-  // Old APKs hit /api/device/commands (without :deviceId). We respond with a
-  // clear error so you can diagnose quickly instead of silent 401 loops.
-  // =====================================================
-  app.get("/api/device/commands", (_req, res) => {
-    return res.status(410).json({
-      error: "moved",
-      message:
-        "This endpoint moved. Use GET /api/device/:deviceId/commands with Authorization: Device <deviceKey>.",
-    });
   });
 
   // =====================================================
@@ -1271,13 +1223,52 @@ app.post("/api/device/activate", async (req, res) => {
         return res.status(400).json({ error: "Device name is required" });
       }
 
+      // Create the device record first (generates device_id etc.)
       const device = await createDevice({ name, location_branch });
-      return res.status(201).json({ device });
+
+      // ✅ Generate a short-lived pairing code (plain code returned once),
+      // store only the hash in DB for verification.
+      const pairing_code = String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
+      const pairing_code_hash = crypto
+        .createHash("sha256")
+        .update(pairing_code)
+        .digest("hex");
+      const pairing_expires_at = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+      // Persist pairing hash + expiry on the screen row.
+      // We match by either internal id or device_id to be safe across schemas.
+      try {
+        const q = await pool.query(
+          `UPDATE screens
+             SET pairing_code_hash = $1,
+                 pairing_expires_at = $2
+           WHERE id::text = $3 OR device_id = $4
+           RETURNING pairing_expires_at`,
+          [pairing_code_hash, pairing_expires_at, String((device as any).id), String((device as any).device_id)]
+        );
+
+        const returnedExpiry = q.rows?.[0]?.pairing_expires_at;
+        if (returnedExpiry) {
+          (device as any).pairing_expires_at = returnedExpiry;
+        } else {
+          (device as any).pairing_expires_at = pairing_expires_at.toISOString();
+        }
+      } catch (e) {
+        // If the schema doesn't have these fields yet, don't crash creation.
+        console.error("Pairing code update failed (missing columns/migration?):", e);
+        (device as any).pairing_expires_at = pairing_expires_at.toISOString();
+      }
+
+      return res.status(201).json({
+        device,
+        pairing_code, // <-- what the UI & APK need
+      });
     } catch (error) {
       console.error("Error creating device:", error);
       return res.status(500).json({ error: "Failed to create device" });
     }
   });
+
 
   // ❌ Disabled: minting long-lived device JWTs is insecure.
   // Use pairing + api_key_hash instead (see /api/device/claim + admin pairing endpoint).
