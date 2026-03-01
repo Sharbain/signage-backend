@@ -548,21 +548,19 @@ app.post("/api/devices/activate", handleDeviceActivate);
  // =====================================================
 // DEVICE DETAILS (for DeviceControlPage)
 // =====================================================
+// Device details (admin) - supports either UUID (screens.id) or device_id (DEV-XXXX)
 app.get("/api/devices/:id/details", async (req, res) => {
-  const rawId = String(req.params.id || "").trim();
-
   try {
+    const rawId = String(req.params.id || "").trim();
     if (!rawId) return res.status(400).json({ error: "missing_id" });
 
-    // - UUID => treat param as screens.id
-    // - Otherwise => treat param as screens.device_id (e.g. "DEV-XXXX")
+    // If param is a UUID -> search screens.id
     const isUuid =
       /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
         rawId
       );
 
-    const result = await pool.query(
-      `
+    const query = `
       SELECT
         s.id,
         s.device_id,
@@ -586,44 +584,42 @@ app.get("/api/devices/:id/details", async (req, res) => {
         s.volume,
         t.name AS "templateName"
       FROM screens s
-      -- templates.id is UUID; assigned_template_id is stored as text in some DBs.
-      -- Join safely via text to avoid uuid/text operator mismatch.
-      LEFT JOIN templates t ON t.id::text = s.assigned_template_id
+      LEFT JOIN templates t
+        ON t.id::text = s.assigned_template_id::text
       WHERE ${isUuid ? "s.id = $1::uuid" : "s.device_id = $1"}
       LIMIT 1
-      `,
-      [rawId]
-    );
+    `;
 
-    if (!result.rowCount) return res.status(404).json({ error: "Device not found" });
+    const result = await pool.query(query, [rawId]);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Device not found" });
+    }
 
     const device = result.rows[0];
+
     res.json({
       id: device.device_id || device.id,
-      deviceId: device.device_id,
       name: device.name,
-      location: device.location,
-      status: device.status,
-      isOnline: device.is_online,
+      status: device.is_online ? "Online" : "Offline",
       lastHeartbeat: device.lastHeartbeat,
       currentContentName: device.currentContentName,
-      screenshot: device.screenshot,
+      templateName: device.templateName,
+      lastScreenshot: device.screenshot,
       screenshotAt: device.screenshotAt,
       thumbnail: device.thumbnail,
       signalStrength: device.signalStrength,
-      connectionType: device.connectionType,
+      connectionType: device.connectionType || "wifi",
       freeStorage: device.freeStorage,
       lastOffline: device.lastOffline,
-      assignedTemplateId: device.assignedTemplateId,
-      templateName: device.templateName,
       latitude: device.latitude,
       longitude: device.longitude,
-      brightness: device.brightness,
-      volume: device.volume,
+      brightness: device.brightness ?? 100,
+      volume: device.volume ?? 70,
     });
   } catch (err) {
     console.error("Device details error:", err);
-    return res.status(500).json({ error: "Failed to load device details" });
+    res.status(500).json({ error: "Failed to load device details" });
   }
 });
 
