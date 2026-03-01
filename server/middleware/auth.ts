@@ -42,25 +42,30 @@ function sha256Hex(input: string): string {
 /**
  * USER JWT AUTH (dashboard/admin)
  *
- * IMPORTANT:
- * We intentionally bypass some DEVICE/PLAYER endpoints here because some codebases
- * mount authenticateJWT globally for "/api". If we don't bypass, device endpoints
- * would fail with "missing_bearer_token" before they reach authenticateDevice.
+ * IMPORTANT (enterprise):
+ * Device/player endpoints must NOT be blocked by Bearer JWT middleware.
+ * Some codebases mount authenticateJWT for "/api" globally. If we don't bypass,
+ * device endpoints would fail with "missing_bearer_token" before they reach authenticateDevice.
+ *
+ * We therefore bypass ALL device/player APIs here:
+ *  - /api/screens/*
+ *  - /api/device/*
+ *  - /screens/* and /device/* (when mounted under app.use("/api", ...))
+ *
+ * Admin/user endpoints remain protected because they explicitly attach authenticateJWT
+ * at the route level (e.g. /api/admin/*).
  */
 export async function authenticateJWT(req: Request, res: Response, next: NextFunction) {
   // --- ENTERPRISE BYPASS FOR DEVICE/PLAYER ROUTES ---
-  // Handles both mounting styles:
-  // 1) app.use("/api", authenticateJWT)  -> req.path looks like "/screens/DEV/playlist"
-  // 2) app.use(authenticateJWT)          -> req.path might include "/api/..."
-  const p = req.path || "";
-  const fullPath = `${req.baseUrl || ""}${req.path || ""}`;
+  const p = req.path || ""; // e.g. "/screens/DEV/playlist" if mounted under "/api"
+  const fullPath = `${req.baseUrl || ""}${req.path || ""}`; // e.g. "/api/screens/DEV/playlist"
 
-  // Allow device registration and playlist to proceed without user JWT.
+  // Bypass Bearer auth for ALL player endpoints.
   if (
-    p === "/screens/register" ||
-    /^\/screens\/[^/]+\/playlist$/.test(p) ||
-    /^\/api\/screens\/[^/]+\/playlist$/.test(fullPath) ||
-    fullPath === "/api/screens/register"
+    p.startsWith("/screens/") ||
+    p.startsWith("/device/") ||
+    fullPath.startsWith("/api/screens/") ||
+    fullPath.startsWith("/api/device/")
   ) {
     return next();
   }
