@@ -132,14 +132,14 @@ export function log(message: string, source = "express") {
 
 app.use((req, res, next) => {
   const start = Date.now();
-  const path = req.path;
+  const reqPath = req.path;
 
   res.on("finish", () => {
     const duration = Date.now() - start;
-    if (path.startsWith("/api")) {
+    if (reqPath.startsWith("/api")) {
       const requestId = (req as any).requestId;
       log(
-        `${req.method} ${path} ${res.statusCode} in ${duration}ms (rid=${requestId})`,
+        `${req.method} ${reqPath} ${res.statusCode} in ${duration}ms (rid=${requestId})`,
       );
     }
   });
@@ -239,14 +239,8 @@ app.use((req, res, next) => {
 
   const port = parseInt(process.env.PORT || "5000", 10);
 
-  httpServer.listen(
-    {
-      port,
-      host: "0.0.0.0",
-      reusePort: true,
-    },
-    () => {
-      log(`API listening on port ${port}`);
-    },
-  );
+// Cloud-safe: bind to all interfaces
+httpServer.listen(port, "0.0.0.0", () => {
+  log(`API listening on port ${port}`);
+});
 })();
