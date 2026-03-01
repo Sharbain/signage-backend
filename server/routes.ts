@@ -556,7 +556,6 @@ app.get("/api/devices/:id/details", async (req, res) => {
     const rawId = String(req.params.id || "").trim();
     if (!rawId) return res.status(400).json({ error: "missing_id" });
 
-    // If param is a UUID -> search screens.id
     const isUuid =
       /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
         rawId
@@ -582,8 +581,6 @@ app.get("/api/devices/:id/details", async (req, res) => {
         s.assigned_template_id AS "assignedTemplateId",
         s.latitude,
         s.longitude,
-        s.brightness,
-        s.volume,
         t.name AS "templateName"
       FROM screens s
       LEFT JOIN templates t
@@ -600,10 +597,16 @@ app.get("/api/devices/:id/details", async (req, res) => {
 
     const device = result.rows[0];
 
+    // Enterprise-style online computation fallback
+    const isOnline =
+      device.lastHeartbeat &&
+      new Date(device.lastHeartbeat).getTime() >
+        Date.now() - 60 * 1000;
+
     res.json({
       id: device.device_id || device.id,
       name: device.name,
-      status: device.is_online ? "Online" : "Offline",
+      status: isOnline ? "Online" : "Offline",
       lastHeartbeat: device.lastHeartbeat,
       currentContentName: device.currentContentName,
       templateName: device.templateName,
@@ -616,8 +619,10 @@ app.get("/api/devices/:id/details", async (req, res) => {
       lastOffline: device.lastOffline,
       latitude: device.latitude,
       longitude: device.longitude,
-      brightness: device.brightness ?? 100,
-      volume: device.volume ?? 70,
+
+      // Until we store brightness/volume in device_status_logs
+      brightness: 100,
+      volume: 70,
     });
   } catch (err) {
     console.error("Device details error:", err);
