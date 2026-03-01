@@ -545,112 +545,129 @@ app.post("/api/devices/activate", handleDeviceActivate);
     }
   });
 
-  // =====================================================
-  // DEVICE DETAILS (for DeviceControlPage)
-  // =====================================================
-  app.get("/api/devices/:id/details", async (req, res) => {
-    const { id } = req.params;
+ // =====================================================
+// DEVICE DETAILS (for DeviceControlPage)
+// =====================================================
+// Device details (admin) - supports either UUID (screens.id) or device_id (DEV-XXXX)
+app.get("/api/devices/:id/details", async (req, res) => {
+  try {
+    const rawId = String(req.params.id || "").trim();
+    if (!rawId) return res.status(400).json({ error: "missing_id" });
 
-    try {
-      const result = await pool.query(
-        `
-        SELECT
-          s.id,
-          s.device_id,
-          s.name,
-          s.location,
-          s.status,
-          s.is_online,
-          s.last_seen AS "lastHeartbeat",
-          s.current_content_name AS "currentContentName",
-          s.screenshot,
-          s.screenshot_at AS "screenshotAt",
-          s.thumbnail,
-          s.signal_strength AS "signalStrength",
-          s.connection_type AS "connectionType",
-          s.free_storage AS "freeStorage",
-          s.last_offline AS "lastOffline",
-          s.assigned_template_id AS "assignedTemplateId",
-          s.latitude,
-          s.longitude,
-          s.brightness,
-          s.volume,
-          t.name AS "templateName"
-        FROM screens s
-        LEFT JOIN templates t ON s.assigned_template_id = t.id
-        WHERE s.id::text = $1 OR s.device_id = $1
-        LIMIT 1
-        `,
-        [id]
+    // If param is a UUID -> search screens.id
+    const isUuid =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        rawId
       );
 
-      if (result.rowCount === 0) {
-        return res.status(404).json({ error: "Device not found" });
-      }
+    const query = `
+      SELECT
+        s.id,
+        s.device_id,
+        s.name,
+        s.location,
+        s.status,
+        s.is_online,
+        s.last_seen AS "lastHeartbeat",
+        s.current_content_name AS "currentContentName",
+        s.screenshot,
+        s.screenshot_at AS "screenshotAt",
+        s.thumbnail,
+        s.signal_strength AS "signalStrength",
+        s.connection_type AS "connectionType",
+        s.free_storage AS "freeStorage",
+        s.last_offline AS "lastOffline",
+        s.assigned_template_id AS "assignedTemplateId",
+        s.latitude,
+        s.longitude,
+        s.brightness,
+        s.volume,
+        t.name AS "templateName"
+      FROM screens s
+      LEFT JOIN templates t
+        ON t.id::text = s.assigned_template_id::text
+      WHERE ${isUuid ? "s.id = $1::uuid" : "s.device_id = $1"}
+      LIMIT 1
+    `;
 
-      const device = result.rows[0];
-      res.json({
-        id: device.device_id || device.id,
-        name: device.name,
-        status: device.is_online ? "Online" : "Offline",
-        lastHeartbeat: device.lastHeartbeat,
-        currentContentName: device.currentContentName,
-        templateName: device.templateName,
-        lastScreenshot: device.screenshot,
-        screenshotAt: device.screenshotAt,
-        thumbnail: device.thumbnail,
-        signalStrength: device.signalStrength,
-        connectionType: device.connectionType || "wifi",
-        freeStorage: device.freeStorage,
-        lastOffline: device.lastOffline,
-        latitude: device.latitude,
-        longitude: device.longitude,
-        brightness: device.brightness ?? 100,
-        volume: device.volume ?? 70,
-      });
-    } catch (err) {
-      console.error("Device details error:", err);
-      res.status(500).json({ error: "Failed to load device details" });
+    const result = await pool.query(query, [rawId]);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Device not found" });
     }
-  });
+
+    const device = result.rows[0];
+
+    res.json({
+      id: device.device_id || device.id,
+      name: device.name,
+      status: device.is_online ? "Online" : "Offline",
+      lastHeartbeat: device.lastHeartbeat,
+      currentContentName: device.currentContentName,
+      templateName: device.templateName,
+      lastScreenshot: device.screenshot,
+      screenshotAt: device.screenshotAt,
+      thumbnail: device.thumbnail,
+      signalStrength: device.signalStrength,
+      connectionType: device.connectionType || "wifi",
+      freeStorage: device.freeStorage,
+      lastOffline: device.lastOffline,
+      latitude: device.latitude,
+      longitude: device.longitude,
+      brightness: device.brightness ?? 100,
+      volume: device.volume ?? 70,
+    });
+  } catch (err) {
+    console.error("Device details error:", err);
+    res.status(500).json({ error: "Failed to load device details" });
+  }
+});
 
   // =====================================================
-  // DEVICE SETTINGS (brightness/volume)
-  // =====================================================
-  app.post("/api/devices/:id/settings", async (req, res) => {
-    const { id } = req.params;
-    const { brightness, volume } = req.body;
+// DEVICE SETTINGS (brightness/volume)
+// =====================================================
+app.post("/api/devices/:id/settings", async (req, res) => {
+  const rawId = String(req.params.id || "").trim();
+  const { brightness, volume } = req.body;
 
-    try {
-      const updates: string[] = [];
-      const values: any[] = [];
-      let paramIndex = 1;
+  try {
+    if (!rawId) return res.status(400).json({ error: "missing_id" });
 
-      if (brightness !== undefined) {
-        updates.push(`brightness = $${paramIndex++}`);
-        values.push(brightness);
-      }
-      if (volume !== undefined) {
-        updates.push(`volume = $${paramIndex++}`);
-        values.push(volume);
-      }
-
-      if (updates.length === 0) {
-        return res.status(400).json({ error: "No settings to update" });
-      }
-
-      values.push(id);
-      await pool.query(
-        `UPDATE screens SET ${updates.join(", ")} WHERE device_id = $${paramIndex} OR id::text = $${paramIndex}`,
-        values
+    const isUuid =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        rawId
       );
 
-      res.json({ success: true });
-    } catch (err) {
-      console.error("Update device settings error:", err);
-      res.status(500).json({ error: "Failed to update settings" });
+    const updates: string[] = [];
+    const values: any[] = [];
+    let paramIndex = 1;
+
+    if (brightness !== undefined) {
+      updates.push(`brightness = $${paramIndex++}`);
+      values.push(brightness);
     }
-  });
+    if (volume !== undefined) {
+      updates.push(`volume = $${paramIndex++}`);
+      values.push(volume);
+    }
+
+    if (!updates.length) return res.status(400).json({ error: "No settings to update" });
+
+    values.push(rawId);
+
+    await pool.query(
+      `UPDATE screens
+       SET ${updates.join(", ")}
+       WHERE ${isUuid ? `id = $${paramIndex}::uuid` : `device_id = $${paramIndex}`}`,
+      values
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Update settings error:", err);
+    res.status(500).json({ error: "Failed to update settings" });
+  }
+});
 
   // =====================================================
   // DEVICE DATA USAGE
