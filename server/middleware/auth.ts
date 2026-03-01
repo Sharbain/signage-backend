@@ -39,7 +39,32 @@ function sha256Hex(input: string): string {
   return crypto.createHash("sha256").update(input).digest("hex");
 }
 
+/**
+ * USER JWT AUTH (dashboard/admin)
+ *
+ * IMPORTANT:
+ * We intentionally bypass some DEVICE/PLAYER endpoints here because some codebases
+ * mount authenticateJWT globally for "/api". If we don't bypass, device endpoints
+ * would fail with "missing_bearer_token" before they reach authenticateDevice.
+ */
 export async function authenticateJWT(req: Request, res: Response, next: NextFunction) {
+  // --- ENTERPRISE BYPASS FOR DEVICE/PLAYER ROUTES ---
+  // Handles both mounting styles:
+  // 1) app.use("/api", authenticateJWT)  -> req.path looks like "/screens/DEV/playlist"
+  // 2) app.use(authenticateJWT)          -> req.path might include "/api/..."
+  const p = req.path || "";
+  const fullPath = `${req.baseUrl || ""}${req.path || ""}`;
+
+  // Allow device registration and playlist to proceed without user JWT.
+  if (
+    p === "/screens/register" ||
+    /^\/screens\/[^/]+\/playlist$/.test(p) ||
+    /^\/api\/screens\/[^/]+\/playlist$/.test(fullPath) ||
+    fullPath === "/api/screens/register"
+  ) {
+    return next();
+  }
+
   const authHeader = getAuthHeader(req);
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return res.status(401).json({ error: "missing_bearer_token" });
