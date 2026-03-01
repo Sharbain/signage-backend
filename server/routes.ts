@@ -548,77 +548,50 @@ app.post("/api/devices/activate", handleDeviceActivate);
   // =====================================================
   // DEVICE DETAILS (for DeviceControlPage)
   // =====================================================
-  app.get("/api/devices/:id/details", async (req, res) => {
-  const { id } = req.params;
-
+app.get("/api/devices/:id/details", async (req, res) => {
   try {
-    const result = await pool.query(
-      `
-        SELECT
-          s.id,
-          s.device_id,
-          s.name,
-          s.location,
-          s.status,
-          s.is_online,
-          s.last_seen AS "lastHeartbeat",
-          s.current_content_name AS "currentContentName",
-          s.screenshot,
-          s.screenshot_at AS "screenshotAt",
-          s.thumbnail,
-          s.signal_strength AS "signalStrength",
-          s.connection_type AS "connectionType",
-          s.free_storage AS "freeStorage",
-          s.last_offline AS "lastOffline",
-          s.assigned_template_id AS "assignedTemplateId",
-          s.latitude,
-          s.longitude,
-          s.brightness,
-          s.volume,
-          t.name AS "templateName"
-        FROM screens s
-        LEFT JOIN templates t
-          ON t.id = (
-            CASE
-              WHEN s.assigned_template_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-              THEN s.assigned_template_id::uuid
-              ELSE NULL
-            END
-          )
-        WHERE s.id::text = $1 OR s.device_id = $1
-        LIMIT 1
-      `,
-      [id]
-    );
+    const rawId = String(req.params.id ?? "").trim();
+    if (!rawId) return res.status(400).json({ error: "missing_id" });
+
+    // JS decides if the param is UUID (screens.id) or device_id ("DEV-xxxx")
+    const isUuid =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        rawId
+      );
+
+    // Safe template join:
+    // - templates.id is uuid
+    // - screens.assigned_template_id might be text OR uuid depending on your schema/history
+    // - NEVER use ~* on uuid columns (that caused: uuid ~* unknown)
+    const query = `
+      SELECT
+        s.*,
+        t.id   AS template_id,
+        t.name AS template_name
+      FROM screens s
+      LEFT JOIN templates t
+        ON t.id = (
+          CASE
+            WHEN s.assigned_template_id IS NULL THEN NULL
+            WHEN (s.assigned_template_id::text) ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+              THEN (s.assigned_template_id::text)::uuid
+            ELSE NULL
+          END
+        )
+      WHERE ${isUuid ? "s.id = $1::uuid" : "s.device_id = $1"}
+      LIMIT 1
+    `;
+
+    const result = await pool.query(query, [rawId]);
 
     if (result.rowCount === 0) {
       return res.status(404).json({ error: "Device not found" });
     }
 
-    const device = result.rows[0];
-    res.json({
-      id: device.device_id || device.id,
-      name: device.name,
-      status: device.is_online ? "Online" : "Offline",
-      lastHeartbeat: device.lastHeartbeat,
-      currentContentName: device.currentContentName,
-      templateName: device.templateName,
-      lastScreenshot: device.screenshot,
-      screenshotAt: device.screenshotAt,
-      thumbnail: device.thumbnail,
-      signalStrength: device.signalStrength,
-      connectionType: device.connectionType,
-      freeStorage: device.freeStorage,
-      lastOffline: device.lastOffline,
-      assignedTemplateId: device.assignedTemplateId,
-      latitude: device.latitude,
-      longitude: device.longitude,
-      brightness: device.brightness,
-      volume: device.volume,
-    });
+    return res.json(result.rows[0]);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to load device details" });
+    console.error("Device details error:", err);
+    return res.status(500).json({ error: "Failed to load device details" });
   }
 });
 
