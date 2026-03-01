@@ -72,7 +72,7 @@ export async function authenticateJWT(req: Request, res: Response, next: NextFun
 
   const authHeader = getAuthHeader(req);
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).json({ error: "missing_bearer_token" });
+   return res.status(401).json({ error: "missing_bearer_token__MARKER_35ad9ac" });
   }
 
   const token = authHeader.slice("Bearer ".length).trim();
