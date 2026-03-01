@@ -554,32 +554,39 @@ app.post("/api/devices/activate", handleDeviceActivate);
   try {
     const result = await pool.query(
       `
-      SELECT
-        s.id,
-        s.device_id,
-        s.name,
-        s.location,
-        s.status,
-        s.is_online,
-        s.last_seen AS "lastHeartbeat",
-        s.current_content_name AS "currentContentName",
-        s.screenshot,
-        s.screenshot_at AS "screenshotAt",
-        s.thumbnail,
-        s.signal_strength AS "signalStrength",
-        s.connection_type AS "connectionType",
-        s.free_storage AS "freeStorage",
-        s.last_offline AS "lastOffline",
-        s.assigned_template_id AS "assignedTemplateId",
-        s.latitude,
-        s.longitude,
-        s.brightness,
-        s.volume,
-        t.name AS "templateName"
-      FROM screens s
-      LEFT JOIN templates t ON t.id::text = s.assigned_template_id::text
-      WHERE s.id::text = $1 OR s.device_id = $1
-      LIMIT 1
+        SELECT
+          s.id,
+          s.device_id,
+          s.name,
+          s.location,
+          s.status,
+          s.is_online,
+          s.last_seen AS "lastHeartbeat",
+          s.current_content_name AS "currentContentName",
+          s.screenshot,
+          s.screenshot_at AS "screenshotAt",
+          s.thumbnail,
+          s.signal_strength AS "signalStrength",
+          s.connection_type AS "connectionType",
+          s.free_storage AS "freeStorage",
+          s.last_offline AS "lastOffline",
+          s.assigned_template_id AS "assignedTemplateId",
+          s.latitude,
+          s.longitude,
+          s.brightness,
+          s.volume,
+          t.name AS "templateName"
+        FROM screens s
+        LEFT JOIN templates t
+          ON t.id = (
+            CASE
+              WHEN s.assigned_template_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+              THEN s.assigned_template_id::uuid
+              ELSE NULL
+            END
+          )
+        WHERE s.id::text = $1 OR s.device_id = $1
+        LIMIT 1
       `,
       [id]
     );
@@ -589,14 +596,14 @@ app.post("/api/devices/activate", handleDeviceActivate);
     }
 
     const device = result.rows[0];
-
     res.json({
       id: device.device_id || device.id,
       name: device.name,
       status: device.is_online ? "Online" : "Offline",
       lastHeartbeat: device.lastHeartbeat,
       currentContentName: device.currentContentName,
-      screenshot: device.screenshot,
+      templateName: device.templateName,
+      lastScreenshot: device.screenshot,
       screenshotAt: device.screenshotAt,
       thumbnail: device.thumbnail,
       signalStrength: device.signalStrength,
@@ -604,14 +611,13 @@ app.post("/api/devices/activate", handleDeviceActivate);
       freeStorage: device.freeStorage,
       lastOffline: device.lastOffline,
       assignedTemplateId: device.assignedTemplateId,
-      templateName: device.templateName,
       latitude: device.latitude,
       longitude: device.longitude,
-      brightness: device.brightness ?? 100,
-      volume: device.volume ?? 70,
+      brightness: device.brightness,
+      volume: device.volume,
     });
   } catch (err) {
-    console.error("Device details error:", err);
+    console.error(err);
     res.status(500).json({ error: "Failed to load device details" });
   }
 });
