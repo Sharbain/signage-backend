@@ -545,22 +545,21 @@ app.post("/api/devices/activate", handleDeviceActivate);
     }
   });
 
-  // =====================================================
-  // DEVICE DETAILS (for DeviceControlPage)
-  // =====================================================
+ // =====================================================
+// DEVICE DETAILS (for DeviceControlPage)
+// =====================================================
 app.get("/api/devices/:id/details", async (req, res) => {
+  const rawId = String(req.params.id || "").trim();
+
   try {
-    const rawId = String(req.params.id || "").trim();
     if (!rawId) return res.status(400).json({ error: "missing_id" });
 
-    // If param is UUID -> treat as screens.id
-    // Else -> treat as screens.device_id (e.g. "DEV-XXXX")
+    // - UUID => treat param as screens.id
+    // - Otherwise => treat param as screens.device_id (e.g. "DEV-XXXX")
     const isUuid =
       /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
         rawId
       );
-
-    const whereClause = isUuid ? "s.id = $1::uuid" : "s.device_id = $1";
 
     const result = await pool.query(
       `
@@ -583,42 +582,44 @@ app.get("/api/devices/:id/details", async (req, res) => {
         s.assigned_template_id AS "assignedTemplateId",
         s.latitude,
         s.longitude,
+        s.brightness,
+        s.volume,
         t.name AS "templateName"
       FROM screens s
-      LEFT JOIN templates t
-        ON t.id = CASE
-          WHEN s.assigned_template_id IS NULL THEN NULL
-          WHEN (s.assigned_template_id::text ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-            THEN s.assigned_template_id::uuid
-          ELSE NULL
-        END
-      WHERE ${whereClause}
+      -- templates.id is UUID; assigned_template_id is stored as text in some DBs.
+      -- Join safely via text to avoid uuid/text operator mismatch.
+      LEFT JOIN templates t ON t.id::text = s.assigned_template_id
+      WHERE ${isUuid ? "s.id = $1::uuid" : "s.device_id = $1"}
       LIMIT 1
       `,
       [rawId]
     );
 
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: "Device not found" });
-    }
+    if (!result.rowCount) return res.status(404).json({ error: "Device not found" });
 
     const device = result.rows[0];
-    return res.json({
+    res.json({
       id: device.device_id || device.id,
+      deviceId: device.device_id,
       name: device.name,
-      status: device.is_online ? "Online" : "Offline",
+      location: device.location,
+      status: device.status,
+      isOnline: device.is_online,
       lastHeartbeat: device.lastHeartbeat,
       currentContentName: device.currentContentName,
-      templateName: device.templateName,
-      lastScreenshot: device.screenshot,
+      screenshot: device.screenshot,
       screenshotAt: device.screenshotAt,
       thumbnail: device.thumbnail,
       signalStrength: device.signalStrength,
-      connectionType: device.connectionType || "wifi",
+      connectionType: device.connectionType,
       freeStorage: device.freeStorage,
       lastOffline: device.lastOffline,
+      assignedTemplateId: device.assignedTemplateId,
+      templateName: device.templateName,
       latitude: device.latitude,
       longitude: device.longitude,
+      brightness: device.brightness,
+      volume: device.volume,
     });
   } catch (err) {
     console.error("Device details error:", err);
@@ -627,42 +628,50 @@ app.get("/api/devices/:id/details", async (req, res) => {
 });
 
   // =====================================================
-  // DEVICE SETTINGS (brightness/volume)
-  // =====================================================
-  app.post("/api/devices/:id/settings", async (req, res) => {
-    const { id } = req.params;
-    const { brightness, volume } = req.body;
+// DEVICE SETTINGS (brightness/volume)
+// =====================================================
+app.post("/api/devices/:id/settings", async (req, res) => {
+  const rawId = String(req.params.id || "").trim();
+  const { brightness, volume } = req.body;
 
-    try {
-      const updates: string[] = [];
-      const values: any[] = [];
-      let paramIndex = 1;
+  try {
+    if (!rawId) return res.status(400).json({ error: "missing_id" });
 
-      if (brightness !== undefined) {
-        updates.push(`brightness = $${paramIndex++}`);
-        values.push(brightness);
-      }
-      if (volume !== undefined) {
-        updates.push(`volume = $${paramIndex++}`);
-        values.push(volume);
-      }
-
-      if (updates.length === 0) {
-        return res.status(400).json({ error: "No settings to update" });
-      }
-
-      values.push(id);
-      await pool.query(
-        `UPDATE screens SET ${updates.join(", ")} WHERE device_id = $${paramIndex} OR id::text = $${paramIndex}`,
-        values
+    const isUuid =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        rawId
       );
 
-      res.json({ success: true });
-    } catch (err) {
-      console.error("Update device settings error:", err);
-      res.status(500).json({ error: "Failed to update settings" });
+    const updates: string[] = [];
+    const values: any[] = [];
+    let paramIndex = 1;
+
+    if (brightness !== undefined) {
+      updates.push(`brightness = $${paramIndex++}`);
+      values.push(brightness);
     }
-  });
+    if (volume !== undefined) {
+      updates.push(`volume = $${paramIndex++}`);
+      values.push(volume);
+    }
+
+    if (!updates.length) return res.status(400).json({ error: "No settings to update" });
+
+    values.push(rawId);
+
+    await pool.query(
+      `UPDATE screens
+       SET ${updates.join(", ")}
+       WHERE ${isUuid ? `id = $${paramIndex}::uuid` : `device_id = $${paramIndex}`}`,
+      values
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Update settings error:", err);
+    res.status(500).json({ error: "Failed to update settings" });
+  }
+});
 
   // =====================================================
   // DEVICE DATA USAGE
