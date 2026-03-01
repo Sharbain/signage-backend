@@ -330,6 +330,8 @@ export async function registerRoutes(
     if (p.startsWith("/auth/")) return next();
     if (p === "/ping") return next();
     if (p === "/screens/register") return next();
+    // Player (device) playlist fetch is device-authenticated (not user JWT)
+    if (/^\/screens\/[^\/]+\/playlist$/.test(p)) return next();
     // Device claim (pairing) should not require user JWT
     if (p === "/device/claim") return next();
     if (p.startsWith("/device/")) return next();
@@ -1545,7 +1547,7 @@ const existingUser = await storage.getUserByEmail(email);
   });
 
   // Get playlist content for a device by deviceId
-  app.get("/api/screens/:deviceId/playlist", async (req, res) => {
+  app.get("/api/screens/:deviceId/playlist", authenticateDevice, async (req, res) => {
     try {
       const { deviceId } = req.params;
 
