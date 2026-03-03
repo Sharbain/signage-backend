@@ -2,6 +2,13 @@
 (function () {
   const root = document.getElementById("root");
 
+  // Hard safety: never white screen
+  try {
+    document.documentElement.style.background = "#000";
+    document.body.style.background = "#000";
+    document.body.style.margin = "0";
+  } catch (_) {}
+
   const state = {
     screenId: "",
     stopped: false,
@@ -10,37 +17,58 @@
     retryTimer: null,
     playlist: [],
     index: 0,
-    backoffMs: 2000,
-    lastMode: "online", // online | cached
+    lastError: "",
   };
+
+  function qs() {
+    try {
+      return new URLSearchParams(location.search || "");
+    } catch (_) {
+      return { get: () => null, has: () => false };
+    }
+  }
+
+  const DEBUG = qs().get("debug") === "1";
 
   function setText(text) {
     if (!root) return;
     root.innerHTML = "";
+    root.style.height = "100%";
+    root.style.display = "flex";
+    root.style.alignItems = "center";
+    root.style.justifyContent = "center";
+    root.style.color = "#fff";
+    root.style.fontFamily = "system-ui, Segoe UI, Roboto, Arial";
+    root.style.padding = "24px";
+    root.style.textAlign = "center";
     root.textContent = String(text);
   }
 
-  function setHtml(html) {
-    if (!root) return;
-    root.innerHTML = String(html);
+  function setError(text) {
+    state.lastError = String(text || "");
+    setText(state.lastError);
+    if (DEBUG) renderDebugOverlay();
   }
 
   function clearRoot() {
     if (!root) return;
     root.innerHTML = "";
+    root.style.background = "#000";
   }
 
   function getScreenIdFromPath() {
+    // supports /display/DEV-xxx or /display/DEV-xxx/
     const parts = (location.pathname || "").split("/").filter(Boolean);
     const last = parts[parts.length - 1] || "";
     return decodeURIComponent(last);
   }
 
   function getToken() {
-    const qs = new URLSearchParams(location.search || "");
-    const qToken = qs.get("token");
+    // 1) URL query is best: /display/DEV-123?token=xxxx
+    const qToken = qs().get("token");
     if (qToken && qToken.trim()) return qToken.trim();
 
+    // 2) localStorage fallback (support multiple keys)
     const keys = ["screenToken", "deviceToken", "device_token", "accessToken"];
     for (const k of keys) {
       try {
@@ -48,45 +76,65 @@
         if (v && v.trim()) return v.trim();
       } catch (_) {}
     }
+
     return "";
   }
 
-  function lkgKey(screenId) {
-    return `lkg_playlist_${screenId}`;
-  }
-  function lkgMetaKey(screenId) {
-    return `lkg_playlist_meta_${screenId}`;
-  }
+  function renderDebugOverlay() {
+    if (!root) return;
 
-  function savePlaylistToCache(screenId, payload) {
-    try {
-      localStorage.setItem(lkgKey(screenId), JSON.stringify(payload));
-      localStorage.setItem(
-        lkgMetaKey(screenId),
-        JSON.stringify({ savedAt: Date.now() })
-      );
-    } catch (_) {}
-  }
-
-  function loadPlaylistFromCache(screenId) {
-    try {
-      const raw = localStorage.getItem(lkgKey(screenId));
-      if (!raw) return null;
-      return JSON.parse(raw);
-    } catch (_) {
-      return null;
+    let box = document.getElementById("__debug_overlay__");
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "__debug_overlay__";
+      box.style.position = "fixed";
+      box.style.left = "8px";
+      box.style.bottom = "8px";
+      box.style.right = "8px";
+      box.style.maxHeight = "45vh";
+      box.style.overflow = "auto";
+      box.style.background = "rgba(0,0,0,0.75)";
+      box.style.color = "#fff";
+      box.style.fontFamily = "monospace";
+      box.style.fontSize = "12px";
+      box.style.padding = "10px";
+      box.style.borderRadius = "10px";
+      box.style.zIndex = "999999";
+      document.body.appendChild(box);
     }
+
+    const token = getToken();
+    const safeToken =
+      token && token.length > 10 ? token.slice(0, 6) + "…" + token.slice(-4) : token;
+
+    box.textContent =
+      [
+        `DEBUG=1`,
+        `screenId=${state.screenId || "(missing)"}`,
+        `token=${safeToken || "(missing)"}`,
+        `playlistLen=${Array.isArray(state.playlist) ? state.playlist.length : 0}`,
+        `index=${state.index}`,
+        state.lastError ? `lastError=${state.lastError}` : "",
+        `url=${location.href}`,
+      ]
+        .filter(Boolean)
+        .join("\n");
   }
 
   async function fetchPlaylist() {
     const token = getToken();
+
+    // Always include token as query param too (best WebView compatibility)
+    const url =
+      `/api/screens/${encodeURIComponent(state.screenId)}/playlist` +
+      (token ? `?token=${encodeURIComponent(token)}` : "");
+
     const headers = {};
     if (token) {
+      // also try headers
       headers["Authorization"] = `Device ${token}`;
-      headers["X-Device-Token"] = token; // compatibility
+      headers["X-Device-Token"] = token;
     }
-
-    const url = `/api/screens/${encodeURIComponent(state.screenId)}/playlist`;
 
     const res = await fetch(url, {
       method: "GET",
@@ -99,7 +147,9 @@
       try {
         body = await res.text();
       } catch (_) {}
-      const err = new Error(`playlist_http_${res.status}`);
+      const snippet = body ? body.slice(0, 300) : "";
+      const msg = `playlist_http_${res.status} url=${url}\n${snippet}`;
+      const err = new Error(msg);
       err.status = res.status;
       err.body = body;
       throw err;
@@ -114,27 +164,6 @@
     return t.includes("video") || /\.(mp4|webm|mov|m4v|mkv)$/i.test(u);
   }
 
-  function clearTimers() {
-    if (state.itemTimer) {
-      clearTimeout(state.itemTimer);
-      state.itemTimer = null;
-    }
-    if (state.refreshTimer) {
-      clearTimeout(state.refreshTimer);
-      state.refreshTimer = null;
-    }
-    if (state.retryTimer) {
-      clearTimeout(state.retryTimer);
-      state.retryTimer = null;
-    }
-  }
-
-  function scheduleNextItemSoon(ms) {
-    if (state.stopped) return;
-    clearTimeout(state.itemTimer);
-    state.itemTimer = setTimeout(scheduleNextItem, Math.max(500, ms || 1500));
-  }
-
   function showItem(item) {
     clearRoot();
     if (!root) return;
@@ -142,26 +171,8 @@
     const url = String(item?.url || "");
     const name = String(item?.name || "media");
 
-    // Small overlay so you can tell if you're running cached content
-    const badge = document.createElement("div");
-    badge.textContent = state.lastMode === "cached" ? "OFFLINE (cached)" : "";
-    badge.style.position = "fixed";
-    badge.style.top = "10px";
-    badge.style.left = "10px";
-    badge.style.padding = "6px 10px";
-    badge.style.borderRadius = "10px";
-    badge.style.background = "rgba(0,0,0,.45)";
-    badge.style.color = "#fff";
-    badge.style.fontFamily = "system-ui,Segoe UI,Roboto,Arial";
-    badge.style.fontSize = "12px";
-    badge.style.zIndex = "9999";
-    badge.style.pointerEvents = "none";
-
-    if (badge.textContent) root.appendChild(badge);
-
     if (!url) {
-      setText("Invalid media URL");
-      scheduleNextItemSoon(1500);
+      setError("Item missing url");
       return;
     }
 
@@ -172,8 +183,6 @@
       v.loop = false;
       v.playsInline = true;
       v.preload = "auto";
-      v.style.maxWidth = "100%";
-      v.style.maxHeight = "100%";
       v.style.width = "100%";
       v.style.height = "100%";
       v.style.objectFit = "contain";
@@ -187,17 +196,7 @@
         v.muted = true;
       }
 
-      v.onerror = () => {
-        console.error("Video failed to load:", url);
-        setText("Video failed to load");
-        scheduleNextItemSoon(1500);
-      };
-
-      // If it ends before the duration timer, skip forward
-      v.onended = () => {
-        scheduleNextItemSoon(250);
-      };
-
+      v.onerror = () => setError(`Video failed to load\n${url}`);
       root.appendChild(v);
       return;
     }
@@ -205,19 +204,20 @@
     const img = document.createElement("img");
     img.src = url;
     img.alt = name;
-    img.style.maxWidth = "100%";
-    img.style.maxHeight = "100%";
     img.style.width = "100%";
     img.style.height = "100%";
     img.style.objectFit = "contain";
-
-    img.onerror = () => {
-      console.error("Image failed to load:", url);
-      setText("Image failed to load");
-      scheduleNextItemSoon(1500);
-    };
-
+    img.onerror = () => setError(`Image failed to load\n${url}`);
     root.appendChild(img);
+  }
+
+  function clearTimers() {
+    if (state.itemTimer) clearTimeout(state.itemTimer);
+    if (state.refreshTimer) clearTimeout(state.refreshTimer);
+    if (state.retryTimer) clearTimeout(state.retryTimer);
+    state.itemTimer = null;
+    state.refreshTimer = null;
+    state.retryTimer = null;
   }
 
   function scheduleNextItem() {
@@ -225,13 +225,8 @@
 
     const playlist = state.playlist || [];
     if (!playlist.length) {
-      setHtml(`
-        <div style="font-family:system-ui,Segoe UI,Roboto,Arial;color:#fff;text-align:center;padding:24px">
-          <h2>No content assigned</h2>
-          <div style="opacity:.75">Retrying…</div>
-        </div>
-      `);
-      state.itemTimer = setTimeout(() => start(), 10000);
+      setText("No content assigned");
+      state.itemTimer = setTimeout(() => start().catch(() => {}), 8000);
       return;
     }
 
@@ -244,40 +239,26 @@
     state.itemTimer = setTimeout(scheduleNextItem, seconds * 1000);
   }
 
-  function scheduleRetry() {
-    if (state.stopped) return;
-
-    const ms = Math.min(60_000, Math.max(2_000, state.backoffMs));
-    state.backoffMs = Math.min(60_000, Math.round(state.backoffMs * 1.7));
-
-    state.retryTimer = setTimeout(() => start().catch(() => {}), ms);
-  }
-
   async function start() {
     if (state.stopped) return;
 
     clearTimers();
 
     if (!state.screenId) {
-      setText("Missing screen id");
+      setError("Missing screen id");
       return;
     }
 
     setText("Loading…");
+    if (DEBUG) renderDebugOverlay();
 
     try {
       const data = await fetchPlaylist();
       const playlist = Array.isArray(data?.playlist) ? data.playlist : [];
 
-      // Reset backoff on success
-      state.backoffMs = 2000;
-      state.lastMode = "online";
-
-      // Cache last known good payload
-      savePlaylistToCache(state.screenId, data);
-
       state.playlist = playlist;
       state.index = 0;
+      state.lastError = "";
 
       scheduleNextItem();
 
@@ -287,41 +268,13 @@
       }, refreshSec * 1000);
     } catch (e) {
       console.error("Playlist load failed:", e);
-
-      const status = e && typeof e === "object" ? e.status : null;
-
-      // Try cached playlist before giving up
-      const cached = loadPlaylistFromCache(state.screenId);
-      if (cached && Array.isArray(cached?.playlist)) {
-        state.lastMode = "cached";
-        state.playlist = cached.playlist;
-        state.index = 0;
-
-        setHtml(`
-          <div style="font-family:system-ui,Segoe UI,Roboto,Arial;color:#fff;text-align:center;padding:24px">
-            <h2>Offline</h2>
-            <div style="opacity:.75">Playing cached content</div>
-          </div>
-        `);
-
-        // Start cached playback
-        scheduleNextItem();
-
-        // Keep trying to recover online in background
-        scheduleRetry();
-        return;
-      }
-
-      if (status === 401) {
-        setText("Unauthorized (401) — missing/invalid screen token");
-      } else {
-        setText("Failed to load playlist");
-      }
-
-      scheduleRetry();
+      const msg = e?.message ? String(e.message) : "Failed to load playlist";
+      setError(msg);
+      state.retryTimer = setTimeout(() => start().catch(() => {}), 5000);
     }
   }
 
+  // Boot
   state.screenId = getScreenIdFromPath();
   start();
 
