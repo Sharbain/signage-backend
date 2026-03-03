@@ -15,9 +15,17 @@
     refreshTimer: null,
     itemTimer: null,
     retryTimer: null,
+    watchdogTimer: null,
     playlist: [],
     index: 0,
     lastError: "",
+    // Backoff control
+    backoffMs: 5000,
+    // Health
+    lastRenderAt: Date.now(),
+    lastPlaylistOkAt: 0,
+    // Mark when we are playing cached content
+    mode: "online", // online | cached
   };
 
   function qs() {
@@ -29,6 +37,41 @@
   }
 
   const DEBUG = qs().get("debug") === "1";
+
+  // ---- Cache (Last Known Good) ----
+  const CACHE_KEY = () => `lumina_lkg_playlist:${state.screenId || "unknown"}`;
+  const CACHE_META_KEY = () => `lumina_lkg_meta:${state.screenId || "unknown"}`;
+  const CACHE_MAX_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
+
+  function cacheSave(payload) {
+    try {
+      localStorage.setItem(CACHE_KEY(), JSON.stringify(payload));
+      localStorage.setItem(
+        CACHE_META_KEY(),
+        JSON.stringify({ savedAt: Date.now() })
+      );
+    } catch (_) {}
+  }
+
+  function cacheLoad() {
+    try {
+      const raw = localStorage.getItem(CACHE_KEY());
+      if (!raw) return null;
+      const payload = JSON.parse(raw);
+
+      const metaRaw = localStorage.getItem(CACHE_META_KEY());
+      const meta = metaRaw ? JSON.parse(metaRaw) : null;
+      const savedAt = meta?.savedAt ? Number(meta.savedAt) : 0;
+
+      if (savedAt && Date.now() - savedAt > CACHE_MAX_AGE_MS) {
+        // Cache too old; ignore
+        return null;
+      }
+      return payload;
+    } catch (_) {
+      return null;
+    }
+  }
 
   function setText(text) {
     if (!root) return;
@@ -42,6 +85,7 @@
     root.style.padding = "24px";
     root.style.textAlign = "center";
     root.textContent = String(text);
+    state.lastRenderAt = Date.now();
   }
 
   function setError(text) {
@@ -110,11 +154,14 @@
     box.textContent =
       [
         `DEBUG=1`,
+        `mode=${state.mode}`,
         `screenId=${state.screenId || "(missing)"}`,
         `token=${safeToken || "(missing)"}`,
         `playlistLen=${Array.isArray(state.playlist) ? state.playlist.length : 0}`,
         `index=${state.index}`,
+        `backoffMs=${state.backoffMs}`,
         state.lastError ? `lastError=${state.lastError}` : "",
+        `lastRenderAgoMs=${Date.now() - state.lastRenderAt}`,
         `url=${location.href}`,
       ]
         .filter(Boolean)
@@ -164,15 +211,54 @@
     return t.includes("video") || /\.(mp4|webm|mov|m4v|mkv)$/i.test(u);
   }
 
+  function scheduleNextSoon(ms) {
+    if (state.stopped) return;
+    if (state.itemTimer) clearTimeout(state.itemTimer);
+    state.itemTimer = setTimeout(scheduleNextItem, Math.max(250, ms || 1500));
+  }
+
+  function showModeBadge() {
+    if (!root) return;
+
+    // only show when cached to avoid UI clutter
+    if (state.mode !== "cached") return;
+
+    const badge = document.createElement("div");
+    badge.textContent = "OFFLINE (cached)";
+    badge.style.position = "fixed";
+    badge.style.top = "10px";
+    badge.style.left = "10px";
+    badge.style.padding = "6px 10px";
+    badge.style.borderRadius = "10px";
+    badge.style.background = "rgba(0,0,0,.45)";
+    badge.style.color = "#fff";
+    badge.style.fontFamily = "system-ui, Segoe UI, Roboto, Arial";
+    badge.style.fontSize = "12px";
+    badge.style.zIndex = "999999";
+    badge.style.pointerEvents = "none";
+    document.body.appendChild(badge);
+
+    // auto-remove after 3s
+    setTimeout(() => {
+      try { badge.remove(); } catch (_) {}
+    }, 3000);
+  }
+
   function showItem(item) {
     clearRoot();
     if (!root) return;
+
+    state.lastRenderAt = Date.now();
+    if (DEBUG) renderDebugOverlay();
+
+    showModeBadge();
 
     const url = String(item?.url || "");
     const name = String(item?.name || "media");
 
     if (!url) {
       setError("Item missing url");
+      scheduleNextSoon(1500);
       return;
     }
 
@@ -196,7 +282,15 @@
         v.muted = true;
       }
 
-      v.onerror = () => setError(`Video failed to load\n${url}`);
+      // If video fails, don't get stuck
+      v.onerror = () => {
+        setError(`Video failed to load\n${url}`);
+        scheduleNextSoon(1500);
+      };
+
+      // If it ends early, advance immediately
+      v.onended = () => scheduleNextSoon(250);
+
       root.appendChild(v);
       return;
     }
@@ -207,7 +301,13 @@
     img.style.width = "100%";
     img.style.height = "100%";
     img.style.objectFit = "contain";
-    img.onerror = () => setError(`Image failed to load\n${url}`);
+
+    // If image fails, don't get stuck
+    img.onerror = () => {
+      setError(`Image failed to load\n${url}`);
+      scheduleNextSoon(1500);
+    };
+
     root.appendChild(img);
   }
 
@@ -215,9 +315,11 @@
     if (state.itemTimer) clearTimeout(state.itemTimer);
     if (state.refreshTimer) clearTimeout(state.refreshTimer);
     if (state.retryTimer) clearTimeout(state.retryTimer);
+    if (state.watchdogTimer) clearInterval(state.watchdogTimer);
     state.itemTimer = null;
     state.refreshTimer = null;
     state.retryTimer = null;
+    state.watchdogTimer = null;
   }
 
   function scheduleNextItem() {
@@ -226,6 +328,7 @@
     const playlist = state.playlist || [];
     if (!playlist.length) {
       setText("No content assigned");
+      // Try to recover regularly
       state.itemTimer = setTimeout(() => start().catch(() => {}), 8000);
       return;
     }
@@ -239,10 +342,34 @@
     state.itemTimer = setTimeout(scheduleNextItem, seconds * 1000);
   }
 
+  function resetBackoff() {
+    state.backoffMs = 5000;
+  }
+
+  function bumpBackoff() {
+    // exponential with cap
+    state.backoffMs = Math.min(60_000, Math.round(state.backoffMs * 1.7));
+  }
+
+  function startWatchdog() {
+    if (state.watchdogTimer) return;
+
+    // If we haven't rendered anything in a while, restart the loop
+    state.watchdogTimer = setInterval(() => {
+      if (state.stopped) return;
+      const idleMs = Date.now() - state.lastRenderAt;
+      if (idleMs > 90_000) {
+        console.error("Watchdog: no render for too long, restarting...");
+        start().catch(() => {});
+      }
+    }, 10_000);
+  }
+
   async function start() {
     if (state.stopped) return;
 
     clearTimers();
+    startWatchdog();
 
     if (!state.screenId) {
       setError("Missing screen id");
@@ -259,6 +386,12 @@
       state.playlist = playlist;
       state.index = 0;
       state.lastError = "";
+      state.mode = "online";
+      state.lastPlaylistOkAt = Date.now();
+
+      // Save LKG cache on success
+      cacheSave(data);
+      resetBackoff();
 
       scheduleNextItem();
 
@@ -268,9 +401,23 @@
       }, refreshSec * 1000);
     } catch (e) {
       console.error("Playlist load failed:", e);
-      const msg = e?.message ? String(e.message) : "Failed to load playlist";
-      setError(msg);
-      state.retryTimer = setTimeout(() => start().catch(() => {}), 5000);
+
+      // Try cache fallback
+      const cached = cacheLoad();
+      if (cached && Array.isArray(cached?.playlist) && cached.playlist.length) {
+        state.mode = "cached";
+        state.playlist = cached.playlist;
+        state.index = 0;
+
+        // Show cached playback immediately
+        scheduleNextItem();
+      } else {
+        const msg = e?.message ? String(e.message) : "Failed to load playlist";
+        setError(msg);
+      }
+
+      bumpBackoff();
+      state.retryTimer = setTimeout(() => start().catch(() => {}), state.backoffMs);
     }
   }
 
