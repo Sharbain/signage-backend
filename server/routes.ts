@@ -1594,6 +1594,76 @@ const existingUser = await storage.getUserByEmail(email);
   });
 
 
+
+
+  // =====================================================
+  // DEVICE HEARTBEAT (SaaS-grade)
+  // =====================================================
+  // Device-auth via device key (same flexible token rules as playlist).
+  // Updates screen online status + stores a status log snapshot.
+  app.post("/api/devices/:deviceId/heartbeat", async (req, res) => {
+    try {
+      const deviceId = String(req.params.deviceId || "").trim();
+      if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
+
+      // 🔐 Validate device token (flexible token sources, supports legacy + SaaS v2)
+      const verified = await verifyDeviceTokenOrFail(req, res, deviceId);
+      if (!verified) return;
+
+      const { screen } = verified;
+
+      const body: any = (req.body && typeof req.body === "object") ? req.body : {};
+
+      // Best-effort IP extraction (behind proxies/CDN)
+      const ip =
+        (String(req.headers["x-forwarded-for"] || "").split(",")[0]?.trim() ||
+          (req.socket as any)?.remoteAddress ||
+          null);
+
+      const appVersion =
+        (body.appVersion ?? body.app_version ?? body?.app?.version ?? null) as string | null;
+
+      const currentUrl =
+        (body.currentUrl ?? body.current_url ?? body?.playback?.currentUrl ?? null) as string | null;
+
+      const freeStorageMb =
+        body?.storage?.freeMb ?? body?.storage?.free_storage_mb ?? body?.freeStorage ?? body?.free_storage ?? null;
+
+      const lastError =
+        body?.playback?.lastError ?? body?.lastError ?? body?.last_error ?? null;
+
+      const errors: string[] = [];
+      if (Array.isArray(body?.errors)) errors.push(...body.errors.map((x: any) => String(x)));
+      if (lastError) errors.push(String(lastError));
+
+      // ✅ Mark online + lastSeen (use storage layer for compatibility with your schema)
+      await storage.updateScreen(screen.id, {
+        lastSeen: new Date(),
+        status: "online",
+      });
+
+      // ✅ Store a status log snapshot (uses your existing device_status_logs pipeline)
+      // saveDeviceStatus() already exists and matches your DB schema expectations.
+      await saveDeviceStatus({
+        device_id: deviceId,
+        deviceId,
+        isOnline: true,
+        ip,
+        appVersion,
+        currentUrl,
+        freeStorage: (freeStorageMb === null || freeStorageMb === undefined) ? null : Number(freeStorageMb),
+        errors: errors.length ? errors : null,
+        timestamp: Date.now(),
+        payload: body,
+      } as any);
+
+      return res.json({ ok: true, serverTime: new Date().toISOString() });
+    } catch (err) {
+      console.error("heartbeat error:", err);
+      return res.status(500).json({ error: "heartbeat_failed" });
+    }
+  });
+
   // Device API endpoints (for Android/player clients)
   app.post("/api/device/register", async (req, res) => {
     try {
