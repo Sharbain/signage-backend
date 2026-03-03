@@ -54,7 +54,10 @@
     const token = getToken();
 
     const headers = {};
-    if (token) headers["Authorization"] = `Bearer ${token}`;
+if (token) {
+  headers["Authorization"] = `Device ${token}`;
+  headers["X-Device-Token"] = token; // extra compatibility
+}
 
     // Uses backend route:
     // GET /api/screens/:deviceId/playlist
@@ -231,3 +234,4 @@
     setText("Stopped");
   };
 })();
+
