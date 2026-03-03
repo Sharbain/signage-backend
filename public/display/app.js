@@ -26,6 +26,12 @@
     lastPlaylistOkAt: 0,
     // Mark when we are playing cached content
     mode: "online", // online | cached
+
+    // Preload
+    preloaded: null, // { type, url, el }
+    preloadUrl: "",
+    // Transition
+    inTransition: false,
   };
 
   function qs() {
@@ -46,10 +52,7 @@
   function cacheSave(payload) {
     try {
       localStorage.setItem(CACHE_KEY(), JSON.stringify(payload));
-      localStorage.setItem(
-        CACHE_META_KEY(),
-        JSON.stringify({ savedAt: Date.now() })
-      );
+      localStorage.setItem(CACHE_META_KEY(), JSON.stringify({ savedAt: Date.now() }));
     } catch (_) {}
   }
 
@@ -63,10 +66,7 @@
       const meta = metaRaw ? JSON.parse(metaRaw) : null;
       const savedAt = meta?.savedAt ? Number(meta.savedAt) : 0;
 
-      if (savedAt && Date.now() - savedAt > CACHE_MAX_AGE_MS) {
-        // Cache too old; ignore
-        return null;
-      }
+      if (savedAt && Date.now() - savedAt > CACHE_MAX_AGE_MS) return null;
       return payload;
     } catch (_) {
       return null;
@@ -101,18 +101,15 @@
   }
 
   function getScreenIdFromPath() {
-    // supports /display/DEV-xxx or /display/DEV-xxx/
     const parts = (location.pathname || "").split("/").filter(Boolean);
     const last = parts[parts.length - 1] || "";
     return decodeURIComponent(last);
   }
 
   function getToken() {
-    // 1) URL query is best: /display/DEV-123?token=xxxx
     const qToken = qs().get("token");
     if (qToken && qToken.trim()) return qToken.trim();
 
-    // 2) localStorage fallback (support multiple keys)
     const keys = ["screenToken", "deviceToken", "device_token", "accessToken"];
     for (const k of keys) {
       try {
@@ -120,7 +117,6 @@
         if (v && v.trim()) return v.trim();
       } catch (_) {}
     }
-
     return "";
   }
 
@@ -160,6 +156,7 @@
         `playlistLen=${Array.isArray(state.playlist) ? state.playlist.length : 0}`,
         `index=${state.index}`,
         `backoffMs=${state.backoffMs}`,
+        `preloadUrl=${state.preloadUrl || ""}`,
         state.lastError ? `lastError=${state.lastError}` : "",
         `lastRenderAgoMs=${Date.now() - state.lastRenderAt}`,
         `url=${location.href}`,
@@ -170,24 +167,17 @@
 
   async function fetchPlaylist() {
     const token = getToken();
-
-    // Always include token as query param too (best WebView compatibility)
     const url =
       `/api/screens/${encodeURIComponent(state.screenId)}/playlist` +
       (token ? `?token=${encodeURIComponent(token)}` : "");
 
     const headers = {};
     if (token) {
-      // also try headers
       headers["Authorization"] = `Device ${token}`;
       headers["X-Device-Token"] = token;
     }
 
-    const res = await fetch(url, {
-      method: "GET",
-      headers,
-      cache: "no-store",
-    });
+    const res = await fetch(url, { method: "GET", headers, cache: "no-store" });
 
     if (!res.ok) {
       let body = "";
@@ -219,8 +209,6 @@
 
   function showModeBadge() {
     if (!root) return;
-
-    // only show when cached to avoid UI clutter
     if (state.mode !== "cached") return;
 
     const badge = document.createElement("div");
@@ -237,15 +225,134 @@
     badge.style.zIndex = "999999";
     badge.style.pointerEvents = "none";
     document.body.appendChild(badge);
-
-    // auto-remove after 3s
     setTimeout(() => {
-      try { badge.remove(); } catch (_) {}
+      try {
+        badge.remove();
+      } catch (_) {}
     }, 3000);
   }
 
+  function styleMedia(el) {
+    el.style.width = "100%";
+    el.style.height = "100%";
+    el.style.objectFit = "contain";
+    el.style.display = "block";
+    // fade
+    el.style.opacity = "0";
+    el.style.transition = "opacity 250ms linear";
+    return el;
+  }
+
+  function fadeIn(el) {
+    requestAnimationFrame(() => {
+      try {
+        el.style.opacity = "1";
+      } catch (_) {}
+    });
+  }
+
+  function fadeSwap(newEl) {
+    if (!root) return;
+    state.inTransition = true;
+
+    const old = root.firstElementChild;
+
+    // Add new element hidden
+    root.appendChild(newEl);
+
+    // Fade in new
+    fadeIn(newEl);
+
+    // Fade out old, then remove
+    if (old && old !== newEl) {
+      try {
+        old.style.transition = "opacity 250ms linear";
+        old.style.opacity = "0";
+      } catch (_) {}
+      setTimeout(() => {
+        try {
+          if (old && old.parentNode === root) old.remove();
+        } catch (_) {}
+        state.inTransition = false;
+      }, 280);
+    } else {
+      state.inTransition = false;
+    }
+  }
+
+  function nextIndexPreview() {
+    const playlist = state.playlist || [];
+    if (!playlist.length) return null;
+    const nextIdx = state.index % playlist.length;
+    return { idx: nextIdx, item: playlist[nextIdx] };
+  }
+
+  function startPreloadForNext() {
+    const preview = nextIndexPreview();
+    if (!preview) return;
+
+    const item = preview.item;
+    const url = String(item?.url || "");
+    if (!url) return;
+
+    // Avoid re-preloading the same URL
+    if (state.preloadUrl === url && state.preloaded) return;
+
+    // Reset
+    state.preloaded = null;
+    state.preloadUrl = url;
+
+    const isVid = isVideo(item);
+
+    if (isVid) {
+      // Video preload: create element and set preload=auto, but don't autoplay
+      const v = document.createElement("video");
+      v.src = url;
+      v.preload = "auto";
+      v.playsInline = true;
+      v.muted = true; // safe for autoplay policies even though we won't autoplay
+      styleMedia(v);
+
+      const onReady = () => {
+        cleanup();
+        state.preloaded = { type: "video", url, el: v };
+        if (DEBUG) renderDebugOverlay();
+      };
+      const onErr = () => {
+        cleanup();
+        // Don't block playback; we just won't have a preload
+        state.preloaded = null;
+      };
+      const cleanup = () => {
+        v.removeEventListener("canplaythrough", onReady);
+        v.removeEventListener("loadeddata", onReady);
+        v.removeEventListener("error", onErr);
+      };
+
+      v.addEventListener("canplaythrough", onReady, { once: true });
+      v.addEventListener("loadeddata", onReady, { once: true });
+      v.addEventListener("error", onErr, { once: true });
+
+      // Touch it so browser begins loading
+      try { v.load(); } catch (_) {}
+      return;
+    }
+
+    // Image preload
+    const img = new Image();
+    img.decoding = "async";
+    img.loading = "eager";
+    img.onload = () => {
+      state.preloaded = { type: "image", url, el: img };
+      if (DEBUG) renderDebugOverlay();
+    };
+    img.onerror = () => {
+      state.preloaded = null;
+    };
+    img.src = url;
+  }
+
   function showItem(item) {
-    clearRoot();
     if (!root) return;
 
     state.lastRenderAt = Date.now();
@@ -254,14 +361,65 @@
     showModeBadge();
 
     const url = String(item?.url || "");
-    const name = String(item?.name || "media");
-
     if (!url) {
       setError("Item missing url");
       scheduleNextSoon(1500);
       return;
     }
 
+    // If we preloaded this exact URL, use it
+    if (state.preloaded && state.preloaded.url === url && state.preloaded.el) {
+      const p = state.preloaded;
+      state.preloaded = null;
+      state.preloadUrl = "";
+
+      if (p.type === "image") {
+        // convert preloaded Image() to DOM img
+        const domImg = document.createElement("img");
+        domImg.src = url;
+        domImg.alt = String(item?.name || "media");
+        styleMedia(domImg);
+        domImg.onerror = () => {
+          setError(`Image failed to load\n${url}`);
+          scheduleNextSoon(1500);
+        };
+
+        // swap with fade
+        clearRoot();
+        fadeSwap(domImg);
+      } else {
+        const v = p.el;
+        // Ensure playback settings
+        v.autoplay = true;
+        v.loop = false;
+        v.playsInline = true;
+
+        const vol = Number(item?.volume);
+        if (!Number.isNaN(vol)) {
+          const clamped = Math.max(0, Math.min(100, vol));
+          v.muted = clamped === 0;
+          v.volume = clamped / 100;
+        } else {
+          v.muted = true;
+        }
+
+        v.onerror = () => {
+          setError(`Video failed to load\n${url}`);
+          scheduleNextSoon(1500);
+        };
+        v.onended = () => scheduleNextSoon(250);
+
+        clearRoot();
+        fadeSwap(v);
+        return;
+      }
+
+      // Start preloading the next item now
+      startPreloadForNext();
+      return;
+    }
+
+    // Fallback: normal render (still with fade + skip-on-error)
     if (isVideo(item)) {
       const v = document.createElement("video");
       v.src = url;
@@ -269,9 +427,7 @@
       v.loop = false;
       v.playsInline = true;
       v.preload = "auto";
-      v.style.width = "100%";
-      v.style.height = "100%";
-      v.style.objectFit = "contain";
+      styleMedia(v);
 
       const vol = Number(item?.volume);
       if (!Number.isNaN(vol)) {
@@ -282,33 +438,33 @@
         v.muted = true;
       }
 
-      // If video fails, don't get stuck
       v.onerror = () => {
         setError(`Video failed to load\n${url}`);
         scheduleNextSoon(1500);
       };
-
-      // If it ends early, advance immediately
       v.onended = () => scheduleNextSoon(250);
 
-      root.appendChild(v);
+      clearRoot();
+      fadeSwap(v);
+      startPreloadForNext();
       return;
     }
 
     const img = document.createElement("img");
     img.src = url;
-    img.alt = name;
-    img.style.width = "100%";
-    img.style.height = "100%";
-    img.style.objectFit = "contain";
-
-    // If image fails, don't get stuck
+    img.alt = String(item?.name || "media");
+    styleMedia(img);
     img.onerror = () => {
       setError(`Image failed to load\n${url}`);
       scheduleNextSoon(1500);
     };
+    img.onload = () => {
+      // fade in happens on swap
+    };
 
-    root.appendChild(img);
+    clearRoot();
+    fadeSwap(img);
+    startPreloadForNext();
   }
 
   function clearTimers() {
@@ -328,7 +484,6 @@
     const playlist = state.playlist || [];
     if (!playlist.length) {
       setText("No content assigned");
-      // Try to recover regularly
       state.itemTimer = setTimeout(() => start().catch(() => {}), 8000);
       return;
     }
@@ -347,14 +502,12 @@
   }
 
   function bumpBackoff() {
-    // exponential with cap
     state.backoffMs = Math.min(60_000, Math.round(state.backoffMs * 1.7));
   }
 
   function startWatchdog() {
     if (state.watchdogTimer) return;
 
-    // If we haven't rendered anything in a while, restart the loop
     state.watchdogTimer = setInterval(() => {
       if (state.stopped) return;
       const idleMs = Date.now() - state.lastRenderAt;
@@ -389,27 +542,26 @@
       state.mode = "online";
       state.lastPlaylistOkAt = Date.now();
 
-      // Save LKG cache on success
       cacheSave(data);
       resetBackoff();
+
+      // Prime preload before first render
+      startPreloadForNext();
 
       scheduleNextItem();
 
       const refreshSec = Math.max(30, Number(data?.refreshInterval || 300));
-      state.refreshTimer = setTimeout(() => {
-        start().catch(() => {});
-      }, refreshSec * 1000);
+      state.refreshTimer = setTimeout(() => start().catch(() => {}), refreshSec * 1000);
     } catch (e) {
       console.error("Playlist load failed:", e);
 
-      // Try cache fallback
       const cached = cacheLoad();
       if (cached && Array.isArray(cached?.playlist) && cached.playlist.length) {
         state.mode = "cached";
         state.playlist = cached.playlist;
         state.index = 0;
 
-        // Show cached playback immediately
+        startPreloadForNext();
         scheduleNextItem();
       } else {
         const msg = e?.message ? String(e.message) : "Failed to load playlist";
