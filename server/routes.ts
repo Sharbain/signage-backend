@@ -859,64 +859,10 @@ app.get("/api/devices/:id/details", async (req, res) => {
     }
   });
 
-  // =====================================================
-  // DASHBOARD LIVE CONTENT
-  // =====================================================
-  app.get("/api/dashboard/live-content", async (_req, res) => {
-    try {
-      const now = new Date();
-      const dayOfWeek = now.getDay();
-      const currentTime = now.toTimeString().slice(0, 8);
-
-      const result = await pool.query(`
-        SELECT 
-          cs.id,
-          cs.content_type,
-          cs.content_id,
-          CASE 
-            WHEN cs.content_type = 'media' THEN m.name
-            WHEN cs.content_type = 'playlist' THEN cp.name
-            WHEN cs.content_type = 'template' THEN t.name
-            ELSE 'Unknown'
-          END as content_name,
-          CASE 
-            WHEN cs.content_type = 'media' THEN m.type
-            ELSE cs.content_type
-          END as type,
-          COUNT(DISTINCT COALESCE(cs.device_id, dgm.device_id)) as device_count
-        FROM content_schedules cs
-        LEFT JOIN media m ON cs.content_type = 'media' AND cs.content_id::text = m.id::text
-        LEFT JOIN content_playlists cp ON cs.content_type = 'playlist' AND cs.content_id::text = cp.id::text
-        LEFT JOIN templates t ON cs.content_type = 'template' AND cs.content_id::text = t.id::text
-        LEFT JOIN device_group_members dgm ON cs.group_id = dgm.group_id
-        WHERE cs.is_active = true
-          AND (cs.start_date IS NULL OR cs.start_date <= CURRENT_DATE)
-          AND (cs.end_date IS NULL OR cs.end_date >= CURRENT_DATE)
-          AND (
-            cs.days_of_week IS NULL 
-            OR cs.days_of_week = '{}' 
-            OR $1 = ANY(cs.days_of_week)
-          )
-          AND (cs.start_time IS NULL OR cs.start_time <= $2::time)
-          AND (cs.end_time IS NULL OR cs.end_time >= $2::time)
-        GROUP BY cs.id, cs.content_type, cs.content_id, m.name, m.type, cp.name, t.name
-        ORDER BY device_count DESC
-        LIMIT 10
-      `, [dayOfWeek, currentTime]);
-
-      const content = result.rows.map(row => ({
-        id: row.id,
-        name: row.content_name || 'Unnamed Content',
-        type: row.type || 'unknown',
-        deviceCount: parseInt(row.device_count) || 1
-      }));
-
-      res.json({ content });
-    } catch (err) {
-      console.error("Live content error:", err);
-      res.status(500).json({ error: "failed_to_load_live_content", content: [] });
-    }
-  });
+  // Live Content (dashboard) - disabled
+app.get("/api/dashboard/live-content", authenticateJWT, async (_req, res) => {
+  return res.json({ content: [], disabled: true });
+});
 
   // =====================================================
   // ACTIVE COMMANDS STATUS (for progress tracking)
