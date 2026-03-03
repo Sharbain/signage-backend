@@ -585,7 +585,7 @@ app.get("/api/devices/:id/details", async (req, res) => {
       FROM screens s
       LEFT JOIN templates t
         ON t.id::text = s.assigned_template_id::text
-      WHERE ${isUuid ? "s.id = $1::uuid" : "s.device_id = $1"}
+      WHERE (s.id::text = $1 OR s.device_id = $1)
       LIMIT 1
     `;
 
