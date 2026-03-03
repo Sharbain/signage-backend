@@ -556,7 +556,6 @@ app.get("/api/devices/:id/details", async (req, res) => {
     const rawId = String(req.params.id || "").trim();
     if (!rawId) return res.status(400).json({ error: "missing_id" });
 
-      );
 
     const query = `
       SELECT
