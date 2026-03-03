@@ -630,48 +630,7 @@ app.get("/api/devices/:id/details", async (req, res) => {
   // =====================================================
 // DEVICE SETTINGS (brightness/volume)
 // =====================================================
-app.post("/api/devices/:id/settings", async (req, res) => {
-  const rawId = String(req.params.id || "").trim();
-  const { brightness, volume } = req.body;
 
-  try {
-    if (!rawId) return res.status(400).json({ error: "missing_id" });
-
-    const isUuid =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-        rawId
-      );
-
-    const updates: string[] = [];
-    const values: any[] = [];
-    let paramIndex = 1;
-
-    if (brightness !== undefined) {
-      updates.push(`brightness = $${paramIndex++}`);
-      values.push(brightness);
-    }
-    if (volume !== undefined) {
-      updates.push(`volume = $${paramIndex++}`);
-      values.push(volume);
-    }
-
-    if (!updates.length) return res.status(400).json({ error: "No settings to update" });
-
-    values.push(rawId);
-
-    await pool.query(
-      `UPDATE screens
-       SET ${updates.join(", ")}
-       WHERE ${isUuid ? `id = $${paramIndex}::uuid` : `device_id = $${paramIndex}`}`,
-      values
-    );
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("Update settings error:", err);
-    res.status(500).json({ error: "Failed to update settings" });
-  }
-});
 
   // =====================================================
   // DEVICE DATA USAGE
