@@ -1479,23 +1479,95 @@ const existingUser = await storage.getUserByEmail(email);
   });
 
   // Get playlist content for a device by deviceId
-  app.get("/api/screens/:deviceId/playlist", authenticateDevice, async (req, res) => {
+  // NOTE: This is called by /display/app.js in a WebView (and sometimes a normal browser).
+  // We therefore support multiple token styles:
+  // - ?token=<deviceKey/deviceToken>
+  // - Authorization: Device <token>
+  // - Authorization: DeviceToken <token>   (legacy)
+  // - Authorization: Bearer <token>        (legacy)
+  // - X-Device-Token: <token>
+  //
+  // Token validation supports:
+  // - screens.device_key / deviceKey (plaintext, SaaS v2)
+  // - screens.password (bcrypt hash, legacy)
+  const extractDeviceToken = (req: Request): string | null => {
+    // 1) query param
+    const q = (req.query?.token as string | undefined)?.trim();
+    if (q) return q;
+
+    // 2) X-Device-Token
+    const xdt = (req.headers["x-device-token"] as string | undefined)?.trim();
+    if (xdt) return xdt;
+
+    // 3) Authorization header
+    const auth = (req.headers.authorization as string | undefined)?.trim();
+    if (!auth) return null;
+
+    const lower = auth.toLowerCase();
+    if (lower.startsWith("device ")) return auth.slice("device ".length).trim();
+    if (lower.startsWith("devicetoken ")) return auth.slice("devicetoken ".length).trim();
+    if (lower.startsWith("bearer ")) return auth.slice("bearer ".length).trim();
+
+    return null;
+  };
+
+  const verifyDeviceTokenOrFail = async (
+    req: Request,
+    res: Response,
+    deviceId: string,
+  ): Promise<{ screen: any; token: string } | null> => {
+    const token = extractDeviceToken(req);
+    if (!token) {
+      res.status(401).json({ error: "missing_device_token" });
+      return null;
+    }
+
+    const screen = await storage.getScreenByDeviceId(deviceId);
+    if (!screen) {
+      res.status(404).json({ error: "device_not_found" });
+      return null;
+    }
+
+    // SaaS v2: deviceKey stored plaintext (common names we’ve used across branches)
+    const deviceKey =
+      (screen as any).deviceKey ??
+      (screen as any).device_key ??
+      (screen as any).deviceKeyHash ??
+      null;
+
+    if (typeof deviceKey === "string" && deviceKey.trim() && deviceKey.trim() === token) {
+      return { screen, token };
+    }
+
+    // Legacy: password stores bcrypt hash of a minted device token
+    const passwordHash = (screen as any).password as string | null | undefined;
+    if (passwordHash && typeof passwordHash === "string") {
+      const ok = await bcrypt.compare(token, passwordHash);
+      if (ok) return { screen, token };
+    }
+
+    res.status(403).json({ error: "invalid_device_token" });
+    return null;
+  };
+
+  app.get("/api/screens/:deviceId/playlist", async (req, res) => {
     try {
       const { deviceId } = req.params;
 
-      // Find screen by deviceId
-      const screen = await storage.getScreenByDeviceId(deviceId);
-      if (!screen) {
-        return res.status(404).json({ error: "Device not found" });
-      }
+      // 🔐 Validate device token (flexible token sources, supports legacy + SaaS v2)
+      const verified = await verifyDeviceTokenOrFail(req, res, deviceId);
+      if (!verified) return;
 
-      // Update last seen timestamp
+      const { screen } = verified;
+
+      // ✅ Treat playlist fetch as heartbeat (online)
       await storage.updateScreen(screen.id, {
         lastSeen: new Date(),
         status: "online",
       });
 
-      // Get all media as playlist content (can be enhanced with actual playlist assignments later)
+      // TODO (A1+): Replace this “all media” fallback with assigned playlist(s)
+      // based on playlist_assignments / content_playlists etc.
       const allMedia = await storage.getAllMedia();
       const playlist = allMedia.map((item) => ({
         id: item.id,
@@ -1505,7 +1577,7 @@ const existingUser = await storage.getUserByEmail(email);
         duration: item.duration || 10,
       }));
 
-      res.json({
+      return res.json({
         screen: {
           id: screen.id,
           deviceId: screen.deviceId,
@@ -1516,9 +1588,11 @@ const existingUser = await storage.getUserByEmail(email);
         refreshInterval: 300, // seconds until next playlist check
       });
     } catch (error) {
-      res.status(500).json({ error: "Failed to fetch playlist" });
+      console.error("playlist fetch error:", error);
+      return res.status(500).json({ error: "Failed to fetch playlist" });
     }
   });
+
 
   // Device API endpoints (for Android/player clients)
   app.post("/api/device/register", async (req, res) => {
