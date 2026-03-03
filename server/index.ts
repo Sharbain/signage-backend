@@ -33,9 +33,63 @@ app.use((req, res, next) => {
 });
 
 /* --------------------------------------------------
-   SECURITY BASELINE
+   SECURITY BASELINE (Helmet + CSP tuned for Supabase media)
 -------------------------------------------------- */
-app.use(helmet());
+
+// Build an allowlist of external media origins (for img/video) from env
+// - SUPABASE_URL example: https://rjivpixvpsxwftrrlefc.supabase.co
+// - MEDIA_ORIGINS example: https://cdn.yourdomain.com,https://*.supabase.co (wildcards may not work everywhere)
+function normalizeOrigin(raw: string): string | null {
+  const v = String(raw || "").trim();
+  if (!v) return null;
+  // allow special CSP keywords that include quotes, but we won't pass those via env in this app
+  // ensure no trailing slash
+  return v.replace(/\/$/, "");
+}
+
+const mediaOrigins = new Set<string>();
+
+const supabaseUrl = normalizeOrigin(process.env.SUPABASE_URL || "");
+if (supabaseUrl) mediaOrigins.add(supabaseUrl);
+
+// Optional: comma-separated additional media origins
+const extraMedia = (process.env.MEDIA_ORIGINS || "")
+  .split(",")
+  .map((s) => normalizeOrigin(s))
+  .filter((s): s is string => !!s);
+
+for (const o of extraMedia) mediaOrigins.add(o);
+
+// If you didn't set SUPABASE_URL, but you're using Supabase storage,
+// you can also set MEDIA_ORIGINS to include your Supabase project origin.
+// Keeping it empty is allowed; then only 'self' works.
+
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      useDefaults: true,
+      directives: {
+        // Start from Helmet defaults
+        ...helmet.contentSecurityPolicy.getDefaultDirectives(),
+
+        // Signage player needs to load images/videos from Supabase (or CDN)
+        // Keep self + data, add blob for media playback/caching
+        "img-src": ["'self'", "data:", "blob:", ...Array.from(mediaOrigins)],
+        "media-src": ["'self'", "blob:", ...Array.from(mediaOrigins)],
+
+        // Display/app.js is served from same origin; connect-src should allow API calls
+        // Keep 'self' and allow your Supabase origin if you later fetch signed URLs etc.
+        "connect-src": ["'self'", ...Array.from(mediaOrigins)],
+
+        // If you ever embed frames (usually no): keep locked down by default
+        // "frame-src": ["'none'"],
+
+        // Note: We are NOT loosening script-src beyond defaults here.
+        // Your display page loads /display/app.js from self, which is fine.
+      },
+    },
+  }),
+);
 
 /* --------------------------------------------------
    CORS (PRODUCTION-SAFE + VERCEL AUTO SUPPORT)
@@ -239,8 +293,8 @@ app.use((req, res, next) => {
 
   const port = parseInt(process.env.PORT || "5000", 10);
 
-// Cloud-safe: bind to all interfaces
-httpServer.listen(port, "0.0.0.0", () => {
-  log(`API listening on port ${port}`);
-});
+  // Cloud-safe: bind to all interfaces
+  httpServer.listen(port, "0.0.0.0", () => {
+    log(`API listening on port ${port}`);
+  });
 })();
