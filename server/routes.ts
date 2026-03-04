@@ -1042,44 +1042,54 @@ app.get("/api/device/:deviceId/commands", async (req, res) => {
 });
 
 // =====================================================
-// DEVICE ACKNOWLEDGES COMMAND EXECUTION (DEVICE AUTH)
+// DEVICE FETCHES ITS PENDING COMMANDS (DEVICE AUTH)
+// - device_commands.device_id is TEXT like "DEV-XXXX"
+// - device_commands.id is INTEGER
 // =====================================================
-app.post("/api/device/:deviceId/commands/:commandId/ack", authenticateDevice, async (req, res) => {
-  const { deviceId, commandId } = req.params;
+app.get("/api/device/:deviceId/commands", async (req, res) => {
+  const deviceId = String(req.params.deviceId || "").trim();
+  if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
 
   try {
-    // ✅ heartbeat on ack too
-    await pool.query(
+    // 1) Fetch pending (unsent) commands for this deviceId (TEXT)
+    const result = await pool.query(
       `
-      UPDATE screens
-      SET last_seen = NOW(),
-          is_online = TRUE,
-          status = 'online',
-          last_offline = NULL
+      SELECT id, payload
+      FROM device_commands
       WHERE device_id = $1
+        AND sent = false
+      ORDER BY created_at ASC
+      LIMIT 50
       `,
       [deviceId],
     );
 
-    const result = await pool.query(
-      `
-      UPDATE device_commands
-      SET executed = true, executed_at = NOW()
-      WHERE id = $1 AND device_id = $2
-      RETURNING id
-      `,
-      [commandId, deviceId],
-    );
-
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: "Command not found" });
+    // 2) Mark as sent (id is INTEGER)
+    if (result.rows.length > 0) {
+      const ids = result.rows.map((r: any) => Number(r.id)).filter((n: any) => Number.isFinite(n));
+      if (ids.length > 0) {
+        await pool.query(
+          `
+          UPDATE device_commands
+          SET sent = true
+          WHERE id = ANY($1::int[])
+          `,
+          [ids],
+        );
+      }
     }
 
-    console.log(`Command ${commandId} acknowledged by device ${deviceId}`);
-    return res.json({ success: true, commandId });
+    // 3) Return normalized payloads to device
+    return res.json(
+      result.rows.map((r: any) => {
+        const payload =
+          typeof r.payload === "string" ? JSON.parse(r.payload) : (r.payload ?? {});
+        return { id: r.id, ...payload };
+      }),
+    );
   } catch (err) {
-    console.error("Error acknowledging command:", err);
-    return res.status(500).json({ error: "Failed to acknowledge command" });
+    console.error("Error fetching commands:", err);
+    return res.status(500).json({ error: "commands_fetch_failed" });
   }
 });
 
