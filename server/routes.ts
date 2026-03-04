@@ -1712,29 +1712,8 @@ app.post("/api/devices/:deviceId/heartbeat", handleDeviceHeartbeat);
 // ✅ Legacy alias (older clients)
 app.post("/api/device/:deviceId/heartbeat", handleDeviceHeartbeat);
 
-      // ✅ Store a status log snapshot (uses your existing device_status_logs pipeline)
-      // saveDeviceStatus() already exists and matches your DB schema expectations.
-      await saveDeviceStatus({
-        device_id: deviceId,
-        deviceId,
-        isOnline: true,
-        ip,
-        appVersion,
-        currentUrl,
-        freeStorage: (freeStorageMb === null || freeStorageMb === undefined) ? null : Number(freeStorageMb),
-        errors: errors.length ? errors : null,
-        timestamp: Date.now(),
-        payload: body,
-      } as any);
 
-      return res.json({ ok: true, serverTime: new Date().toISOString() });
-    } catch (err) {
-      console.error("heartbeat error:", err);
-      return res.status(500).json({ error: "heartbeat_failed" });
-    }
-  });
-
-  // Device API endpoints (for Android/player clients)
+// Device API endpoints (for Android/player clients)
   app.post("/api/device/register", async (req, res) => {
     try {
       const { deviceId, name, resolution, location } = req.body;
