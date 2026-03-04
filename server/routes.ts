@@ -931,75 +931,16 @@ app.get("/api/dashboard/live-content", authenticateJWT, async (_req, res) => {
     }
   });
 
- // =====================================================
-// DEVICE FETCHES ITS PENDING COMMANDS (DEVICE AUTH + HEARTBEAT)
-// =====================================================
-app.get("/api/device/:deviceId/commands", async (req, res) => {
-  const deviceId = String(req.params.deviceId || "").trim();
-  if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
-
-  try {
-    // 1) Fetch pending (unsent) commands for this device_id (DEV-XXXX)
-    const result = await pool.query(
-      `
-      SELECT id, payload
-      FROM device_commands
-      WHERE device_id = $1
-        AND sent = false
-      ORDER BY created_at ASC
-      LIMIT 50
-      `,
-      [deviceId],
-    );
-
-    // 2) Mark them as SENT (delivered to device)
-    if (result.rows.length > 0) {
-      const ids: number[] = result.rows.map((r: any) => Number(r.id)).filter((n) => Number.isFinite(n));
-
-      if (ids.length > 0) {
-        await pool.query(
-          `
-          UPDATE device_commands
-          SET sent = true
-          WHERE id = ANY($1::int[])
-          `,
-          [ids],
-        );
-      }
-    }
-
-    // 3) Return payloads to device (normalize JSON)
-    return res.json(
-      result.rows.map((r: any) => {
-        let payload: any = r.payload;
-        try {
-          if (typeof payload === "string") payload = JSON.parse(payload);
-        } catch (_) {
-          // leave as-is if parsing fails
-        }
-        // return id + flattened payload
-        return { id: r.id, ...(payload && typeof payload === "object" ? payload : { payload }) };
-      }),
-    );
-  } catch (err) {
-    console.error("Error fetching commands:", err);
-    // Keep device resilient: return [] so player doesn't crash
-    return res.json([]);
-  }
-});
-
-
 // =====================================================
 // DEVICE FETCHES ITS PENDING COMMANDS (DEVICE AUTH)
 // - device_commands.device_id is TEXT like "DEV-XXXX"
 // - device_commands.id is INTEGER
 // =====================================================
-app.get("/api/device/:deviceId/commands", async (req, res) => {
+app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) => {
   const deviceId = String(req.params.deviceId || "").trim();
   if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
 
   try {
-    // 1) Fetch pending (unsent) commands for this deviceId (TEXT)
     const result = await pool.query(
       `
       SELECT id, payload
@@ -1012,9 +953,11 @@ app.get("/api/device/:deviceId/commands", async (req, res) => {
       [deviceId],
     );
 
-    // 2) Mark as sent (id is INTEGER)
     if (result.rows.length > 0) {
-      const ids = result.rows.map((r: any) => Number(r.id)).filter((n: any) => Number.isFinite(n));
+      const ids: number[] = result.rows
+        .map((r: any) => Number(r.id))
+        .filter((n) => Number.isFinite(n));
+
       if (ids.length > 0) {
         await pool.query(
           `
@@ -1027,17 +970,21 @@ app.get("/api/device/:deviceId/commands", async (req, res) => {
       }
     }
 
-    // 3) Return normalized payloads to device
     return res.json(
       result.rows.map((r: any) => {
-        const payload =
-          typeof r.payload === "string" ? JSON.parse(r.payload) : (r.payload ?? {});
-        return { id: r.id, ...payload };
+        let payload: any = r.payload;
+        try {
+          if (typeof payload === "string") payload = JSON.parse(payload);
+        } catch {
+          // ignore
+        }
+        return { id: r.id, ...(payload && typeof payload === "object" ? payload : { payload }) };
       }),
     );
   } catch (err) {
     console.error("Error fetching commands:", err);
-    return res.status(500).json({ error: "commands_fetch_failed" });
+    // ✅ Device resilience: return [] so player doesn't crash
+    return res.json([]);
   }
 });
 
