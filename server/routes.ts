@@ -1702,50 +1702,61 @@ app.post("/api/device/:deviceId/heartbeat", handleDeviceHeartbeat);
 
 // ✅ ADMIN → DEVICE COMMAND (JWT protected)
 // Accepts BOTH legacy command types (SET_BRIGHTNESS) and modern types (brightness)
+// Also accepts modern wrapper: { payload: { type, value, ... } }
 app.post(
   "/api/admin/devices/:deviceId/command",
   authenticateJWT,
   requireRole("admin", "manager"),
   async (req, res) => {
-    const { deviceId } = req.params;
+    const deviceId = String(req.params.deviceId || "").trim();
+    if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
 
     // Support modern payload wrapper: { payload: { type, value, ... } }
-    const raw = (req.body?.payload && typeof req.body.payload === "object")
-      ? req.body.payload
-      : req.body;
+    const raw =
+      req.body?.payload && typeof req.body.payload === "object"
+        ? req.body.payload
+        : req.body;
 
     const rawType = String(raw?.type || "").trim();
     if (!rawType) return res.status(400).json({ error: "Command type is required" });
 
-    // Normalize: allow SET_BRIGHTNESS / SCREEN_ON etc, and allow lowercase SaaS types
-    const type = rawType.toLowerCase();
-
     const value = raw?.value;
     const duration = raw?.duration;
 
+    // normalize command types:
+    // - modern: "volume", "brightness", "restart_app"
+    // - legacy: "SET_VOLUME", "SCREEN_ON"
+    const normalize = (t: string) =>
+      String(t || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[ -]/g, "_");
+
+    const tNorm = normalize(rawType);
+
     let payload: any;
 
-    // ✅ MODERN TYPES (preferred)
-    // brightness, volume, reboot, restart_app, refresh, screenshot, record, play_content, screen_on/off
-    if (
-      type === "brightness" ||
-      type === "volume" ||
-      type === "reboot" ||
-      type === "restart_app" ||
-      type === "refresh" ||
-      type === "screenshot" ||
-      type === "record" ||
-      type === "play_content" ||
-      type === "screen_on" ||
-      type === "screen_off" ||
-      type === "mute" ||
-      type === "unmute"
-    ) {
-      payload = { ...raw, type }; // keep any extra fields
-      // normalize record default
-      if (type === "record" && (payload.duration == null)) payload.duration = duration || 10;
+    // ✅ Modern supported types (preferred)
+    const modernAllowed = new Set([
+      "brightness",
+      "volume",
+      "reboot",
+      "restart_app",
+      "refresh",
+      "screenshot",
+      "record",
+      "play_content",
+      "screen_on",
+      "screen_off",
+      "mute",
+      "unmute",
+    ]);
+
+    if (modernAllowed.has(tNorm)) {
+      payload = { ...raw, type: tNorm };
+      if (tNorm === "record" && payload.duration == null) payload.duration = duration || 10;
     } else {
-      // ✅ LEGACY TYPES (backwards compatible)
+      // ✅ Legacy support
       switch (rawType) {
         case "SET_VOLUME":
           payload = { type: "volume", value };
@@ -1756,8 +1767,7 @@ app.post(
           break;
 
         case "MUTE":
-          // safest: convert to volume=0
-          payload = { type: "volume", value: 0 };
+          payload = { type: "mute" };
           break;
 
         case "UNMUTE":
@@ -1808,350 +1818,348 @@ app.post(
           return res.status(400).json({
             error: "Unknown command type",
             received: rawType,
-            hint: "Use modern types: brightness, volume, reboot, restart_app, refresh, screenshot...",
+            normalized: tNorm,
+            hint: "Use modern types: brightness, volume, reboot, restart_app, refresh, screenshot, screen_on, screen_off, mute, unmute",
           });
       }
     }
 
-    const result = await pool.query(
-      `
-      INSERT INTO device_commands (device_id, payload, sent, executed)
-      VALUES ($1, $2, false, false)
-      RETURNING id, created_at
-      `,
-      [deviceId, JSON.stringify(payload)],
-    );
+    try {
+      const result = await pool.query(
+        `
+        INSERT INTO device_commands (device_id, payload, sent, executed)
+        VALUES ($1, $2, false, false)
+        RETURNING id, created_at
+        `,
+        [deviceId, JSON.stringify(payload)],
+      );
 
-    const command = result.rows[0];
-    return res.json({
-      success: true,
-      commandId: command.id,
-      createdAt: command.created_at,
-      queued: payload,
-    });
+      const command = result.rows[0];
+      return res.json({
+        success: true,
+        commandId: command.id,
+        createdAt: command.created_at,
+        queued: payload,
+      });
+    } catch (err) {
+      console.error("Admin command insert error:", err);
+      return res.status(500).json({ error: "failed_to_queue_command" });
+    }
   },
 );
 
-      // =====================================================
-      // COMMAND HISTORY FOR DEVICE (CMS)
-      // =====================================================
-      // ✅ ADMIN (dashboard) - JWT protected
-      app.get(
-        "/api/admin/devices/:deviceId/commands/history",
-        authenticateJWT,
-        requireRole("admin", "manager"),
-        async (req, res) => {
-          const { deviceId } = req.params;
+// =====================================================
+// COMMAND HISTORY FOR DEVICE (CMS)
+// =====================================================
+// ✅ ADMIN (dashboard) - JWT protected
+app.get(
+  "/api/admin/devices/:deviceId/commands/history",
+  authenticateJWT,
+  requireRole("admin", "manager"),
+  async (req, res) => {
+    const deviceId = String(req.params.deviceId || "").trim();
+    if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
 
-          try {
-            const result = await pool.query(
-              `
-              SELECT
-                id,
-                payload,
-                sent,
-                executed,
-                executed_at,
-                created_at
-              FROM device_commands
-              WHERE device_id = $1
-              ORDER BY created_at DESC
-              LIMIT 50
-              `,
-              [deviceId],
-            );
-
-            return res.json(result.rows);
-          } catch (err) {
-            console.error("Command history error:", err);
-            return res.status(500).json({ error: "failed_to_fetch_command_history" });
-          }
-        },
-      );
-
-      // ❌ Deprecated (was incorrectly protected by device auth)
-      app.post("/api/device/:deviceId/command", (_req, res) => {
-        return res.status(410).json({ error: "moved_to_/api/admin/devices/:deviceId/command" });
-      });
-
-  // =====================================================
-  // DEVICE SCREENSHOT UPLOAD
-  // =====================================================
-  app.post("/api/device/:deviceId/screenshot", async (req, res) => {
-    const { deviceId } = req.params;
-    const { screenshot } = req.body;
-
-    if (!screenshot) {
-      return res.status(400).json({ error: "screenshot_required" });
-    }
-
-    try {
-      await pool.query(
-        `
-        UPDATE screens SET
-          screenshot = $1,
-          screenshot_at = NOW()
-        WHERE device_id = $2
-        `,
-        [screenshot, deviceId]
-      );
-
-      res.json({ success: true });
-    } catch (err) {
-      console.error("Screenshot upload error:", err);
-      res.status(500).json({ error: "screenshot_upload_failed" });
-    }
-  });
-
-  // =====================================================
-  // DEVICE THUMBNAIL UPLOAD
-  // =====================================================
-  app.post(
-    "/api/device/:deviceId/thumbnail",
-    deviceThumbnailUpload.single("thumbnail"),
-    async (req, res) => {
-      const { deviceId } = req.params;
-      const file = req.file;
-
-      if (!file) {
-        return res.status(400).json({ error: "No thumbnail file provided" });
-      }
-
-      try {
-        const thumbnailUrl = `/uploads/device-thumbnails/${file.filename}`;
-        
-        await pool.query(
-          `UPDATE screens SET thumbnail = $1 WHERE device_id = $2`,
-          [thumbnailUrl, deviceId]
-        );
-
-        res.json({ success: true, thumbnail: thumbnailUrl });
-      } catch (err) {
-        console.error("Thumbnail upload error:", err);
-        res.status(500).json({ error: "Failed to upload thumbnail" });
-      }
-    }
-  );
-
-  // Get device thumbnail
-  app.get("/api/device/:deviceId/thumbnail", async (req, res) => {
-    const { deviceId } = req.params;
-    
     try {
       const result = await pool.query(
-        `SELECT thumbnail FROM screens WHERE device_id = $1`,
-        [deviceId]
+        `
+        SELECT
+          id,
+          payload,
+          sent,
+          executed,
+          executed_at,
+          created_at
+        FROM device_commands
+        WHERE device_id = $1
+        ORDER BY created_at DESC
+        LIMIT 50
+        `,
+        [deviceId],
       );
-      
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: "Device not found" });
-      }
-      
-      res.json({ thumbnail: result.rows[0].thumbnail });
+
+      return res.json(result.rows);
     } catch (err) {
-      console.error("Get thumbnail error:", err);
-      res.status(500).json({ error: "Failed to get thumbnail" });
+      console.error("Command history error:", err);
+      return res.status(500).json({ error: "failed_to_fetch_command_history" });
     }
-  });
+  },
+);
 
-  const deviceStatusSchema = z.object({
-    deviceId: z.string().optional(),
-    status: z.enum(["playing", "idle", "error", "offline"]).optional(),
-    currentContentId: z.string().nullable().optional(),
-    currentContentName: z.string().nullable().optional(),
-    batteryLevel: z.number().min(0).max(100).nullable().optional(),
-    temperature: z.number().min(-50).max(150).nullable().optional(),
-    freeStorage: z.number().min(0).nullable().optional(),
-    signalStrength: z.number().min(-150).max(0).nullable().optional(),
-    isOnline: z.boolean().nullable().optional(),
-    latitude: z.number().min(-90).max(90).nullable().optional(),
-    longitude: z.number().min(-180).max(180).nullable().optional(),
-    errors: z.array(z.string()).nullable().optional(),
-    timestamp: z.number().nullable().optional(),
-  });
+// ❌ Deprecated (device should NOT send commands here)
+app.post("/api/device/:deviceId/command", (_req, res) => {
+  return res.status(410).json({ error: "moved_to_/api/admin/devices/:deviceId/command" });
+});
 
-  app.post("/api/device/status", authenticateDevice, async (req, res) => {
+// =====================================================
+// DEVICE SCREENSHOT UPLOAD (DEVICE AUTH)
+// =====================================================
+app.post("/api/device/:deviceId/screenshot", authenticateDevice, async (req, res) => {
+  const deviceId = String(req.params.deviceId || "").trim();
+  const { screenshot } = req.body;
+
+  if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
+  if (!screenshot) return res.status(400).json({ error: "screenshot_required" });
+
+  try {
+    await pool.query(
+      `
+      UPDATE screens SET
+        screenshot = $1,
+        screenshot_at = NOW()
+      WHERE device_id = $2
+      `,
+      [screenshot, deviceId],
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Screenshot upload error:", err);
+    res.status(500).json({ error: "screenshot_upload_failed" });
+  }
+});
+
+// =====================================================
+// DEVICE THUMBNAIL UPLOAD (DEVICE AUTH)
+// =====================================================
+app.post(
+  "/api/device/:deviceId/thumbnail",
+  authenticateDevice,
+  deviceThumbnailUpload.single("thumbnail"),
+  async (req, res) => {
+    const deviceId = String(req.params.deviceId || "").trim();
+    const file = req.file;
+
+    if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
+    if (!file) return res.status(400).json({ error: "No thumbnail file provided" });
+
     try {
-      const authHeader = req.headers.authorization;
-      if (!authHeader) return res.status(401).json({ error: "Missing token" });
+      const thumbnailUrl = `/uploads/device-thumbnails/${file.filename}`;
 
-      const token = authHeader.split(" ")[1];
+      await pool.query(`UPDATE screens SET thumbnail = $1 WHERE device_id = $2`, [
+        thumbnailUrl,
+        deviceId,
+      ]);
 
-      const secret = process.env.JWT_SECRET;
-      if (!secret) {
-        console.error("JWT SECRET MISSING!");
-        return res.status(500).json({ error: "JWT secret missing" });
-      }
-
-      let decoded;
-      try {
-        decoded = jwt.verify(token, secret);
-      } catch (error) {
-        console.error("JWT VERIFY ERROR:", error);
-        return res.status(403).json({ error: "Invalid or expired token" });
-      }
-
-      const body = {
-        ...req.body,
-        isOnline: req.body.isOnline ?? req.body.is_online ?? true,
-      };
-
-      if (!body.device_id) {
-        return res.status(400).json({ error: "device_id is required" });
-      }
-
-      await saveDeviceStatus(body);
-
-      res.json({ success: true });
+      res.json({ success: true, thumbnail: thumbnailUrl });
     } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Failed to save device status" });
+      console.error("Thumbnail upload error:", err);
+      res.status(500).json({ error: "Failed to upload thumbnail" });
     }
-  });
+  },
+);
 
-  app.post(
-    "/api/device/status/auth",
-    authenticateJWT as any,
-    async (req: Request, res) => {
-      try {
-        const validatedData = deviceStatusSchema.parse(req.body);
+// Get device thumbnail (DEVICE AUTH)
+app.get("/api/device/:deviceId/thumbnail", authenticateDevice, async (req, res) => {
+  const deviceId = String(req.params.deviceId || "").trim();
+  if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
 
-        if (!validatedData.deviceId) {
-          return res.status(400).json({ error: "deviceId is required" });
-        }
-
-        const screen = await storage.getScreenByDeviceId(
-          validatedData.deviceId,
-        );
-        if (!screen) {
-          return res.status(404).json({ error: "Device not found" });
-        }
-
-        await storage.createDeviceStatusLog({
-          deviceId: validatedData.deviceId,
-          status: validatedData.status ?? undefined,
-          currentContentId: validatedData.currentContentId ?? undefined,
-          currentContentName: validatedData.currentContentName ?? undefined,
-          batteryLevel: validatedData.batteryLevel ?? undefined,
-          temperature: validatedData.temperature ?? undefined,
-          freeStorage: validatedData.freeStorage ?? undefined,
-          signalStrength: validatedData.signalStrength ?? undefined,
-          isOnline: validatedData.isOnline ?? undefined,
-          latitude: validatedData.latitude ?? undefined,
-          longitude: validatedData.longitude ?? undefined,
-          errors: validatedData.errors ?? undefined,
-          timestamp: validatedData.timestamp ?? Date.now(),
-        });
-
-        await storage.updateDeviceStatus(validatedData.deviceId, {
-          status: validatedData.status ?? undefined,
-          currentContent: validatedData.currentContentId ?? undefined,
-          currentContentName: validatedData.currentContentName ?? undefined,
-          batteryLevel: validatedData.batteryLevel ?? undefined,
-          temperature: validatedData.temperature ?? undefined,
-          freeStorage: validatedData.freeStorage ?? undefined,
-          signalStrength: validatedData.signalStrength ?? undefined,
-          isOnline: validatedData.isOnline ?? undefined,
-          latitude: validatedData.latitude ?? undefined,
-          longitude: validatedData.longitude ?? undefined,
-          errors: validatedData.errors ?? undefined,
-        });
-
-        res.json({ success: true });
-      } catch (error) {
-        if (error instanceof z.ZodError) {
-          return res.status(400).json({ error: error.errors });
-        }
-        console.error("Device status endpoint error:", error);
-        res.status(500).json({ error: "Server error" });
-      }
-    },
-  );
-
-  app.post("/api/device/:deviceId/status", async (req, res) => {
-    try {
-      const { deviceId } = req.params;
-      const validatedData = deviceStatusSchema.parse(req.body);
-
-      const screen = await storage.getScreenByDeviceId(deviceId);
-      if (!screen) {
-        return res.status(404).json({ error: "Device not found" });
-      }
-
-      await storage.createDeviceStatusLog({
-        deviceId,
-        status: validatedData.status ?? undefined,
-        currentContentId: validatedData.currentContentId ?? undefined,
-        currentContentName: validatedData.currentContentName ?? undefined,
-        batteryLevel: validatedData.batteryLevel ?? undefined,
-        temperature: validatedData.temperature ?? undefined,
-        freeStorage: validatedData.freeStorage ?? undefined,
-        signalStrength: validatedData.signalStrength ?? undefined,
-        isOnline: validatedData.isOnline ?? undefined,
-        latitude: validatedData.latitude ?? undefined,
-        longitude: validatedData.longitude ?? undefined,
-        errors: validatedData.errors ?? undefined,
-        timestamp: validatedData.timestamp ?? Date.now(),
-      });
-
-      const updatedScreen = await storage.updateDeviceStatus(deviceId, {
-        status: validatedData.status ?? undefined,
-        currentContent: validatedData.currentContentId ?? undefined,
-        currentContentName: validatedData.currentContentName ?? undefined,
-        batteryLevel: validatedData.batteryLevel ?? undefined,
-        temperature: validatedData.temperature ?? undefined,
-        freeStorage: validatedData.freeStorage ?? undefined,
-        signalStrength: validatedData.signalStrength ?? undefined,
-        isOnline: validatedData.isOnline ?? undefined,
-        latitude: validatedData.latitude ?? undefined,
-        longitude: validatedData.longitude ?? undefined,
-        errors: validatedData.errors ?? undefined,
-      });
-
-      res.json({ success: true, screen: updatedScreen });
-    } catch (error) {
-      if (error instanceof z.ZodError) {
-        return res.status(400).json({ error: error.errors });
-      }
-      console.error("Device status endpoint error:", error);
-      res.status(500).json({ error: "Server error" });
-    }
-  });
-
-  app.get("/api/device/:deviceId/playlist", (req, res) => {
-    const { deviceId } = req.params;
-
-    const playlist = playlists[deviceId];
-
-    if (!playlist) {
-      return res.json({
-        deviceId,
-        lastUpdated: null,
-        items: [],
-      });
-    }
-
-    res.json(playlist);
-  });
-
-  app.post("/api/device/:deviceId/playlist", (req, res) => {
-    const { deviceId } = req.params;
-    const { items } = req.body;
-
-    if (!Array.isArray(items)) {
-      return res.status(400).json({ error: "items must be an array" });
-    }
-
-    playlists[deviceId] = {
+  try {
+    const result = await pool.query(`SELECT thumbnail FROM screens WHERE device_id = $1`, [
       deviceId,
-      lastUpdated: new Date().toISOString(),
-      items,
+    ]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Device not found" });
+    }
+
+    res.json({ thumbnail: result.rows[0].thumbnail });
+  } catch (err) {
+    console.error("Get thumbnail error:", err);
+    res.status(500).json({ error: "Failed to get thumbnail" });
+  }
+});
+
+const deviceStatusSchema = z.object({
+  deviceId: z.string().optional(),
+  device_id: z.string().optional(),
+  status: z.enum(["playing", "idle", "error", "offline"]).optional(),
+  currentContentId: z.string().nullable().optional(),
+  currentContentName: z.string().nullable().optional(),
+  batteryLevel: z.number().min(0).max(100).nullable().optional(),
+  temperature: z.number().min(-50).max(150).nullable().optional(),
+  freeStorage: z.number().min(0).nullable().optional(),
+  signalStrength: z.number().min(-150).max(0).nullable().optional(),
+  isOnline: z.boolean().nullable().optional(),
+  is_online: z.boolean().nullable().optional(),
+  latitude: z.number().min(-90).max(90).nullable().optional(),
+  longitude: z.number().min(-180).max(180).nullable().optional(),
+  errors: z.array(z.string()).nullable().optional(),
+  timestamp: z.number().nullable().optional(),
+});
+
+// =====================================================
+// DEVICE STATUS (DEVICE AUTH) — SaaS-grade
+// NOTE: authenticateDevice already verifies the token.
+// DO NOT do jwt.verify again here.
+// =====================================================
+app.post("/api/device/status", authenticateDevice, async (req, res) => {
+  try {
+    const validated = deviceStatusSchema.parse(req.body);
+
+    const deviceId =
+      String(validated.device_id || validated.deviceId || "").trim();
+
+    if (!deviceId) {
+      return res.status(400).json({ error: "device_id is required" });
+    }
+
+    const body = {
+      ...req.body,
+      device_id: deviceId,
+      isOnline: validated.isOnline ?? validated.is_online ?? true,
     };
 
-    console.log("Updated playlist for", deviceId, "Items:", items.length);
+    await saveDeviceStatus(body);
 
-    res.json({ ok: true, playlist: playlists[deviceId] });
-  });
+    res.json({ success: true });
+  } catch (err: any) {
+    if (err instanceof z.ZodError) {
+      return res.status(400).json({ error: err.errors });
+    }
+    console.error("Device status error:", err);
+    res.status(500).json({ error: "Failed to save device status" });
+  }
+});
+
+// =====================================================
+// DEVICE STATUS (ADMIN AUTH) — optional audit/log pipeline
+// =====================================================
+app.post("/api/device/status/auth", authenticateJWT as any, async (req: Request, res) => {
+  try {
+    const validatedData = deviceStatusSchema.parse(req.body);
+
+    const deviceId = String(validatedData.deviceId || validatedData.device_id || "").trim();
+    if (!deviceId) return res.status(400).json({ error: "deviceId is required" });
+
+    const screen = await storage.getScreenByDeviceId(deviceId);
+    if (!screen) return res.status(404).json({ error: "Device not found" });
+
+    await storage.createDeviceStatusLog({
+      deviceId,
+      status: validatedData.status ?? undefined,
+      currentContentId: validatedData.currentContentId ?? undefined,
+      currentContentName: validatedData.currentContentName ?? undefined,
+      batteryLevel: validatedData.batteryLevel ?? undefined,
+      temperature: validatedData.temperature ?? undefined,
+      freeStorage: validatedData.freeStorage ?? undefined,
+      signalStrength: validatedData.signalStrength ?? undefined,
+      isOnline: validatedData.isOnline ?? validatedData.is_online ?? undefined,
+      latitude: validatedData.latitude ?? undefined,
+      longitude: validatedData.longitude ?? undefined,
+      errors: validatedData.errors ?? undefined,
+      timestamp: validatedData.timestamp ?? Date.now(),
+    });
+
+    await storage.updateDeviceStatus(deviceId, {
+      status: validatedData.status ?? undefined,
+      currentContent: validatedData.currentContentId ?? undefined,
+      currentContentName: validatedData.currentContentName ?? undefined,
+      batteryLevel: validatedData.batteryLevel ?? undefined,
+      temperature: validatedData.temperature ?? undefined,
+      freeStorage: validatedData.freeStorage ?? undefined,
+      signalStrength: validatedData.signalStrength ?? undefined,
+      isOnline: validatedData.isOnline ?? validatedData.is_online ?? undefined,
+      latitude: validatedData.latitude ?? undefined,
+      longitude: validatedData.longitude ?? undefined,
+      errors: validatedData.errors ?? undefined,
+    });
+
+    res.json({ success: true });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) return res.status(400).json({ error: error.errors });
+    console.error("Device status(auth) endpoint error:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// =====================================================
+// DEVICE STATUS by deviceId (DEVICE AUTH)
+// (Your old version was open — not enterprise-grade.)
+// =====================================================
+app.post("/api/device/:deviceId/status", authenticateDevice, async (req, res) => {
+  try {
+    const deviceId = String(req.params.deviceId || "").trim();
+    if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
+
+    const validatedData = deviceStatusSchema.parse({ ...req.body, deviceId });
+
+    const screen = await storage.getScreenByDeviceId(deviceId);
+    if (!screen) return res.status(404).json({ error: "Device not found" });
+
+    await storage.createDeviceStatusLog({
+      deviceId,
+      status: validatedData.status ?? undefined,
+      currentContentId: validatedData.currentContentId ?? undefined,
+      currentContentName: validatedData.currentContentName ?? undefined,
+      batteryLevel: validatedData.batteryLevel ?? undefined,
+      temperature: validatedData.temperature ?? undefined,
+      freeStorage: validatedData.freeStorage ?? undefined,
+      signalStrength: validatedData.signalStrength ?? undefined,
+      isOnline: validatedData.isOnline ?? validatedData.is_online ?? undefined,
+      latitude: validatedData.latitude ?? undefined,
+      longitude: validatedData.longitude ?? undefined,
+      errors: validatedData.errors ?? undefined,
+      timestamp: validatedData.timestamp ?? Date.now(),
+    });
+
+    const updatedScreen = await storage.updateDeviceStatus(deviceId, {
+      status: validatedData.status ?? undefined,
+      currentContent: validatedData.currentContentId ?? undefined,
+      currentContentName: validatedData.currentContentName ?? undefined,
+      batteryLevel: validatedData.batteryLevel ?? undefined,
+      temperature: validatedData.temperature ?? undefined,
+      freeStorage: validatedData.freeStorage ?? undefined,
+      signalStrength: validatedData.signalStrength ?? undefined,
+      isOnline: validatedData.isOnline ?? validatedData.is_online ?? undefined,
+      latitude: validatedData.latitude ?? undefined,
+      longitude: validatedData.longitude ?? undefined,
+      errors: validatedData.errors ?? undefined,
+    });
+
+    res.json({ success: true, screen: updatedScreen });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) return res.status(400).json({ error: error.errors });
+    console.error("Device status(deviceId) endpoint error:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// =====================================================
+// DEVICE PLAYLIST (NOTE)
+// Your pasted code uses in-memory `playlists`.
+// That is NOT SaaS-grade because it resets on restart.
+// Keep for now, but protect it with authenticateDevice.
+// =====================================================
+app.get("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
+  const deviceId = String(req.params.deviceId || "").trim();
+  const playlist = playlists[deviceId];
+
+  if (!playlist) {
+    return res.json({ deviceId, lastUpdated: null, items: [] });
+  }
+
+  res.json(playlist);
+});
+
+app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
+  const deviceId = String(req.params.deviceId || "").trim();
+  const { items } = req.body;
+
+  if (!Array.isArray(items)) {
+    return res.status(400).json({ error: "items must be an array" });
+  }
+
+  playlists[deviceId] = {
+    deviceId,
+    lastUpdated: new Date().toISOString(),
+    items,
+  };
+
+  console.log("Updated playlist for", deviceId, "Items:", items.length);
+
+  res.json({ ok: true, playlist: playlists[deviceId] });
+});
 
   // Delete device-specific playlist (revert to default)
   app.delete("/api/device/:deviceId/playlist", (req, res) => {
