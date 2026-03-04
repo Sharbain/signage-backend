@@ -1923,6 +1923,43 @@ app.post("/api/device/:deviceId/heartbeat", handleDeviceHeartbeat);
         },
       );
 
+      // =====================================================
+      // COMMAND HISTORY FOR DEVICE (CMS)
+      // =====================================================
+      // ✅ ADMIN (dashboard) - JWT protected
+      app.get(
+        "/api/admin/devices/:deviceId/commands/history",
+        authenticateJWT,
+        requireRole("admin", "manager"),
+        async (req, res) => {
+          const { deviceId } = req.params;
+
+          try {
+            const result = await pool.query(
+              `
+              SELECT
+                id,
+                payload,
+                sent,
+                executed,
+                executed_at,
+                created_at
+              FROM device_commands
+              WHERE device_id = $1
+              ORDER BY created_at DESC
+              LIMIT 50
+              `,
+              [deviceId],
+            );
+
+            return res.json(result.rows);
+          } catch (err) {
+            console.error("Command history error:", err);
+            return res.status(500).json({ error: "failed_to_fetch_command_history" });
+          }
+        },
+      );
+
       // ❌ Deprecated (was incorrectly protected by device auth)
       app.post("/api/device/:deviceId/command", (_req, res) => {
         return res.status(410).json({ error: "moved_to_/api/admin/devices/:deviceId/command" });
