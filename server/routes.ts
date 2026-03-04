@@ -920,71 +920,62 @@ app.get("/api/dashboard/live-content", authenticateJWT, async (_req, res) => {
     }
   });
 
-  // =====================================================
-  // COMMAND HISTORY FOR DEVICE (CMS)
-  // =====================================================
-  // ✅ ADMIN (dashboard) - JWT protected
-  app.get(
-    "/api/admin/devices/:deviceId/commands/history",
-    authenticateJWT,
-    requireRole("admin", "manager"),
-    async (req, res) => {
-      const { deviceId } = req.params;
+ // =====================================================
+// DEVICE FETCHES ITS PENDING COMMANDS (DEVICE AUTH + HEARTBEAT)
+// =====================================================
+app.get("/api/device/:deviceId/commands", async (req, res) => {
+  const deviceId = String(req.params.deviceId || "").trim();
+  if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
 
-      try {
-        const result = await pool.query(
+  try {
+    // 1) Fetch pending (unsent) commands for this device_id (DEV-XXXX)
+    const result = await pool.query(
+      `
+      SELECT id, payload
+      FROM device_commands
+      WHERE device_id = $1
+        AND sent = false
+      ORDER BY created_at ASC
+      LIMIT 50
+      `,
+      [deviceId],
+    );
+
+    // 2) Mark them as SENT (delivered to device)
+    if (result.rows.length > 0) {
+      const ids: number[] = result.rows.map((r: any) => Number(r.id)).filter((n) => Number.isFinite(n));
+
+      if (ids.length > 0) {
+        await pool.query(
           `
-          SELECT
-            id,
-            payload,
-            sent,
-            executed,
-            executed_at,
-            created_at
-          FROM device_commands
-          WHERE device_id = $1
-          ORDER BY created_at DESC
-          LIMIT 50
+          UPDATE device_commands
+          SET sent = true
+          WHERE id = ANY($1::int[])
           `,
-          [deviceId],
+          [ids],
         );
-
-        return res.json(result.rows);
-      } catch (err) {
-        console.error("Admin command history error:", err);
-        return res.status(500).json({ error: "failed_to_fetch_command_history" });
       }
-    },
-  );
-
-  // Device-scoped history (device auth) - keep for backwards compatibility
-  app.get("/api/device/:deviceId/commands/history", async (req, res) => {
-    const { deviceId } = req.params;
-
-    try {
-      const result = await pool.query(
-        `
-        SELECT
-          id,
-          payload,
-          sent,
-          executed,
-          executed_at,
-          created_at
-        FROM device_commands
-        WHERE device_id = $1
-        ORDER BY created_at DESC
-        LIMIT 50
-        `,
-        [deviceId]
-      );
-
-      res.json(result.rows);
-    } catch (err) {
-      console.error("Command history error:", err);
-      res.status(500).json({ error: "failed_to_fetch_command_history" });
     }
-  });
+
+    // 3) Return payloads to device (normalize JSON)
+    return res.json(
+      result.rows.map((r: any) => {
+        let payload: any = r.payload;
+        try {
+          if (typeof payload === "string") payload = JSON.parse(payload);
+        } catch (_) {
+          // leave as-is if parsing fails
+        }
+        // return id + flattened payload
+        return { id: r.id, ...(payload && typeof payload === "object" ? payload : { payload }) };
+      }),
+    );
+  } catch (err) {
+    console.error("Error fetching commands:", err);
+    // Keep device resilient: return [] so player doesn't crash
+    return res.json([]);
+  }
+});
 
 
 
