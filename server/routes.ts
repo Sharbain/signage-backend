@@ -199,9 +199,6 @@ const pendingCommands: {
   }>;
 } = {};
 
-// Track last uploaded screenshot/recording per device
-const lastScreenshot: { [deviceId: string]: string } = {};
-const lastRecording: { [deviceId: string]: string } = {};
 
 // In-memory playlist storage (legacy - device-level)
 // Structure: { [deviceId]: { deviceId, lastUpdated, items: [...] } }
@@ -968,57 +965,72 @@ app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) =
 
   
 
-  // DEVICE UPLOADS VIDEO RECORDING
-  app.post(
-    "/api/device/:deviceId/record",
-    recordingUpload.single("file"),
-    (req, res) => {
-      const { deviceId } = req.params;
+  // =====================================================
+// DEVICE UPLOADS VIDEO RECORDING (DEVICE AUTH)
+// Stores file path in DB via updateDeviceRecording (screens.last_recording)
+// =====================================================
+app.post(
+  "/api/device/:deviceId/record",
+  authenticateDevice,
+  recordingUpload.single("file"),
+  async (req, res) => {
+    const deviceId = String(req.params.deviceId || "").trim();
+    if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
 
-      if (!req.file) {
-        return res.status(400).json({ error: "No file uploaded" });
-      }
+    if (!req.file) {
+      return res.status(400).json({ error: "no_file_uploaded" });
+    }
 
-      const filePath = `/uploads/recordings/${req.file.filename}`;
-      lastRecording[deviceId] = filePath;
+    const filePath = `/uploads/recordings/${req.file.filename}`;
 
-      console.log(
-        `Recording received from device ${deviceId}:`,
-        req.file.filename,
+    try {
+      await updateDeviceRecording(deviceId, filePath);
+      return res.json({ ok: true, filePath });
+    } catch (err) {
+      console.error("Recording upload error:", err);
+      return res.status(500).json({ error: "recording_upload_failed" });
+    }
+  },
+);
+
+// =====================================================
+// GET LAST RECORDING (ADMIN JWT)
+// Reads from DB (screens.last_recording)
+// =====================================================
+app.get(
+  "/api/admin/devices/:deviceId/recording",
+  authenticateJWT,
+  requireRole("admin", "manager"),
+  async (req, res) => {
+    const deviceId = String(req.params.deviceId || "").trim();
+    if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
+
+    try {
+      const result = await pool.query(
+        `SELECT last_recording, last_seen FROM screens WHERE device_id = $1`,
+        [deviceId],
       );
 
-      res.json({ ok: true, filePath });
-    },
-  );
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: "device_not_found" });
+      }
+
+      return res.json({
+        file: result.rows[0].last_recording ?? null,
+        last_seen: result.rows[0].last_seen ?? null,
+      });
+    } catch (err) {
+      console.error("Get recording error:", err);
+      return res.status(500).json({ error: "failed_to_get_recording" });
+    }
+  },
+);
 
 // =====================================================
 // DEVICE SCREENSHOT UPLOAD (DEVICE AUTH) — SaaS-grade
 // Supports JSON base64: { screenshot: "data:image/png;base64,..." }
 // =====================================================
-app.post("/api/device/:deviceId/screenshot", authenticateDevice, async (req, res) => {
-  const deviceId = String(req.params.deviceId || "").trim();
-  const { screenshot } = req.body;
 
-  if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
-  if (!screenshot) return res.status(400).json({ error: "screenshot_required" });
-
-  try {
-    await pool.query(
-      `
-      UPDATE screens SET
-        screenshot = $1,
-        screenshot_at = NOW()
-      WHERE device_id = $2
-      `,
-      [screenshot, deviceId],
-    );
-
-    return res.json({ success: true });
-  } catch (err) {
-    console.error("Screenshot upload error:", err);
-    return res.status(500).json({ error: "screenshot_upload_failed" });
-  }
-});
 
 // =====================================================
 // GET LAST SCREENSHOT (ADMIN JWT) — SaaS-grade
@@ -1052,47 +1064,15 @@ app.get(
 );
 
   // GET LAST RECORDING FOR A DEVICE (CMS uses this)
-  app.get("/api/device/:deviceId/recording", (req, res) => {
-    const { deviceId } = req.params;
-    const filePath = lastRecording[deviceId];
-
-    if (!filePath) {
-      return res.status(404).json({ error: "No recording available" });
-    }
-
-    res.json({ ok: true, filePath });
-  });
+  
 
   // Alternative endpoints returning null if not found (simpler for Android)
-  app.get("/api/device/:deviceId/last-screenshot", (req, res) => {
-    const { deviceId } = req.params;
-    res.json({ file: lastScreenshot[deviceId] || null });
-  });
+  
 
-  app.get("/api/device/:deviceId/last-recording", (req, res) => {
-    const { deviceId } = req.params;
-    res.json({ file: lastRecording[deviceId] || null });
-  });
+  
 
   // Serve latest screenshot image directly
-  app.get("/api/device/:deviceId/screenshot/latest", (req, res) => {
-    const { deviceId } = req.params;
-    const screenshotPath = path.join(screenshotsDir, `${deviceId}_latest.png`);
-
-    if (!fs.existsSync(screenshotPath)) {
-      // Try to find any screenshot for this device
-      const files = fs
-        .readdirSync(screenshotsDir)
-        .filter((f) => f.startsWith(deviceId));
-      if (files.length > 0) {
-        files.sort().reverse();
-        return res.sendFile(path.join(screenshotsDir, files[0]));
-      }
-      return res.status(404).send("No screenshot available");
-    }
-
-    res.sendFile(screenshotPath);
-  });
+  
 
   app.post("/api/devices", async (req, res) => {
     try {
