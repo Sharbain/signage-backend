@@ -1595,52 +1595,130 @@ const existingUser = await storage.getUserByEmail(email);
 
 
 
+// =====================================================
+// DEVICE HEARTBEAT (SaaS-grade, unified + backward compatible)
+// =====================================================
+// Canonical endpoint:
+//   POST /api/devices/:deviceId/heartbeat
+// Legacy alias (kept for older Android builds):
+//   POST /api/device/:deviceId/heartbeat
+//
+// Both routes:
+// - require valid device token (device_key for SaaS v2, bcrypt password for legacy)
+// - mark the device online + update lastSeen
+// - optionally store metrics fields if provided
+// - write a device_status_logs snapshot via saveDeviceStatus()
+async function handleDeviceHeartbeat(req: Request, res: Response) {
+  try {
+    const deviceId = String(req.params.deviceId || "").trim();
+    if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
 
-  // =====================================================
-  // DEVICE HEARTBEAT (SaaS-grade)
-  // =====================================================
-  // Device-auth via device key (same flexible token rules as playlist).
-  // Updates screen online status + stores a status log snapshot.
-  app.post("/api/devices/:deviceId/heartbeat", async (req, res) => {
-    try {
-      const deviceId = String(req.params.deviceId || "").trim();
-      if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
+    // 🔐 Validate device token (flexible token sources, supports legacy + SaaS v2)
+    const verified = await verifyDeviceTokenOrFail(req, res, deviceId);
+    if (!verified) return;
 
-      // 🔐 Validate device token (flexible token sources, supports legacy + SaaS v2)
-      const verified = await verifyDeviceTokenOrFail(req, res, deviceId);
-      if (!verified) return;
+    const { screen } = verified;
 
-      const { screen } = verified;
+    const body: any = req.body && typeof req.body === "object" ? req.body : {};
 
-      const body: any = (req.body && typeof req.body === "object") ? req.body : {};
+    // Flexible field mapping (support older clients + newer payloads)
+    const brightness = body.brightness ?? body.displayBrightness ?? null;
+    const volume = body.volume ?? body.audioVolume ?? null;
+    const screenState = body.screenState ?? body.screen_state ?? body.playbackState ?? null;
+    const apkVersion = body.apkVersion ?? body.apk_version ?? body.appVersion ?? body.app_version ?? body?.app?.version ?? null;
+    const temperature = body.temperature ?? body.temp ?? null;
+    const freeStorage = body.freeStorage ?? body.free_storage ?? body?.storage?.freeMb ?? body?.storage?.free_storage_mb ?? null;
+    const totalStorage = body.totalStorage ?? body.total_storage ?? body?.storage?.totalMb ?? body?.storage?.total_storage_mb ?? null;
+    const signalStrength = body.signalStrength ?? body.signal_strength ?? body.rssi ?? null;
+    const uptime = body.uptime ?? body.upTime ?? null;
+    const localIp = body.localIp ?? body.local_ip ?? null;
+    const publicIp = body.publicIp ?? body.public_ip ?? null;
 
-      // Best-effort IP extraction (behind proxies/CDN)
-      const ip =
-        (String(req.headers["x-forwarded-for"] || "").split(",")[0]?.trim() ||
-          (req.socket as any)?.remoteAddress ||
-          null);
+    const currentUrl =
+      (body.currentUrl ?? body.current_url ?? body?.playback?.currentUrl ?? null) as string | null;
 
-      const appVersion =
-        (body.appVersion ?? body.app_version ?? body?.app?.version ?? null) as string | null;
+    const lastError =
+      body?.playback?.lastError ?? body?.lastError ?? body?.last_error ?? null;
 
-      const currentUrl =
-        (body.currentUrl ?? body.current_url ?? body?.playback?.currentUrl ?? null) as string | null;
+    // Best-effort IP extraction (behind proxies/CDN)
+    const ip =
+      (String(req.headers["x-forwarded-for"] || "").split(",")[0]?.trim() ||
+        (req.socket as any)?.remoteAddress ||
+        null);
 
-      const freeStorageMb =
-        body?.storage?.freeMb ?? body?.storage?.free_storage_mb ?? body?.freeStorage ?? body?.free_storage ?? null;
+    // ✅ Mark online + lastSeen (storage layer for compatibility)
+    await storage.updateScreen(screen.id, {
+      lastSeen: new Date(),
+      status: "online",
+    });
 
-      const lastError =
-        body?.playback?.lastError ?? body?.lastError ?? body?.last_error ?? null;
+    // ✅ Update optional device metrics (do NOT overwrite with nulls)
+    // Uses COALESCE so partial payloads won't wipe existing values.
+    await pool.query(
+      `
+      UPDATE screens SET
+        last_seen = NOW(),
+        status = 'online',
+        is_online = TRUE,
+        brightness = COALESCE($1, brightness),
+        volume = COALESCE($2, volume),
+        screen_state = COALESCE($3, screen_state),
+        apk_version = COALESCE($4, apk_version),
+        temperature = COALESCE($5, temperature),
+        free_storage = COALESCE($6, free_storage),
+        total_storage = COALESCE($7, total_storage),
+        signal_strength = COALESCE($8, signal_strength),
+        uptime = COALESCE($9, uptime),
+        local_ip = COALESCE($10, local_ip),
+        public_ip = COALESCE($11, public_ip)
+      WHERE device_id = $12
+      `,
+      [
+        brightness,
+        volume,
+        screenState,
+        apkVersion,
+        temperature,
+        freeStorage,
+        totalStorage,
+        signalStrength,
+        uptime,
+        localIp,
+        publicIp,
+        deviceId,
+      ],
+    );
 
-      const errors: string[] = [];
-      if (Array.isArray(body?.errors)) errors.push(...body.errors.map((x: any) => String(x)));
-      if (lastError) errors.push(String(lastError));
+    // ✅ Store a status log snapshot (device_status_logs)
+    const errors: string[] = [];
+    if (Array.isArray(body?.errors)) errors.push(...body.errors.map((x: any) => String(x)));
+    if (lastError) errors.push(String(lastError));
 
-      // ✅ Mark online + lastSeen (use storage layer for compatibility with your schema)
-      await storage.updateScreen(screen.id, {
-        lastSeen: new Date(),
-        status: "online",
-      });
+    await saveDeviceStatus({
+      device_id: deviceId,
+      deviceId,
+      isOnline: true,
+      ip,
+      appVersion: apkVersion,
+      currentUrl,
+      freeStorage: freeStorage == null ? null : Number(freeStorage),
+      errors: errors.length ? errors : null,
+      timestamp: Date.now(),
+      payload: body,
+    } as any);
+
+    return res.json({ ok: true, serverTime: new Date().toISOString() });
+  } catch (err) {
+    console.error("heartbeat error:", err);
+    return res.status(500).json({ error: "heartbeat_failed" });
+  }
+}
+
+// ✅ Canonical heartbeat (SaaS v2)
+app.post("/api/devices/:deviceId/heartbeat", handleDeviceHeartbeat);
+
+// ✅ Legacy alias (older clients)
+app.post("/api/device/:deviceId/heartbeat", handleDeviceHeartbeat);
 
       // ✅ Store a status log snapshot (uses your existing device_status_logs pipeline)
       // saveDeviceStatus() already exists and matches your DB schema expectations.
@@ -1808,67 +1886,6 @@ const existingUser = await storage.getUserByEmail(email);
       app.post("/api/device/:deviceId/command", (_req, res) => {
         return res.status(410).json({ error: "moved_to_/api/admin/devices/:deviceId/command" });
       });
- 
-
-// 🔽 EXISTING ROUTE (leave untouched)
-  
-  app.post("/api/device/:deviceId/heartbeat", async (req, res) => {
-    const { deviceId } = req.params;
-    const {
-      brightness,
-      volume,
-      screenState,
-      apkVersion,
-      temperature,
-      freeStorage,
-      totalStorage,
-      signalStrength,
-      uptime,
-      localIp,
-      publicIp,
-    } = req.body;
-
-    try {
-      await pool.query(
-        `
-        UPDATE screens SET
-          last_seen = NOW(),
-          brightness = $1,
-          volume = $2,
-          screen_state = $3,
-          apk_version = $4,
-          temperature = $5,
-          free_storage = $6,
-          total_storage = $7,
-          signal_strength = $8,
-          uptime = $9,
-          local_ip = $10,
-          public_ip = $11,
-          is_online = TRUE
-        WHERE device_id = $12
-        `,
-        [
-          brightness,
-          volume,
-          screenState,
-          apkVersion,
-          temperature,
-          freeStorage,
-          totalStorage,
-          signalStrength,
-          uptime,
-          localIp,
-          publicIp,
-          deviceId,
-        ],
-      );
-
-      res.json({ success: true });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "heartbeat_failed" });
-    }
-  });
 
   // =====================================================
   // DEVICE SCREENSHOT UPLOAD
