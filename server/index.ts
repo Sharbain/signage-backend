@@ -8,6 +8,7 @@ import { registerRoutes } from "./routes";
 import { createServer } from "http";
 
 const app = express();
+app.set("trust proxy", 1);
 app.use("/display", express.static(path.join(process.cwd(), "public/display")));
 const httpServer = createServer(app);
 
@@ -298,3 +299,4 @@ app.use((req, res, next) => {
     log(`API listening on port ${port}`);
   });
 })();
+
