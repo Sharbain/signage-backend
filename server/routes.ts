@@ -82,28 +82,6 @@ const upload = multer({
   },
 });
 
-// Screenshot upload configuration
-const screenshotStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, screenshotsDir),
-  filename: (req, file, cb) => {
-    const deviceId = (req.params as { deviceId: string }).deviceId || "unknown";
-    const timestamp = Date.now();
-    cb(null, `${deviceId}-${timestamp}${path.extname(file.originalname)}`);
-  },
-});
-
-const screenshotUpload = multer({
-  storage: screenshotStorage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit for screenshots
-  fileFilter: (_req, file, cb) => {
-    const allowed = /jpeg|jpg|png|webp/;
-    const ext = allowed.test(path.extname(file.originalname).toLowerCase());
-    const mime = allowed.test(file.mimetype);
-    if (ext && mime) cb(null, true);
-    else cb(new Error("Only image files allowed for screenshots"));
-  },
-});
-
 // Recording upload configuration
 const recordingStorage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, recordingsDir),
