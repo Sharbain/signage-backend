@@ -799,40 +799,63 @@ export async function createNotification({
   );
 }
 
-export async function queueCommand(deviceId: string, command: string, params: Record<string, any> | null) {
-  const payload = { command, ...params };
+export async function queueCommand(
+  deviceId: string,
+  command: string,
+  params: Record<string, any> | null,
+) {
+  // jsonb payload should be OBJECT, not string
+  const payload = { type: command, ...(params || {}) };
+
   await pool.query(
-    `INSERT INTO device_commands (device_id, payload, executed)
-     VALUES ($1, $2, false)`,
-    [deviceId, JSON.stringify(payload)]
+    `
+    INSERT INTO device_commands (device_id, payload, sent, executed)
+    VALUES ($1, $2::jsonb, false, false)
+    `,
+    [deviceId, JSON.stringify(payload)],
   );
 }
 
 export async function getQueuedCommands(deviceId: string) {
   const { rows } = await pool.query(
-    `SELECT id, payload 
-     FROM device_commands
-     WHERE device_id = $1 AND executed = FALSE
-     ORDER BY created_at ASC`,
-    [deviceId]
+    `
+    SELECT id, payload
+    FROM device_commands
+    WHERE device_id = $1
+      AND sent = FALSE
+      AND executed = FALSE
+    ORDER BY created_at ASC
+    LIMIT 50
+    `,
+    [deviceId],
   );
 
   return rows.map((row: any) => {
-    const { command, ...rest } = row.payload || {};
-    return {
-      id: row.id,
-      command: command || "UNKNOWN",
-      payload: Object.keys(rest).length > 0 ? rest : null,
-    };
+    let payload: any = row.payload;
+
+    if (typeof payload === "string") {
+      try {
+        payload = JSON.parse(payload);
+      } catch {
+        payload = { payload };
+      }
+    }
+    if (!payload || typeof payload !== "object") payload = { payload };
+
+    // normalize to what Android expects
+    return { id: row.id, ...payload };
   });
 }
 
 export async function markCommandExecuted(id: string | number) {
   await pool.query(
-    `UPDATE device_commands
-     SET executed = TRUE
-     WHERE id = $1`,
-    [id]
+    `
+    UPDATE device_commands
+    SET executed = TRUE,
+        executed_at = NOW()
+    WHERE id = $1
+    `,
+    [id],
   );
 }
 
@@ -852,4 +875,5 @@ export async function updateDeviceRecording(deviceId: string, filePath: string) 
      WHERE device_id = $1`,
     [deviceId, filePath]
   );
+
 }
