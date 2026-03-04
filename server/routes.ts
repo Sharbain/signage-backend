@@ -626,6 +626,17 @@ app.get("/api/devices/:id/details", async (req, res) => {
   }
 });
 
+// =====================================================
+// DEVICE DETAILS ALIAS (compat)
+// Frontend sometimes calls /api/devices/:id (no /details)
+// =====================================================
+app.get("/api/devices/:id", async (req, res) => {
+  // Reuse the same handler by internally calling the same logic.
+  // Easiest: redirect to the existing endpoint (works for GET)
+  const id = encodeURIComponent(String(req.params.id || "").trim());
+  return res.redirect(302, `/api/devices/${id}/details`);
+});
+
   // =====================================================
 // DEVICE SETTINGS (brightness/volume)
 // =====================================================
