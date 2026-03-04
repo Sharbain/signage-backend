@@ -989,32 +989,7 @@ app.get("/api/device/:deviceId/commands", async (req, res) => {
   if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
 
   try {
-    // ✅ deviceId is "DEV-...." text, NOT uuid, NOT integer
-    const result = await pool.query(
-      `
-      SELECT
-        id,
-        payload,
-        sent,
-        executed,
-        executed_at,
-        created_at
-      FROM device_commands
-      WHERE device_id = $1
-      ORDER BY created_at DESC
-      LIMIT 50
-      `,
-      [deviceId],
-    );
-
-    return res.json(result.rows);
-  } catch (e) {
-    console.error("Error fetching commands:", e);
-    return res.status(500).json({ error: "commands_fetch_failed" });
-  }
-});
-
-    // 1️⃣ Fetch pending (unsent) commands
+    // 1) Fetch pending (unsent) commands
     const result = await pool.query(
       `
       SELECT id, payload
@@ -1022,33 +997,46 @@ app.get("/api/device/:deviceId/commands", async (req, res) => {
       WHERE device_id = $1
         AND sent = false
       ORDER BY created_at ASC
+      LIMIT 50
       `,
       [deviceId],
     );
 
-    // 2️⃣ Mark them as SENT (delivered to device)
+    // 2) Mark them as SENT (delivered to device)
     if (result.rows.length > 0) {
-      const ids = result.rows.map((r) => r.id);
+      const ids: number[] = result.rows
+        .map((r: any) => Number(r.id))
+        .filter((n) => Number.isFinite(n));
 
-      await pool.query(
-        `
-        UPDATE device_commands
-        SET sent = true
-        WHERE id = ANY($1::uuid[])
-        `,
-        [ids],
-      );
+      if (ids.length > 0) {
+        await pool.query(
+          `
+          UPDATE device_commands
+          SET sent = true
+          WHERE id = ANY($1::int[])
+          `,
+          [ids],
+        );
+      }
     }
 
-    // 3️⃣ Return payloads to device
+    // 3) Return payloads to device (normalize JSON)
     return res.json(
-      result.rows.map((r) => {
-        const payload = typeof r.payload === "string" ? JSON.parse(r.payload) : r.payload;
-        return { id: r.id, ...payload };
+      result.rows.map((r: any) => {
+        let payload: any = r.payload;
+        try {
+          if (typeof payload === "string") payload = JSON.parse(payload);
+        } catch (_) {}
+
+        return {
+          id: r.id,
+          ...(payload && typeof payload === "object" ? payload : { payload }),
+        };
       }),
     );
   } catch (err) {
     console.error("Error fetching commands:", err);
+    // keep device resilient
     return res.json([]);
   }
 });
