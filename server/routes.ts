@@ -993,22 +993,35 @@ app.get("/api/dashboard/live-content", authenticateJWT, async (_req, res) => {
 // =====================================================
 // DEVICE FETCHES ITS PENDING COMMANDS (DEVICE AUTH + HEARTBEAT)
 // =====================================================
-app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) => {
-  const { deviceId } = req.params;
+app.get("/api/device/:deviceId/commands", async (req, res) => {
+  const deviceId = String(req.params.deviceId || "").trim();
+  if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
 
   try {
-    // ✅ Treat polling as heartbeat (fix online/offline)
-    await pool.query(
+    // ✅ deviceId is "DEV-...." text, NOT uuid, NOT integer
+    const result = await pool.query(
       `
-      UPDATE screens
-      SET last_seen = NOW(),
-          is_online = TRUE,
-          status = 'online',
-          last_offline = NULL
+      SELECT
+        id,
+        payload,
+        sent,
+        executed,
+        executed_at,
+        created_at
+      FROM device_commands
       WHERE device_id = $1
+      ORDER BY created_at DESC
+      LIMIT 50
       `,
       [deviceId],
     );
+
+    return res.json(result.rows);
+  } catch (e) {
+    console.error("Error fetching commands:", e);
+    return res.status(500).json({ error: "commands_fetch_failed" });
+  }
+});
 
     // 1️⃣ Fetch pending (unsent) commands
     const result = await pool.query(
