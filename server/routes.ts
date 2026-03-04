@@ -1513,44 +1513,93 @@ const existingUser = await storage.getUserByEmail(email);
     return null;
   };
 
-  const verifyDeviceTokenOrFail = async (
-    req: Request,
-    res: Response,
-    deviceId: string,
-  ): Promise<{ screen: any; token: string } | null> => {
-    const token = extractDeviceToken(req);
-    if (!token) {
-      res.status(401).json({ error: "missing_device_token" });
-      return null;
-    }
+  
+const sha256Hex = (v: string) =>
+  crypto.createHash("sha256").update(v, "utf8").digest("hex");
 
-    const screen = await storage.getScreenByDeviceId(deviceId);
-    if (!screen) {
-      res.status(404).json({ error: "device_not_found" });
-      return null;
-    }
+const looksLikeBcrypt = (v: string) =>
+  v.startsWith("$2a$") || v.startsWith("$2b$") || v.startsWith("$2y$");
 
-    // SaaS v2: deviceKey stored plaintext (common names we’ve used across branches)
-    const deviceKey =
-      (screen as any).deviceKey ??
-      (screen as any).device_key ??
-      (screen as any).deviceKeyHash ??
-      null;
+const looksLikeSha256Hex = (v: string) => /^[0-9a-f]{64}$/i.test(v);
 
-    if (typeof deviceKey === "string" && deviceKey.trim() && deviceKey.trim() === token) {
-      return { screen, token };
-    }
-
-    // Legacy: password stores bcrypt hash of a minted device token
-    const passwordHash = (screen as any).password as string | null | undefined;
-    if (passwordHash && typeof passwordHash === "string") {
-      const ok = await bcrypt.compare(token, passwordHash);
-      if (ok) return { screen, token };
-    }
-
-    res.status(403).json({ error: "invalid_device_token" });
+const verifyDeviceTokenOrFail = async (
+  req: Request,
+  res: Response,
+  deviceId: string,
+): Promise<{ screen: any; token: string } | null> => {
+  const token = extractDeviceToken(req);
+  if (!token) {
+    res.status(401).json({ error: "missing_device_token" });
     return null;
-  };
+  }
+
+  const screen = await storage.getScreenByDeviceId(deviceId);
+  if (!screen) {
+    res.status(404).json({ error: "device_not_found" });
+    return null;
+  }
+
+  // --------------------------------------------------
+  // SaaS-grade auth (current schema):
+  // - screens.api_key_hash (sha256 hex OR bcrypt)
+  // - screens.api_key_last4 for display only
+  // - screens.token_version optional
+  // Legacy auth:
+  // - screens.password (bcrypt or plaintext)
+  // Older branches:
+  // - screens.device_key / screens.deviceKey (plaintext)
+  // --------------------------------------------------
+
+  const tokenTrim = token.trim();
+
+  // 1) Plaintext key compatibility (older branches / transitional)
+  const plaintextKey =
+    (screen as any).deviceKey ??
+    (screen as any).device_key ??
+    (screen as any).device_key_plain ??
+    null;
+
+  if (typeof plaintextKey === "string" && plaintextKey.trim() && plaintextKey.trim() === tokenTrim) {
+    return { screen, token: tokenTrim };
+  }
+
+  // 2) SaaS-grade api_key_hash (preferred)
+  const apiKeyHash =
+    (screen as any).apiKeyHash ??
+    (screen as any).api_key_hash ??
+    null;
+
+  if (typeof apiKeyHash === "string" && apiKeyHash.trim()) {
+    const expected = apiKeyHash.trim();
+
+    if (looksLikeBcrypt(expected)) {
+      const ok = await bcrypt.compare(tokenTrim, expected);
+      if (ok) return { screen, token: tokenTrim };
+    } else if (looksLikeSha256Hex(expected)) {
+      const ok = sha256Hex(tokenTrim).toLowerCase() === expected.toLowerCase();
+      if (ok) return { screen, token: tokenTrim };
+    } else {
+      // Unknown format; last-resort: direct equality (helps during migrations)
+      if (expected === tokenTrim) return { screen, token: tokenTrim };
+    }
+  }
+
+  // 3) Legacy password fallback
+  const password = (screen as any).password as string | null | undefined;
+  if (password && typeof password === "string" && password.trim()) {
+    const p = password.trim();
+    if (looksLikeBcrypt(p)) {
+      const ok = await bcrypt.compare(tokenTrim, p);
+      if (ok) return { screen, token: tokenTrim };
+    } else {
+      // plaintext legacy (rare)
+      if (p === tokenTrim) return { screen, token: tokenTrim };
+    }
+  }
+
+  res.status(403).json({ error: "invalid_device_token" });
+  return null;
+};
 
   app.get("/api/screens/:deviceId/playlist", async (req, res) => {
     try {
