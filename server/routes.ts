@@ -1753,112 +1753,137 @@ app.post("/api/device/:deviceId/heartbeat", handleDeviceHeartbeat);
     }
   });
 
-      // ✅ ADMIN → DEVICE COMMAND (JWT protected)
-      // This endpoint is used by the dashboard (NOT by the device).
-      app.post(
-        "/api/admin/devices/:deviceId/command",
-        authenticateJWT,
-        requireRole("admin", "manager"),
-        async (req, res) => {
-          const { deviceId } = req.params;
-          const { type, value, state, duration } = req.body;
+// ✅ ADMIN → DEVICE COMMAND (JWT protected)
+// Accepts BOTH legacy command types (SET_BRIGHTNESS) and modern types (brightness)
+app.post(
+  "/api/admin/devices/:deviceId/command",
+  authenticateJWT,
+  requireRole("admin", "manager"),
+  async (req, res) => {
+    const { deviceId } = req.params;
 
-          if (!type) {
-            return res.status(400).json({ error: "Command type is required" });
-          }
+    // Support modern payload wrapper: { payload: { type, value, ... } }
+    const raw = (req.body?.payload && typeof req.body.payload === "object")
+      ? req.body.payload
+      : req.body;
 
-          let payload: any;
+    const rawType = String(raw?.type || "").trim();
+    if (!rawType) return res.status(400).json({ error: "Command type is required" });
 
-          switch (type) {
-            case "SET_VOLUME":
-              payload = { type: "volume", value };
-              break;
+    // Normalize: allow SET_BRIGHTNESS / SCREEN_ON etc, and allow lowercase SaaS types
+    const type = rawType.toLowerCase();
 
-            case "SET_BRIGHTNESS":
-              payload = { type: "brightness", value };
-              break;
+    const value = raw?.value;
+    const duration = raw?.duration;
 
-            case "MUTE":
-              payload = { type: "volume", value: 0 };
-              break;
+    let payload: any;
 
-            case "UNMUTE":
-              payload = { type: "unmute" };
-              break;
+    // ✅ MODERN TYPES (preferred)
+    // brightness, volume, reboot, restart_app, refresh, screenshot, record, play_content, screen_on/off
+    if (
+      type === "brightness" ||
+      type === "volume" ||
+      type === "reboot" ||
+      type === "restart_app" ||
+      type === "refresh" ||
+      type === "screenshot" ||
+      type === "record" ||
+      type === "play_content" ||
+      type === "screen_on" ||
+      type === "screen_off" ||
+      type === "mute" ||
+      type === "unmute"
+    ) {
+      payload = { ...raw, type }; // keep any extra fields
+      // normalize record default
+      if (type === "record" && (payload.duration == null)) payload.duration = duration || 10;
+    } else {
+      // ✅ LEGACY TYPES (backwards compatible)
+      switch (rawType) {
+        case "SET_VOLUME":
+          payload = { type: "volume", value };
+          break;
 
-            case "SCREEN_OFF":
-              payload = { type: "screen", state: "off" };
-              break;
+        case "SET_BRIGHTNESS":
+          payload = { type: "brightness", value };
+          break;
 
-            case "SCREEN_ON":
-              payload = { type: "screen", state: "on" };
-              break;
+        case "MUTE":
+          // safest: convert to volume=0
+          payload = { type: "volume", value: 0 };
+          break;
 
-            case "REBOOT":
-              payload = { type: "reboot" };
-              break;
+        case "UNMUTE":
+          payload = { type: "unmute" };
+          break;
 
-            case "SCREENSHOT":
-              payload = { type: "screenshot" };
-              break;
+        case "SCREEN_OFF":
+          payload = { type: "screen_off" };
+          break;
 
-            case "RECORD":
-              payload = { type: "record", duration: duration || 10 };
-              break;
+        case "SCREEN_ON":
+          payload = { type: "screen_on" };
+          break;
 
-            case "PLAY_CONTENT": {
-              const { contentId, contentName, contentUrl, contentType } = req.body;
-              payload = {
-                type: "play_content",
-                contentId,
-                contentName,
-                contentUrl,
-                contentType,
-              };
-              // Also update the device's current content
-              await pool.query(
-                `UPDATE screens SET current_content = $1, current_content_name = $2 WHERE device_id = $3`,
-                [contentId, contentName, deviceId],
-              );
-              break;
-            }
+        case "REBOOT":
+          payload = { type: "reboot" };
+          break;
 
-            case "PING": {
-              const { message } = req.body;
-              payload = { type: "ping", message: message || "This Device is being pinged" };
-              break;
-            }
+        case "RESTART_APP":
+          payload = { type: "restart_app" };
+          break;
 
-            case "SHUTDOWN":
-              payload = { type: "shutdown" };
-              break;
+        case "REFRESH":
+          payload = { type: "refresh" };
+          break;
 
-            case "POWER_ON":
-              payload = { type: "power_on" };
-              break;
+        case "SCREENSHOT":
+          payload = { type: "screenshot" };
+          break;
 
-            default:
-              return res.status(400).json({ error: "Unknown command type" });
-          }
+        case "RECORD":
+          payload = { type: "record", duration: duration || 10 };
+          break;
 
-          const result = await pool.query(
-            `
-            INSERT INTO device_commands (device_id, payload, sent, executed)
-            VALUES ($1, $2, false, false)
-            RETURNING id, created_at
-            `,
-            [deviceId, JSON.stringify(payload)],
-          );
+        case "PLAY_CONTENT": {
+          const { contentId, contentName, contentUrl, contentType } = raw;
+          payload = {
+            type: "play_content",
+            contentId,
+            contentName,
+            contentUrl,
+            contentType,
+          };
+          break;
+        }
 
-          const command = result.rows[0];
-          return res.json({
-            success: true,
-            commandId: command.id,
-            createdAt: command.created_at,
-            queued: payload,
+        default:
+          return res.status(400).json({
+            error: "Unknown command type",
+            received: rawType,
+            hint: "Use modern types: brightness, volume, reboot, restart_app, refresh, screenshot...",
           });
-        },
-      );
+      }
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO device_commands (device_id, payload, sent, executed)
+      VALUES ($1, $2, false, false)
+      RETURNING id, created_at
+      `,
+      [deviceId, JSON.stringify(payload)],
+    );
+
+    const command = result.rows[0];
+    return res.json({
+      success: true,
+      commandId: command.id,
+      createdAt: command.created_at,
+      queued: payload,
+    });
+  },
+);
 
       // =====================================================
       // COMMAND HISTORY FOR DEVICE (CMS)
