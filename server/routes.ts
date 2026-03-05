@@ -1535,9 +1535,7 @@ const existingUser = await storage.getUserByEmail(email);
     return null;
   };
 
-  
-const sha256Hex = (v: string) =>
-  crypto.createHash("sha256").update(v, "utf8").digest("hex");
+
 
 const looksLikeBcrypt = (v: string) =>
   v.startsWith("$2a$") || v.startsWith("$2b$") || v.startsWith("$2y$");
