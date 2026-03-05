@@ -1268,9 +1268,7 @@ app.post("/api/device/claim", handleDeviceClaim);
 
 // Backwards-compatible alias (older APK builds)
 app.post("/api/device/activate", handleDeviceClaim);
-  });
 
-});
 
 
   // ❌ Disabled: minting long-lived device JWTs is insecure.
