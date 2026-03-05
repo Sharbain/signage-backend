@@ -1109,57 +1109,55 @@ app.get(
   // POST /api/devices
   // Body: { name: string, location_branch?: string }
   app.post(
-    "/api/devices",
-    authenticateJWT,
-    requireRole("admin", "manager"),
-    async (req, res) => {
-      try {
-        const name = String(req.body?.name || "").trim();
-        const location_branch =
-          req.body?.location_branch != null ? String(req.body.location_branch).trim() : null;
+  "/api/devices",
+  authenticateJWT,
+  requireRole("admin", "manager"),
+  async (req, res) => {
+    try {
+      const { name } = req.body as { name?: string };
 
-        if (!name) {
-          return res.status(400).json({ error: "name_required" });
-        }
+      // Frontend label: "Location / Branch"
+      // Support multiple keys for compatibility
+      const rawLocation =
+        (req.body?.location_branch as any) ??
+        (req.body?.locationBranch as any) ??
+        (req.body?.location as any);
 
-        // Generate deviceId like DEV-XXXXXXXX
-        const rand = crypto.randomBytes(4).toString("hex").toUpperCase(); // 8 chars
-        const deviceId = `DEV-${rand}`;
+      const deviceName = String(name ?? "").trim();
+      if (!deviceName) return res.status(400).json({ error: "name_required" });
 
-        // Short pairing code (user types into device)
-        const pairingCode = crypto.randomBytes(3).toString("hex").toUpperCase(); // 6 chars
-        const pairingExpiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+      // IMPORTANT: screens.location is NOT NULL in your DB
+      const location = String(rawLocation ?? "").trim() || "Unassigned";
 
-        // Insert screen row. Do NOT mint device_key here; it is minted on claim.
-        const result = await pool.query(
-          `
-          INSERT INTO screens (
-            device_id,
-            name,
-            location_branch,
-            pairing_code,
-            pairing_expires_at,
-            is_online,
-            created_at
-          )
-          VALUES ($1, $2, $3, $4, $5, false, NOW())
-          RETURNING id, device_id, name, location_branch, pairing_expires_at
-          `,
-          [deviceId, name, location_branch, pairingCode, pairingExpiresAt],
-        );
+      const deviceId =
+        "DEV-" + crypto.randomBytes(4).toString("hex").toUpperCase();
+      const pairingCode = crypto.randomBytes(3).toString("hex").toUpperCase();
+      const expiresAt = new Date(Date.now() + 1000 * 60 * 10); // 10 minutes
 
-        return res.status(201).json({
-          success: true,
-          screen: result.rows[0],
-          pairingCode,
-          expiresAt: pairingExpiresAt.toISOString(),
-        });
-      } catch (e) {
-        console.error("Create device error:", e);
-        return res.status(500).json({ error: "failed_to_create_device" });
-      }
-    },
-  );
+      // Insert using stable, real columns (location is required)
+      const result = await pool.query(
+        `
+        INSERT INTO screens (device_id, name, location, status, pairing_code, pairing_expires_at)
+        VALUES ($1, $2, $3, 'offline', $4, $5)
+        RETURNING
+          id,
+          device_id as "deviceId",
+          name,
+          location as "locationBranch",
+          pairing_code as "pairingCode",
+          pairing_expires_at as "pairingExpiresAt",
+          api_key_last4 as "deviceKeyLast4"
+        `,
+        [deviceId, deviceName, location, pairingCode, expiresAt]
+      );
+
+      return res.json(result.rows[0]);
+    } catch (err) {
+      console.error("Create device error:", err);
+      return res.status(500).json({ error: "failed_to_create_device" });
+    }
+  }
+);
 
   /**
    * Pairing claim handler (device)
