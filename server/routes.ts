@@ -1147,29 +1147,31 @@ const locationBranch =
 // screens.location is NOT NULL in your DB, so NEVER allow it to be null/empty
 const location = locationBranch || "Unassigned";
 
+// Insert using stable, real columns (location is required)
 const result = await pool.query(
   `
   INSERT INTO screens (
     device_id,
     name,
     location,
-    location_branch,
+    status,
     pairing_code,
     pairing_expires_at
   )
-  VALUES ($1, $2, $3, $4, $5, $6)
+  VALUES ($1, $2, $3, 'offline', $4, $5)
   RETURNING
     id,
     device_id as "deviceId",
     name,
-    location_branch as "locationBranch",
-    location as "location",
+    location as "locationBranch",
     pairing_code as "pairingCode",
     pairing_expires_at as "pairingExpiresAt",
     api_key_last4 as "deviceKeyLast4"
   `,
-  [deviceId, deviceName, location, locationBranch || null, pairingCode, expiresAt]
+  [deviceId, deviceName, location, pairingCode, expiresAt]
 );
+
+return res.json(result.rows[0]);
 
   /**
    * Pairing claim handler (device)
