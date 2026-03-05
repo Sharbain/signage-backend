@@ -313,12 +313,6 @@ export async function registerRoutes(
     return authenticateJWT(req, res, next);
   });
 
-  // Device API must use device token when a specific deviceId is present
-// ✅ PUBLIC: Device activation must NOT require device token
-// ✅ PUBLIC: Device activation (pairing) - returns a device API key (token)
-// - Does NOT require user JWT
-// - Does NOT require a prior device token
-// - Generates/rotates a device token stored as sha256 in screens.api_key_hash
 // Pairing / activation handler (mounted on multiple paths for backward compatibility)
 async function handleDeviceActivate(req: any, res: any) {
   try {
@@ -339,20 +333,35 @@ async function handleDeviceActivate(req: any, res: any) {
       return res.status(400).json({ error: "pairing_code_required" });
     }
 
-    // Pairing codes are stored as SHA-256 hashes in pairing_code_hash
+    // Try hashed-column flow first (pairing_code_hash). If column doesn't exist, fallback to pairing_code.
     const pairingCodeHash = crypto.createHash("sha256").update(pairingCode).digest("hex");
 
-    const result = await pool.query(
-      `SELECT id, device_id, pairing_expires_at
-       FROM screens
-       WHERE pairing_code_hash = $1
-       LIMIT 1`,
-      [pairingCodeHash],
-    );
-
-    const row = result.rows[0] as
+    let row:
       | { id: number; device_id: string; pairing_expires_at: string | null }
       | undefined;
+
+    try {
+      const result = await pool.query(
+        `SELECT id, device_id, pairing_expires_at
+         FROM screens
+         WHERE pairing_code_hash = $1
+         LIMIT 1`,
+        [pairingCodeHash],
+      );
+      row = result.rows[0];
+    } catch (e: any) {
+      // 42703 = undefined_column
+      if (e?.code !== "42703") throw e;
+
+      const result = await pool.query(
+        `SELECT id, device_id, pairing_expires_at
+         FROM screens
+         WHERE pairing_code = $1
+         LIMIT 1`,
+        [pairingCode],
+      );
+      row = result.rows[0];
+    }
 
     if (!row) return res.status(404).json({ error: "invalid_pairing_code" });
 
@@ -365,20 +374,42 @@ async function handleDeviceActivate(req: any, res: any) {
     const tokenHash = crypto.createHash("sha256").update(deviceToken).digest("hex");
     const last4 = deviceToken.slice(-4);
 
-    await pool.query(
-      `UPDATE screens
-       SET pairing_code_hash = NULL,
-           pairing_expires_at = NULL,
-           is_online = true,
-           last_seen = NOW(),
-           api_key_hash = $2,
-           api_key_last4 = $3,
-           revoked_at = NULL,
-           rotated_at = NOW(),
-           password = NULL
-       WHERE id = $1`,
-      [row.id, tokenHash, last4],
-    );
+    // Clear both pairing_code_hash + pairing_code (whichever exists), then store api_key_hash.
+    try {
+      await pool.query(
+        `UPDATE screens
+         SET pairing_code_hash = NULL,
+             pairing_code = NULL,
+             pairing_expires_at = NULL,
+             is_online = true,
+             last_seen = NOW(),
+             api_key_hash = $2,
+             api_key_last4 = $3,
+             revoked_at = NULL,
+             rotated_at = NOW(),
+             password = NULL
+         WHERE id = $1`,
+        [row.id, tokenHash, last4],
+      );
+    } catch (e: any) {
+      // If pairing_code_hash doesn't exist, retry without it.
+      if (e?.code !== "42703") throw e;
+
+      await pool.query(
+        `UPDATE screens
+         SET pairing_code = NULL,
+             pairing_expires_at = NULL,
+             is_online = true,
+             last_seen = NOW(),
+             api_key_hash = $2,
+             api_key_last4 = $3,
+             revoked_at = NULL,
+             rotated_at = NOW(),
+             password = NULL
+         WHERE id = $1`,
+        [row.id, tokenHash, last4],
+      );
+    }
 
     // ✅ Return BOTH snake_case and camelCase for client compatibility
     return res.json({
@@ -394,14 +425,6 @@ async function handleDeviceActivate(req: any, res: any) {
     return res.status(500).json({ error: "activation_failed" });
   }
 }
-
-// New canonical route
-app.post("/api/device/activate", handleDeviceActivate);
-
-// Backward-compatible alias (some clients call plural)
-app.post("/api/devices/activate", handleDeviceActivate);
-
-  app.use("/api/device/:deviceId", authenticateDevice);
 
       // =====================================================
       // DASHBOARD SUMMARY
@@ -1074,59 +1097,68 @@ app.get(
   // Serve latest screenshot image directly
   
 
-  app.post("/api/devices", async (req, res) => {
-    try {
-      const { name, location_branch } = req.body;
+app.post("/api/devices", async (req, res) => {
+  try {
+    const { name, location_branch } = req.body;
 
-      if (!name) {
-        return res.status(400).json({ error: "Device name is required" });
-      }
-
-      // Create the device record first (generates device_id etc.)
-      const device = await createDevice({ name, location_branch });
-
-      // ✅ Generate a short-lived pairing code (plain code returned once),
-      // store only the hash in DB for verification.
-      const pairing_code = String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
-      const pairing_code_hash = crypto
-        .createHash("sha256")
-        .update(pairing_code)
-        .digest("hex");
-      const pairing_expires_at = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
-
-      // Persist pairing hash + expiry on the screen row.
-      // We match by either internal id or device_id to be safe across schemas.
-      try {
-        const q = await pool.query(
-          `UPDATE screens
-             SET pairing_code_hash = $1,
-                 pairing_expires_at = $2
-           WHERE id::text = $3 OR device_id = $4
-           RETURNING pairing_expires_at`,
-          [pairing_code_hash, pairing_expires_at, String((device as any).id), String((device as any).device_id)]
-        );
-
-        const returnedExpiry = q.rows?.[0]?.pairing_expires_at;
-        if (returnedExpiry) {
-          (device as any).pairing_expires_at = returnedExpiry;
-        } else {
-          (device as any).pairing_expires_at = pairing_expires_at.toISOString();
-        }
-      } catch (e) {
-        // If the schema doesn't have these fields yet, don't crash creation.
-        console.error("Pairing code update failed (missing columns/migration?):", e);
-        (device as any).pairing_expires_at = pairing_expires_at.toISOString();
-      }
-
-      return res.status(201).json({
-        device,
-        pairing_code, // <-- what the UI & APK need
-      });
-    } catch (error) {
-      console.error("Error creating device:", error);
-      return res.status(500).json({ error: "Failed to create device" });
+    if (!name) {
+      return res.status(400).json({ error: "Device name is required" });
     }
-  });
+
+    // Create the device record first (generates device_id etc.)
+    const device = await createDevice({ name, location_branch });
+
+    // Generate a short-lived pairing code
+    const pairing_code = String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
+    const pairing_expires_at = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+    // Prefer hashed storage if pairing_code_hash exists, else fallback to plaintext pairing_code column.
+    const pairing_code_hash = crypto
+      .createHash("sha256")
+      .update(pairing_code)
+      .digest("hex");
+
+    const screenId = String((device as any).id ?? "");
+    const deviceId = String((device as any).device_id ?? (device as any).deviceId ?? "");
+
+    try {
+      const q = await pool.query(
+        `UPDATE screens
+           SET pairing_code_hash = $1,
+               pairing_expires_at = $2
+         WHERE id::text = $3 OR device_id = $4
+         RETURNING pairing_expires_at`,
+        [pairing_code_hash, pairing_expires_at, screenId, deviceId],
+      );
+
+      (device as any).pairing_expires_at =
+        q.rows?.[0]?.pairing_expires_at ?? pairing_expires_at.toISOString();
+    } catch (e: any) {
+      // 42703 = undefined_column (pairing_code_hash missing)
+      if (e?.code !== "42703") throw e;
+
+      const q = await pool.query(
+        `UPDATE screens
+           SET pairing_code = $1,
+               pairing_expires_at = $2
+         WHERE id::text = $3 OR device_id = $4
+         RETURNING pairing_expires_at`,
+        [pairing_code, pairing_expires_at, screenId, deviceId],
+      );
+
+      (device as any).pairing_expires_at =
+        q.rows?.[0]?.pairing_expires_at ?? pairing_expires_at.toISOString();
+    }
+
+    return res.status(201).json({
+      device,
+      pairing_code, // what the UI & APK need
+    });
+  } catch (error) {
+    console.error("Error creating device:", error);
+    return res.status(500).json({ error: "Failed to create device" });
+  }
+});
 
 
   // ❌ Disabled: minting long-lived device JWTs is insecure.
