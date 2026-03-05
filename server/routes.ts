@@ -1123,55 +1123,41 @@ app.get(
         (req.body?.locationBranch as any) ??
         (req.body?.location as any);
 
-      const deviceName = String(name ?? "").trim();
-      if (!deviceName) return res.status(400).json({ error: "name_required" });
+      // Normalize incoming field names from frontend
+      const locationBranch = String(
+        (req.body as any)?.locationBranch ??
+          (req.body as any)?.location_branch ??
+          (req.body as any)?.location ??
+          "",
+      ).trim();
 
-      // IMPORTANT: screens.location is NOT NULL in your DB
-      const location = String(rawLocation ?? "").trim() || "Unassigned";
+      // screens.location is NOT NULL in DB
+      const location = locationBranch || "Unassigned";
 
-      const deviceId =
-        "DEV-" + crypto.randomBytes(4).toString("hex").toUpperCase();
-      const pairingCode = crypto.randomBytes(3).toString("hex").toUpperCase();
-      const expiresAt = new Date(Date.now() + 1000 * 60 * 10); // 10 minutes
-
-      // Insert using stable, real columns (location is required)
+      // Insert device (stable columns)
       const result = await pool.query(
         `
-        // Normalize incoming field names from frontend
-const locationBranch =
-  (req.body?.locationBranch ??
-    req.body?.location_branch ??
-    req.body?.location ??
-    "").toString().trim();
+        INSERT INTO screens (device_id, name, location, status, pairing_code, pairing_expires_at)
+        VALUES ($1, $2, $3, 'offline', $4, $5)
+        RETURNING
+          id,
+          device_id as "deviceId",
+          name,
+          location as "locationBranch",
+          pairing_code as "pairingCode",
+          pairing_expires_at as "pairingExpiresAt",
+          api_key_last4 as "deviceKeyLast4"
+        `,
+        [deviceId, deviceName, location, pairingCode, expiresAt],
+      );
 
-// screens.location is NOT NULL in your DB, so NEVER allow it to be null/empty
-const location = locationBranch || "Unassigned";
+      return res.json(result.rows[0]);
 
-// Insert using stable, real columns (location is required)
-const result = await pool.query(
-  `
-  INSERT INTO screens (
-    device_id,
-    name,
-    location,
-    status,
-    pairing_code,
-    pairing_expires_at
-  )
-  VALUES ($1, $2, $3, 'offline', $4, $5)
-  RETURNING
-    id,
-    device_id as "deviceId",
-    name,
-    location as "locationBranch",
-    pairing_code as "pairingCode",
-    pairing_expires_at as "pairingExpiresAt",
-    api_key_last4 as "deviceKeyLast4"
-  `,
-  [deviceId, deviceName, location, pairingCode, expiresAt]
-);
-
-return res.json(result.rows[0]);
+    } catch (err) {
+      console.error("Create device error:", err);
+      return res.status(500).json({ error: "failed_to_create_device" });
+    }
+  });
 
   /**
    * Pairing claim handler (device)
