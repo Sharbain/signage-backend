@@ -1118,10 +1118,41 @@ app.post("/api/devices", async (req, res) => {
       .update(pairing_code)
       .digest("hex");
 
-    const screenId = String((device as any).id ?? "");
-    const deviceId = String((device as any).device_id ?? (device as any).deviceId ?? "");
+    let screenId = String((device as any).id ?? "");
+let deviceId = String((device as any).device_id ?? (device as any).deviceId ?? "");
 
-    try {
+// 🔒 Robustly resolve identifiers (some storage layers return partial shapes)
+// Prefer deviceId, but if one of them is missing, look it up from DB.
+try {
+  if (!screenId && deviceId) {
+    const q = await pool.query(
+      `SELECT id::text AS id FROM screens WHERE device_id = $1 LIMIT 1`,
+      [deviceId],
+    );
+    screenId = q.rows?.[0]?.id ?? "";
+  } else if (!deviceId && screenId) {
+    const q = await pool.query(
+      `SELECT device_id FROM screens WHERE id::text = $1 LIMIT 1`,
+      [screenId],
+    );
+    deviceId = q.rows?.[0]?.device_id ?? "";
+  }
+
+  // Worst-case: fall back to latest created screen (prevents pairing_code staying NULL).
+  if (!screenId && !deviceId) {
+    const q = await pool.query(
+      `SELECT id::text AS id, device_id
+       FROM screens
+       ORDER BY created_at DESC NULLS LAST
+       LIMIT 1`,
+    );
+    screenId = q.rows?.[0]?.id ?? "";
+    deviceId = q.rows?.[0]?.device_id ?? "";
+  }
+} catch (e) {
+  console.warn("Pairing code: could not resolve screenId/deviceId", e);
+}
+try {
       const q = await pool.query(
         `UPDATE screens
            SET pairing_code_hash = $1,
@@ -1158,6 +1189,87 @@ app.post("/api/devices", async (req, res) => {
     console.error("Error creating device:", error);
     return res.status(500).json({ error: "Failed to create device" });
   }
+
+/* =====================================================
+   DEVICE PAIRING (APK)
+   - CMS creates a device and returns pairing_code
+   - Device submits pairing_code to claim its long-lived device token (deviceKey)
+   - We store sha256(token) in screens.api_key_hash (+ last4) and clear pairing_code
+===================================================== */
+
+  function sha256Hex(input: string) {
+    return crypto.createHash("sha256").update(input).digest("hex");
+  }
+
+  // POST /api/device/claim  { pairingCode: "ABCD1234" }
+  // Also accepts { code } or { pairing_code }
+  async function handleDeviceClaim(req: any, res: any) {
+  const pairingCode = String(
+    req.body?.pairingCode ?? req.body?.code ?? req.body?.pairing_code ?? "",
+  ).trim();
+
+  if (!pairingCode) return res.status(400).json({ error: "pairing_code_required" });
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT id::text AS id, device_id, pairing_expires_at
+       FROM screens
+       WHERE pairing_code = $1
+       LIMIT 1`,
+      [pairingCode],
+    );
+
+    if (!rows.length) {
+      return res.status(400).json({ error: "invalid_pairing_code" });
+    }
+
+    const screen = rows[0] as {
+      id: string;
+      device_id: string;
+      pairing_expires_at: string | null;
+    };
+
+    if (screen.pairing_expires_at) {
+      const exp = new Date(screen.pairing_expires_at);
+      if (!Number.isNaN(exp.getTime()) && exp.getTime() < Date.now()) {
+        return res.status(400).json({ error: "pairing_code_expired" });
+      }
+    }
+
+    // Mint a device token (APK stores this as deviceKey)
+    const deviceKey = crypto.randomBytes(16).toString("hex"); // 32 hex chars
+    const apiKeyHash = sha256Hex(deviceKey);
+    const apiKeyLast4 = deviceKey.slice(-4);
+
+    await pool.query(
+      `UPDATE screens
+         SET api_key_hash = $1,
+             api_key_last4 = $2,
+             token_version = COALESCE(token_version, 0) + 1,
+             pairing_code = NULL,
+             pairing_expires_at = NULL
+       WHERE id::text = $3`,
+      [apiKeyHash, apiKeyLast4, screen.id],
+    );
+
+    return res.json({
+      success: true,
+      deviceId: screen.device_id,
+      deviceKey, // show ONCE; store on device
+    });
+  } catch (e) {
+    console.error("device claim error", e);
+    return res.status(500).json({ error: "pairing_failed" });
+  }
+}
+
+// POST /api/device/claim { pairingCode }
+app.post("/api/device/claim", handleDeviceClaim);
+
+// Backwards-compatible alias (older APK builds)
+app.post("/api/device/activate", handleDeviceClaim);
+  });
+
 });
 
 
