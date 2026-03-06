@@ -339,43 +339,77 @@ async function handleDeviceActivate(req: any, res: any) {
       return res.status(400).json({ error: "pairing_code_required" });
     }
 
-    // Pairing codes are stored as SHA-256 hashes in pairing_code_hash
-    const pairingCodeHash = crypto.createHash("sha256").update(pairingCode).digest("hex");
+    const pairingCodeHash = crypto
+      .createHash("sha256")
+      .update(pairingCode)
+      .digest("hex");
 
+    // ✅ Support BOTH SaaS-grade hash lookup and plaintext fallback during migration
     const result = await pool.query(
-      `SELECT id, device_id, pairing_expires_at
+      `SELECT id, device_id, pairing_expires_at, pairing_locked_until, pairing_attempts
        FROM screens
        WHERE pairing_code_hash = $1
+          OR pairing_code = $2
        LIMIT 1`,
-      [pairingCodeHash],
+      [pairingCodeHash, pairingCode],
     );
 
     const row = result.rows[0] as
-      | { id: number; device_id: string; pairing_expires_at: string | null }
+      | {
+          id: number;
+          device_id: string;
+          pairing_expires_at: string | null;
+          pairing_locked_until: string | null;
+          pairing_attempts: number | null;
+        }
       | undefined;
 
-    if (!row) return res.status(404).json({ error: "invalid_pairing_code" });
+    if (!row) {
+      return res.status(404).json({ error: "invalid_pairing_code" });
+    }
 
-    if (!row.pairing_expires_at || new Date(row.pairing_expires_at).getTime() < Date.now()) {
+    // Locked?
+    if (
+      row.pairing_locked_until &&
+      new Date(row.pairing_locked_until).getTime() > Date.now()
+    ) {
+      return res.status(423).json({ error: "pairing_locked" });
+    }
+
+    // Expired?
+    if (
+      !row.pairing_expires_at ||
+      new Date(row.pairing_expires_at).getTime() < Date.now()
+    ) {
       return res.status(401).json({ error: "pairing_code_expired" });
     }
 
     // Rotate token on every successful activation
     const deviceToken = randomUUID();
-    const tokenHash = crypto.createHash("sha256").update(deviceToken).digest("hex");
+    const tokenHash = crypto
+      .createHash("sha256")
+      .update(deviceToken)
+      .digest("hex");
     const last4 = deviceToken.slice(-4);
 
     await pool.query(
       `UPDATE screens
-       SET pairing_code_hash = NULL,
+       SET pairing_code = NULL,
+           pairing_code_hash = NULL,
            pairing_expires_at = NULL,
+           pairing_status = 'paired',
+           pairing_attempts = 0,
+           pairing_locked_until = NULL,
+           last_paired_at = NOW(),
            is_online = true,
-           last_seen = NOW(),
+           last_seen_at = NOW(),
            api_key_hash = $2,
            api_key_last4 = $3,
+           token_version = COALESCE(token_version, 0) + 1,
            revoked_at = NULL,
            rotated_at = NOW(),
-           password = NULL
+           password = NULL,
+           updated_at = NOW()
        WHERE id = $1`,
       [row.id, tokenHash, last4],
     );
@@ -385,7 +419,8 @@ async function handleDeviceActivate(req: any, res: any) {
       // snake_case
       device_id: row.device_id,
       device_key: deviceToken,
-      // camelCase (older clients)
+
+      // camelCase
       deviceId: row.device_id,
       deviceKey: deviceToken,
     });
@@ -398,10 +433,11 @@ async function handleDeviceActivate(req: any, res: any) {
 // New canonical route
 app.post("/api/device/activate", handleDeviceActivate);
 
-// Backward-compatible alias (some clients call plural)
+// Backward-compatible aliases
 app.post("/api/devices/activate", handleDeviceActivate);
+app.post("/api/device/claim", handleDeviceActivate);
+app.post("/api/devices/pair", handleDeviceActivate);
 
-  app.use("/api/device/:deviceId", authenticateDevice);
 
       // =====================================================
       // DASHBOARD SUMMARY
@@ -1075,64 +1111,70 @@ app.get(
   
 
   app.post("/api/devices", async (req, res) => {
-    try {
-      // Accept multiple client payload shapes:
-      // - { name, location_branch } (legacy)
-      // - { deviceName, locationBranch } (new UI)
-      // - { name, location } (direct)
-      const deviceName =
-        (req.body?.deviceName ?? req.body?.name ?? "").toString().trim();
-      const location =
-        (req.body?.locationBranch ??
-          req.body?.location_branch ??
-          req.body?.location ??
-          "").toString().trim();
+  try {
+    // Accept multiple client payload shapes:
+    const deviceName =
+      (req.body?.deviceName ?? req.body?.name ?? "").toString().trim();
 
-      if (!deviceName) {
-        return res.status(400).json({ error: "Device name is required" });
-      }
-      // DB has NOT NULL constraint on screens.location
-      if (!location) {
-        return res.status(400).json({ error: "Location / branch is required" });
-      }
+    const location =
+      (req.body?.locationBranch ??
+        req.body?.location_branch ??
+        req.body?.location ??
+        "").toString().trim();
 
-      const deviceId = `DEV-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
-      const pairingCode = crypto.randomBytes(3).toString("hex").toUpperCase();
-      const expiresAt = new Date(Date.now() + 1000 * 60 * 10); // 10 minutes
-
-      // Insert using stable columns present in your DB.
-      // NOTE: screens.location is required (NOT NULL).
-      const result = await pool.query(
-        `
-        INSERT INTO screens (
-          device_id,
-          name,
-          location,
-          location_branch,
-          status,
-          pairing_code,
-          pairing_expires_at,
-          token_version
-        )
-        VALUES ($1, $2, $3, $3, 'offline', $4, $5, 2)
-        RETURNING
-          id,
-          device_id as "deviceId",
-          name,
-          location as "locationBranch",
-          pairing_code as "pairingCode",
-          pairing_expires_at as "pairingExpiresAt",
-          api_key_last4 as "deviceKeyLast4"
-        `,
-        [deviceId, deviceName, location, pairingCode, expiresAt]
-      );
-
-      return res.json(result.rows[0]);
-    } catch (err) {
-      console.error("Create device error:", err);
-      return res.status(500).json({ error: "failed_to_create_device" });
+    if (!deviceName) {
+      return res.status(400).json({ error: "Device name is required" });
     }
-  });
+
+    if (!location) {
+      return res.status(400).json({ error: "Location / branch is required" });
+    }
+
+    const deviceId = `DEV-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
+    const pairingCode = crypto.randomBytes(3).toString("hex").toUpperCase();
+    const pairingCodeHash = crypto
+      .createHash("sha256")
+      .update(pairingCode)
+      .digest("hex");
+    const expiresAt = new Date(Date.now() + 1000 * 60 * 10); // 10 minutes
+
+    const result = await pool.query(
+      `
+      INSERT INTO screens (
+        device_id,
+        name,
+        location,
+        location_branch,
+        status,
+        pairing_code,
+        pairing_code_hash,
+        pairing_expires_at,
+        pairing_status,
+        pairing_attempts,
+        token_version,
+        archived,
+        created_at,
+        updated_at
+      )
+      VALUES ($1, $2, $3, $3, 'offline', $4, $5, $6, 'pending', 0, 1, false, NOW(), NOW())
+      RETURNING
+        id,
+        device_id as "deviceId",
+        name,
+        location_branch as "locationBranch",
+        pairing_code as "pairingCode",
+        pairing_expires_at as "pairingExpiresAt",
+        api_key_last4 as "deviceKeyLast4"
+      `,
+      [deviceId, deviceName, location, pairingCode, pairingCodeHash, expiresAt],
+    );
+
+    return res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Create device error:", err);
+    return res.status(500).json({ error: "failed_to_create_device" });
+  }
+});
 
 
 
@@ -1295,28 +1337,55 @@ const existingUser = await storage.getUserByEmail(email);
 
   // Admin: rotate device token (returned once; stored hashed)
   app.post(
-    "/api/admin/screens/:id/rotate-token",
-    authenticateJWT,
-    requireRole("admin"),
-    async (req, res) => {
-      try {
-        const id = Number(req.params.id);
-        if (!Number.isFinite(id)) return res.status(400).json({ error: "invalid_id" });
-
-        const screen = await storage.getScreen(id);
-        if (!screen) return res.status(404).json({ error: "screen_not_found" });
-
-        const deviceToken = randomUUID();
-        const hash = await bcrypt.hash(deviceToken, 10);
-        await storage.updateScreen(id, { password: hash } as any);
-
-        return res.json({ ok: true, deviceToken, screenId: id, deviceId: (screen as any).deviceId || (screen as any).device_id });
-      } catch (e) {
-        console.error("rotate-token error", e);
-        return res.status(500).json({ error: "failed_to_rotate_token" });
+  "/api/admin/screens/:id/rotate-token",
+  authenticateJWT,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isFinite(id)) {
+        return res.status(400).json({ error: "invalid_id" });
       }
-    },
-  );
+
+      const screen = await storage.getScreen(id);
+      if (!screen) {
+        return res.status(404).json({ error: "screen_not_found" });
+      }
+
+      const deviceToken = randomUUID();
+      const tokenHash = crypto
+        .createHash("sha256")
+        .update(deviceToken)
+        .digest("hex");
+      const last4 = deviceToken.slice(-4);
+
+      await pool.query(
+        `
+        UPDATE screens
+        SET api_key_hash = $2,
+            api_key_last4 = $3,
+            token_version = COALESCE(token_version, 0) + 1,
+            revoked_at = NULL,
+            rotated_at = NOW(),
+            password = NULL,
+            updated_at = NOW()
+        WHERE id = $1
+        `,
+        [id, tokenHash, last4],
+      );
+
+      return res.json({
+        ok: true,
+        deviceToken,
+        screenId: id,
+        deviceId: (screen as any).deviceId || (screen as any).device_id,
+      });
+    } catch (e) {
+      console.error("rotate-token error", e);
+      return res.status(500).json({ error: "failed_to_rotate_token" });
+    }
+  },
+);
 
   // Screens Routes
 
