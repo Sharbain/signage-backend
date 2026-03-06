@@ -22,6 +22,7 @@ import multer from "multer";
 import path from "path";
 import fs from "fs";
 import express from "express";
+import { imageSize } from "image-size";
 import {
   insertScreenSchema,
   insertMediaSchema,
@@ -72,7 +73,7 @@ const multerStorage = multer.diskStorage({
 
 const upload = multer({
   storage: multerStorage,
-  limits: { fileSize: 100 * 1024 * 1024 },
+  limits: { fileSize: 500 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const allowed = /jpeg|jpg|png|gif|webp|mp4|webm|mov/;
     const ext = allowed.test(path.extname(file.originalname).toLowerCase());
@@ -94,7 +95,7 @@ const recordingStorage = multer.diskStorage({
 
 const recordingUpload = multer({
   storage: recordingStorage,
-  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB limit for recordings
+  limits: { fileSize: 500 * 1024 * 1024 }, // 100MB limit for recordings
   fileFilter: (_req, file, cb) => {
     const allowed = /mp4|webm|mov|avi|mkv/;
     const ext = allowed.test(path.extname(file.originalname).toLowerCase());
@@ -2916,23 +2917,42 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
           process.env.BASE_URL ||
           `http://localhost:${process.env.PORT || 5000}`;
         const fileUrl = `${baseUrl}/uploads/${req.file.filename}`;
-        const fileType = req.file.mimetype.startsWith("video")
-          ? "video"
-          : "image";
+        const fileType = req.file.mimetype.startsWith("video") ? "video" : "image";
+        const storagePath = path.join(uploadsDir, req.file.filename);
+
+        let width: number | null = null;
+        let height: number | null = null;
+
+        if (fileType === "image") {
+          try {
+            const dimensions = imageSize(storagePath);
+            width = dimensions.width ?? null;
+            height = dimensions.height ?? null;
+          } catch (metaErr) {
+            console.warn("Unable to read image dimensions:", metaErr);
+          }
+        }
 
         const mediaItem = await storage.createMedia({
           name: req.file.originalname,
           type: fileType,
           url: fileUrl,
+          mimeType: req.file.mimetype,
+          originalFilename: req.file.originalname,
+          storagePath: `/uploads/${req.file.filename}`,
+          width,
+          height,
           size: req.file.size,
           duration: fileType === "video" ? 30 : 10,
-        });
+          processingStatus: "ready",
+        } as any);
 
         res.status(201).json({
           message: "File uploaded",
           media: mediaItem,
         });
       } catch (error) {
+        console.error("Media upload error:", error);
         res.status(500).json({ error: "Failed to upload file" });
       }
     },
