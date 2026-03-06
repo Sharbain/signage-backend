@@ -288,7 +288,7 @@ export class DbStorage implements IStorage {
   }
 
   async getAllMedia(): Promise<Media[]> {
-    return db.select().from(media);
+    return db.select().from(media).orderBy(desc(media.uploadedAt));
   }
 
   async getMedia(id: number): Promise<Media | undefined> {
