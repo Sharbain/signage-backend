@@ -1522,8 +1522,8 @@ const existingUser = await storage.getUserByEmail(email);
   // - X-Device-Token: <token>
   //
   // Token validation supports:
-  // - screens.device_key / deviceKey (plaintext, SaaS v2)
-  // - screens.password (bcrypt hash, legacy)
+  // - screens.api_key_hash (preferred; sha256 hex, with transitional bcrypt/plaintext support)
+  // - screens.password (legacy bcrypt/plaintext fallback)
   const extractDeviceToken = (req: Request): string | null => {
     // 1) query param
     const q = (req.query?.token as string | undefined)?.trim();
@@ -1573,29 +1573,20 @@ const verifyDeviceTokenOrFail = async (
 
   // --------------------------------------------------
   // SaaS-grade auth (current schema):
-  // - screens.api_key_hash (sha256 hex OR bcrypt)
+  // - screens.api_key_hash (preferred; sha256 hex)
   // - screens.api_key_last4 for display only
-  // - screens.token_version optional
-  // Legacy auth:
-  // - screens.password (bcrypt or plaintext)
-  // Older branches:
-  // - screens.device_key / screens.deviceKey (plaintext)
+  // - screens.revoked_at / token_version optional
+  // Transitional compatibility:
+  // - api_key_hash stored as bcrypt/plaintext
+  // - legacy screens.password (bcrypt/plaintext)
+  //
+  // IMPORTANT:
+  // - This project/schema does NOT use screens.device_key.
   // --------------------------------------------------
 
   const tokenTrim = token.trim();
 
-  // 1) Plaintext key compatibility (older branches / transitional)
-  const plaintextKey =
-    (screen as any).deviceKey ??
-    (screen as any).device_key ??
-    (screen as any).device_key_plain ??
-    null;
-
-  if (typeof plaintextKey === "string" && plaintextKey.trim() && plaintextKey.trim() === tokenTrim) {
-    return { screen, token: tokenTrim };
-  }
-
-  // 2) SaaS-grade api_key_hash (preferred)
+  // 1) Preferred: api_key_hash
   const apiKeyHash =
     (screen as any).apiKeyHash ??
     (screen as any).api_key_hash ??
@@ -1604,28 +1595,58 @@ const verifyDeviceTokenOrFail = async (
   if (typeof apiKeyHash === "string" && apiKeyHash.trim()) {
     const expected = apiKeyHash.trim();
 
-    if (looksLikeBcrypt(expected)) {
-      const ok = await bcrypt.compare(tokenTrim, expected);
-      if (ok) return { screen, token: tokenTrim };
-    } else if (looksLikeSha256Hex(expected)) {
+    if (looksLikeSha256Hex(expected)) {
       const ok = sha256Hex(tokenTrim).toLowerCase() === expected.toLowerCase();
       if (ok) return { screen, token: tokenTrim };
-    } else {
-      // Unknown format; last-resort: direct equality (helps during migrations)
-      if (expected === tokenTrim) return { screen, token: tokenTrim };
+    } else if (looksLikeBcrypt(expected)) {
+      const ok = await bcrypt.compare(tokenTrim, expected);
+      if (ok) {
+        await pool.query(
+          `UPDATE screens
+           SET api_key_hash = $2,
+               api_key_last4 = $3,
+               rotated_at = NOW()
+           WHERE device_id = $1`,
+          [deviceId, sha256Hex(tokenTrim), tokenTrim.slice(-4)],
+        );
+        return { screen, token: tokenTrim };
+      }
+    } else if (expected === tokenTrim) {
+      // Transitional support if plaintext was ever stored in api_key_hash
+      await pool.query(
+        `UPDATE screens
+         SET api_key_hash = $2,
+             api_key_last4 = $3,
+             rotated_at = NOW()
+         WHERE device_id = $1`,
+        [deviceId, sha256Hex(tokenTrim), tokenTrim.slice(-4)],
+      );
+      return { screen, token: tokenTrim };
     }
   }
 
-  // 3) Legacy password fallback
+  // 2) Legacy password fallback (per-device only; no table scan)
   const password = (screen as any).password as string | null | undefined;
   if (password && typeof password === "string" && password.trim()) {
     const p = password.trim();
+    let ok = false;
+
     if (looksLikeBcrypt(p)) {
-      const ok = await bcrypt.compare(tokenTrim, p);
-      if (ok) return { screen, token: tokenTrim };
+      ok = await bcrypt.compare(tokenTrim, p);
     } else {
-      // plaintext legacy (rare)
-      if (p === tokenTrim) return { screen, token: tokenTrim };
+      ok = p === tokenTrim;
+    }
+
+    if (ok) {
+      await pool.query(
+        `UPDATE screens
+         SET api_key_hash = COALESCE(api_key_hash, $2),
+             api_key_last4 = $3,
+             rotated_at = NOW()
+         WHERE device_id = $1`,
+        [deviceId, sha256Hex(tokenTrim), tokenTrim.slice(-4)],
+      );
+      return { screen, token: tokenTrim };
     }
   }
 
