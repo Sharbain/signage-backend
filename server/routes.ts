@@ -402,6 +402,8 @@ export async function registerRoutes(
     // Device claim (pairing) should not require user JWT
     if (p === "/device/claim") return next();
     if (p.startsWith("/device/")) return next();
+    // Device progress updates for publish jobs use device token auth
+    if (/^\/publish-jobs\/[^\/]+$/.test(p) && req.method === "PATCH") return next();
     return authenticateJWT(req, res, next);
   });
 
@@ -2102,6 +2104,54 @@ app.post(
     }
 
     try {
+      // For play_content, ensure there is a publish job and attach its id to the command payload.
+      if (payload?.type === "play_content") {
+        const screenResult = await pool.query(
+          `SELECT name FROM screens WHERE device_id = $1 LIMIT 1`,
+          [deviceId],
+        );
+
+        const deviceName =
+          String(raw?.deviceName || screenResult.rows[0]?.name || deviceId).trim() || deviceId;
+
+        const totalBytesRaw = raw?.totalBytes ?? raw?.size ?? raw?.contentSize ?? null;
+        const totalBytes =
+          totalBytesRaw == null || totalBytesRaw === ""
+            ? null
+            : Number.isFinite(Number(totalBytesRaw))
+              ? Number(totalBytesRaw)
+              : null;
+
+        if (!payload.publishJobId) {
+          const publishJob = await pool.query(
+            `
+            INSERT INTO publish_jobs (
+              device_id,
+              device_name,
+              content_type,
+              content_id,
+              content_name,
+              total_bytes,
+              status,
+              progress
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0)
+            RETURNING id, started_at
+            `,
+            [
+              deviceId,
+              deviceName,
+              String(payload.contentType || raw?.contentType || "media"),
+              payload.contentId ?? raw?.contentId ?? null,
+              String(payload.contentName || raw?.contentName || payload.type || "content"),
+              totalBytes,
+            ],
+          );
+
+          payload.publishJobId = String(publishJob.rows[0].id);
+        }
+      }
+
       const result = await pool.query(
         `
         INSERT INTO device_commands (device_id, payload, sent, executed)
@@ -2116,6 +2166,7 @@ app.post(
         success: true,
         commandId: command.id,
         createdAt: command.created_at,
+        publishJobId: payload?.publishJobId ?? null,
         queued: payload,
       });
     } catch (err) {
@@ -5571,7 +5622,86 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
     }
   });
 
-  app.patch("/api/publish-jobs/:id", async (req, res) => {
+
+  // One-shot publish: create publish job and queue play_content command together
+  app.post("/api/publish-jobs/queue", authenticateJWT, requireRole("admin", "manager"), async (req, res) => {
+    try {
+      const {
+        deviceId,
+        deviceName,
+        contentType,
+        contentId,
+        contentName,
+        contentUrl,
+        totalBytes,
+      } = req.body;
+
+      if (!deviceId || !contentName || !contentUrl) {
+        return res.status(400).json({ error: "deviceId, contentName, and contentUrl are required" });
+      }
+
+      const screenResult = await pool.query(
+        `SELECT name FROM screens WHERE device_id = $1 LIMIT 1`,
+        [deviceId],
+      );
+
+      const resolvedDeviceName =
+        String(deviceName || screenResult.rows[0]?.name || deviceId).trim() || deviceId;
+
+      const publishJob = await pool.query(
+        `INSERT INTO publish_jobs (
+            device_id,
+            device_name,
+            content_type,
+            content_id,
+            content_name,
+            total_bytes,
+            status,
+            progress
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0)
+         RETURNING id, device_id as "deviceId", device_name as "deviceName", content_type as "contentType",
+                   content_id as "contentId", content_name as "contentName", status, progress,
+                   total_bytes as "totalBytes", started_at as "startedAt"`,
+        [
+          deviceId,
+          resolvedDeviceName,
+          contentType || "media",
+          contentId ?? null,
+          contentName,
+          totalBytes ?? null,
+        ]
+      );
+
+      const payload = {
+        type: "play_content",
+        contentId: contentId ?? null,
+        contentName,
+        contentUrl,
+        contentType: contentType || "media",
+        publishJobId: String(publishJob.rows[0].id),
+      };
+
+      const command = await pool.query(
+        `INSERT INTO device_commands (device_id, payload, sent, executed)
+         VALUES ($1, $2, false, false)
+         RETURNING id, created_at`,
+        [deviceId, JSON.stringify(payload)]
+      );
+
+      return res.status(201).json({
+        success: true,
+        publishJob: publishJob.rows[0],
+        commandId: command.rows[0].id,
+        queued: payload,
+      });
+    } catch (err) {
+      console.error("Queue publish job error:", err);
+      return res.status(500).json({ error: "Failed to queue publish job" });
+    }
+  });
+
+  app.patch("/api/publish-jobs/:id", authenticateUserOrDevice, async (req, res) => {
     try {
       const { id } = req.params;
       const { status, progress, downloadedBytes, errorMessage } = req.body;
@@ -5607,6 +5737,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
       if (status === "completed" || status === "failed") {
         updates.push(`completed_at = NOW()`);
       }
+      updates.push(`updated_at = NOW()`);
       
       if (updates.length === 0) {
         return res.status(400).json({ error: "No updates provided" });
