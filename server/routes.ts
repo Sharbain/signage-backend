@@ -475,6 +475,7 @@ app.post("/api/devices/pair", handleDeviceActivate);
           location AS location_branch,
           is_online
         FROM screens
+        WHERE COALESCE(archived, false) = false
         ORDER BY id DESC
         LIMIT 10
       `);
@@ -511,6 +512,7 @@ app.post("/api/devices/pair", handleDeviceActivate);
           dgm.group_id
         FROM screens s
         LEFT JOIN device_group_map dgm ON s.device_id = dgm.device_id
+        WHERE COALESCE(s.archived, false) = false
         ORDER BY s.device_id, s.name ASC
       `;
 
@@ -539,7 +541,12 @@ app.post("/api/devices/pair", handleDeviceActivate);
         await client.query("BEGIN");
 
         const screenResult = await client.query(
-          `SELECT id, device_id FROM screens WHERE device_id = $1 LIMIT 1`,
+          `
+          SELECT id, device_id, name
+          FROM screens
+          WHERE device_id = $1
+          LIMIT 1
+          `,
           [deviceId],
         );
 
@@ -548,13 +555,14 @@ app.post("/api/devices/pair", handleDeviceActivate);
           return res.status(404).json({ error: "device_not_found" });
         }
 
-        const screenId = screenResult.rows[0].id;
+        const screen = screenResult.rows[0];
+        const screenId = screen.id;
 
         const safeDelete = async (sql: string, params: any[]) => {
           try {
             await client.query(sql, params);
           } catch (cleanupErr) {
-            console.warn("device delete cleanup skipped:", sql, cleanupErr);
+            console.warn("device archive cleanup skipped:", sql, cleanupErr);
           }
         };
 
@@ -570,28 +578,44 @@ app.post("/api/devices/pair", handleDeviceActivate);
         await safeDelete(`DELETE FROM publish_jobs WHERE device_id = $1`, [deviceId]);
         await safeDelete(`DELETE FROM publish_jobs WHERE screen_id = $1`, [screenId]);
 
-        const deleteScreen = await client.query(
-          `DELETE FROM screens WHERE device_id = $1 RETURNING id, device_id, name`,
+        const archiveScreen = await client.query(
+          `
+          UPDATE screens
+          SET
+            archived = true,
+            status = 'offline',
+            is_online = false,
+            updated_at = NOW()
+          WHERE device_id = $1
+          RETURNING id, device_id, name, archived
+          `,
           [deviceId],
         );
 
         await client.query("COMMIT");
 
-        delete pendingCommands[deviceId];
-        delete playlists[deviceId];
-        delete zonePlaylists[deviceId];
-        delete zoneRSSFeeds[deviceId];
-        delete socialZoneConfig[deviceId];
-        delete deviceTemplates[deviceId];
+        if (typeof pendingCommands !== "undefined") delete pendingCommands[deviceId];
+        if (typeof playlists !== "undefined") delete playlists[deviceId];
+        if (typeof zonePlaylists !== "undefined") delete zonePlaylists[deviceId];
+        if (typeof zoneRSSFeeds !== "undefined") delete zoneRSSFeeds[deviceId];
+        if (typeof socialZoneConfig !== "undefined") delete socialZoneConfig[deviceId];
+        if (typeof deviceTemplates !== "undefined") delete deviceTemplates[deviceId];
 
         return res.json({
           success: true,
-          removed: deleteScreen.rows[0] || { id: screenId, device_id: deviceId },
+          archived: true,
+          removed:
+            archiveScreen.rows[0] || {
+              id: screenId,
+              device_id: deviceId,
+              name: screen.name,
+              archived: true,
+            },
         });
       } catch (err) {
         await client.query("ROLLBACK");
-        console.error("ADMIN DEVICE DELETE ERROR:", err);
-        return res.status(500).json({ error: "failed_to_delete_device" });
+        console.error("ADMIN DEVICE ARCHIVE ERROR:", err);
+        return res.status(500).json({ error: "failed_to_archive_device" });
       } finally {
         client.release();
       }
@@ -940,6 +964,7 @@ app.get("/api/devices/:id", async (req, res) => {
         SELECT name, device_id
         FROM screens
         WHERE is_online = false
+          AND COALESCE(archived, false) = false
         ORDER BY last_seen DESC
         LIMIT 10
       `);
@@ -2756,7 +2781,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
   app.get("/api/screens", async (_req, res) => {
     try {
       const allScreens = await storage.getAllScreens();
-      res.json(allScreens);
+      res.json(allScreens.filter((s: any) => !s.archived));
     } catch (error) {
       res.status(500).json({ error: "Failed to fetch screens" });
     }
