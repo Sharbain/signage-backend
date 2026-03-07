@@ -74,11 +74,23 @@ const upload = multer({
   storage: multerStorage,
   limits: { fileSize: 500 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    const allowed = /jpeg|jpg|png|gif|webp|mp4|webm|mov/;
-    const ext = allowed.test(path.extname(file.originalname).toLowerCase());
-    const mime = allowed.test(file.mimetype);
-    if (ext && mime) cb(null, true);
-    else cb(new Error("Only image/video files allowed"));
+    const allowedExts = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".webm", ".mov"]);
+    const allowedMimes = new Set([
+      "image/jpeg",
+      "image/jpg",
+      "image/png",
+      "image/gif",
+      "image/webp",
+      "video/mp4",
+      "video/webm",
+      "video/quicktime",
+    ]);
+
+    const ext = path.extname(file.originalname).toLowerCase();
+    const mime = String(file.mimetype || "").toLowerCase();
+
+    if (allowedExts.has(ext) && allowedMimes.has(mime)) cb(null, true);
+    else cb(new Error("Only JPG/JPEG/PNG/GIF/WebP/MP4/WebM/MOV files allowed"));
   },
 });
 
@@ -227,11 +239,63 @@ function getPublicBaseUrl(req: Request): string {
   return `http://localhost:${process.env.PORT || 5000}`;
 }
 
+function isProtectedUploadPath(raw: string): boolean {
+  return /^\/?uploads\/(screenshots|recordings|group-icons|device-thumbnails|clients)\//i.test(raw);
+}
+
+function toPublicMediaPath(value: string | null | undefined): string | null {
+  if (!value) return null;
+
+  const raw = String(value).trim();
+  if (!raw) return null;
+
+  if (/^https?:\/\//i.test(raw)) {
+    try {
+      const u = new URL(raw);
+      const p = u.pathname || "";
+      if (/^\/media\//i.test(p)) return `/media/${path.basename(p)}`;
+      if (/^\/uploads\//i.test(p) && !isProtectedUploadPath(p)) return `/media/${path.basename(p)}`;
+      return raw;
+    } catch {
+      return raw;
+    }
+  }
+
+  if (/^\/?media\//i.test(raw)) {
+    return `/media/${path.basename(raw)}`;
+  }
+
+  if (/^\/?uploads\//i.test(raw) && !isProtectedUploadPath(raw)) {
+    return `/media/${path.basename(raw)}`;
+  }
+
+  if (/^uploads\//i.test(raw) && !isProtectedUploadPath(`/${raw}`)) {
+    return `/media/${path.basename(raw)}`;
+  }
+
+  return raw;
+}
+
+function toAbsoluteMediaUrl(req: Request, value: string | null | undefined): string | null {
+  const normalized = toPublicMediaPath(value);
+  if (!normalized) return null;
+  const base = getPublicBaseUrl(req);
+  if (/^https?:\/\//i.test(normalized)) return normalized.replace(/^http:\/\/localhost:\d+/i, base);
+  if (normalized.startsWith("/")) return `${base}${normalized}`;
+  return `${base}/${normalized.replace(/^\/+/, "")}`;
+}
+
+
 function absolutizeAssetUrl(req: Request, value: string | null | undefined): string | null {
   if (!value) return null;
 
   const raw = String(value).trim();
   if (!raw) return null;
+
+  const mediaUrl = toAbsoluteMediaUrl(req, raw);
+  if (mediaUrl && mediaUrl !== raw) {
+    return mediaUrl;
+  }
 
   const base = getPublicBaseUrl(req);
 
@@ -368,6 +432,36 @@ export async function registerRoutes(
   // --------------------------------------------------
   registerAuthRoutes(app);
   registerDeviceRoutes(app);
+
+  // --------------------------------------------------
+  // PUBLIC MEDIA DELIVERY
+  // - CMS previews must load without auth headers
+  // - Android devices must be able to download published media
+  // - Only generic media files are public here
+  // --------------------------------------------------
+  app.get("/media/:file", (req, res) => {
+    try {
+      const requested = String(req.params.file || "").trim();
+      const safeFile = path.basename(requested);
+
+      if (!safeFile) {
+        return res.status(400).json({ error: "missing_media_file" });
+      }
+
+      const filePath = path.join(uploadsDir, safeFile);
+
+      if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+        return res.status(404).json({ error: "media_not_found" });
+      }
+
+      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      return res.sendFile(filePath);
+    } catch (err) {
+      console.error("MEDIA SERVE ERROR:", err);
+      return res.status(500).json({ error: "media_serve_failed" });
+    }
+  });
 
   // --------------------------------------------------
   // Protect uploads (no public filesystem exposure)
@@ -2087,7 +2181,7 @@ app.post(
             type: "play_content",
             contentId,
             contentName,
-            contentUrl,
+            contentUrl: toAbsoluteMediaUrl(req, contentUrl) || absolutizeAssetUrl(req, contentUrl) || contentUrl,
             contentType,
           };
           break;
@@ -2104,6 +2198,13 @@ app.post(
     }
 
     try {
+      if (payload?.type === "play_content" && payload?.contentUrl) {
+        payload.contentUrl =
+          toAbsoluteMediaUrl(req, payload.contentUrl) ||
+          absolutizeAssetUrl(req, payload.contentUrl) ||
+          payload.contentUrl;
+      }
+
       // For play_content, ensure there is a publish job and attach its id to the command payload.
       if (payload?.type === "play_content") {
         const screenResult = await pool.query(
@@ -3180,7 +3281,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         }
 
         const baseUrl = getPublicBaseUrl(req);
-        const fileUrl = `${baseUrl}/uploads/${req.file.filename}`;
+        const fileUrl = `${baseUrl}/media/${req.file.filename}`;
         const fileType = req.file.mimetype.startsWith("video")
           ? "video"
           : "image";
@@ -4247,7 +4348,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
             type: "PLAY_CONTENT",
             contentId,
             contentName,
-            contentUrl,
+            contentUrl: toAbsoluteMediaUrl(req, contentUrl) || absolutizeAssetUrl(req, contentUrl) || contentUrl,
             contentType,
           })]
         );
@@ -5734,11 +5835,16 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         ]
       );
 
+      const normalizedContentUrl =
+        toAbsoluteMediaUrl(req, contentUrl) ||
+        absolutizeAssetUrl(req, contentUrl) ||
+        contentUrl;
+
       const payload = {
         type: "play_content",
         contentId: contentId ?? null,
         contentName,
-        contentUrl,
+        contentUrl: normalizedContentUrl,
         contentType: contentType || "media",
         publishJobId: String(publishJob.rows[0].id),
       };
