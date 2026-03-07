@@ -1236,7 +1236,7 @@ app.get("/api/dashboard/live-content", authenticateJWT, async (_req, res) => {
 // - device_commands.device_id is TEXT like "DEV-XXXX"
 // - device_commands.id is INTEGER
 // =====================================================
-app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) => {
+const handleDeviceGetCommands = async (req: Request, res: Response) => {
   const deviceId = String(req.params.deviceId || "").trim();
   if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
 
@@ -1286,7 +1286,74 @@ app.get("/api/device/:deviceId/commands", authenticateDevice, async (req, res) =
     // ✅ Device resilience: return [] so player doesn't crash
     return res.json([]);
   }
-});
+};
+
+app.get("/api/device/:deviceId/commands", authenticateDevice, handleDeviceGetCommands);
+app.get("/api/devices/:deviceId/commands", authenticateDevice, handleDeviceGetCommands);
+
+const handleDeviceAckCommand = async (req: Request, res: Response) => {
+  const deviceId = String(req.params.deviceId || "").trim();
+  const commandId = Number(req.params.commandId);
+
+  if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
+  if (!Number.isFinite(commandId)) return res.status(400).json({ error: "invalid_command_id" });
+
+  try {
+    const result = await pool.query(
+      `
+      UPDATE device_commands
+      SET
+        executed = true,
+        executed_at = NOW()
+      WHERE id = $1
+        AND device_id = $2
+      RETURNING id, payload
+      `,
+      [commandId, deviceId],
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "command_not_found" });
+    }
+
+    let payload: any = result.rows[0].payload;
+    try {
+      if (typeof payload === "string") payload = JSON.parse(payload);
+    } catch {
+      // ignore
+    }
+
+    const publishJobId = String(
+      payload?.publishJobId ??
+      payload?.publish_job_id ??
+      "",
+    ).trim();
+
+    if (publishJobId) {
+      await pool.query(
+        `
+        UPDATE publish_jobs
+        SET
+          status = 'completed',
+          progress = 100,
+          downloaded_bytes = COALESCE(total_bytes, downloaded_bytes),
+          completed_at = NOW(),
+          updated_at = NOW()
+        WHERE id = $1::int
+        `,
+        [publishJobId],
+      );
+    }
+
+    return res.json({ success: true, commandId });
+  } catch (err) {
+    console.error("Command ACK error:", err);
+    return res.status(500).json({ error: "failed_to_ack_command" });
+  }
+};
+
+app.post("/api/device/:deviceId/commands/:commandId/ack", authenticateDevice, handleDeviceAckCommand);
+app.post("/api/devices/:deviceId/commands/:commandId/ack", authenticateDevice, handleDeviceAckCommand);
 
   
 
@@ -1869,7 +1936,10 @@ const verifyDeviceTokenOrFail = async (
 
   app.get("/api/screens/:deviceId/playlist", async (req, res) => {
     try {
-      const { deviceId } = req.params;
+      const deviceId = String(req.params.deviceId || "").trim();
+      if (!deviceId) {
+        return res.status(400).json({ error: "missing_device_id" });
+      }
 
       // 🔐 Validate device token (flexible token sources, supports legacy + SaaS v2)
       const verified = await verifyDeviceTokenOrFail(req, res, deviceId);
@@ -1883,16 +1953,90 @@ const verifyDeviceTokenOrFail = async (
         status: "online",
       });
 
-      // TODO (A1+): Replace this “all media” fallback with assigned playlist(s)
-      // based on playlist_assignments / content_playlists etc.
-      const allMedia = await storage.getAllMedia();
-      const playlist = allMedia.map((item) =>
+      // Keep direct DB heartbeat fields aligned as well
+      await pool.query(
+        `
+        UPDATE screens
+        SET
+          last_seen = NOW(),
+          last_seen_at = NOW(),
+          is_online = TRUE,
+          status = 'online',
+          updated_at = NOW()
+        WHERE device_id = $1
+        `,
+        [deviceId],
+      );
+
+      // --------------------------------------------------
+      // Resolve most recent assigned playlist for this device
+      // --------------------------------------------------
+      const assignmentResult = await pool.query(
+        `
+        SELECT
+          pa.playlist_id,
+          pa.assigned_at,
+          cp.name AS playlist_name,
+          cp.description AS playlist_description
+        FROM playlist_assignments pa
+        JOIN content_playlists cp ON cp.id = pa.playlist_id
+        WHERE pa.device_id = $1
+        ORDER BY pa.assigned_at DESC, pa.id DESC
+        LIMIT 1
+        `,
+        [deviceId],
+      );
+
+      if (assignmentResult.rowCount === 0) {
+        return res.json({
+          screen: {
+            id: screen.id,
+            deviceId: screen.deviceId,
+            name: screen.name,
+            resolution: screen.resolution,
+          },
+          playlist: [],
+          assignment: null,
+          refreshInterval: 300,
+        });
+      }
+
+      const assignment = assignmentResult.rows[0];
+      const playlistId = Number(assignment.playlist_id);
+
+      const itemsResult = await pool.query(
+        `
+        SELECT
+          pi.id AS item_id,
+          pi.playlist_id,
+          pi.media_id,
+          pi.position,
+          COALESCE(pi.duration, 10) AS duration,
+          COALESCE(pi.volume, 100) AS volume,
+          m.id,
+          m.name,
+          m.type,
+          m.url
+        FROM playlist_items pi
+        JOIN media m ON m.id = pi.media_id
+        WHERE pi.playlist_id = $1
+        ORDER BY pi.position ASC, pi.id ASC
+        `,
+        [playlistId],
+      );
+
+      const playlist = itemsResult.rows.map((row: any) =>
         normalizeMediaRow(req, {
-          id: item.id,
-          type: item.type,
-          url: item.url,
-          name: item.name,
-          duration: item.duration || 10,
+          id: row.id,
+          itemId: row.item_id,
+          mediaId: row.media_id,
+          playlistId: row.playlist_id,
+          position: row.position,
+          duration: row.duration,
+          volume: row.volume,
+          type: row.type,
+          url: row.url,
+          name: row.name,
         }),
       );
 
@@ -1903,8 +2047,14 @@ const verifyDeviceTokenOrFail = async (
           name: screen.name,
           resolution: screen.resolution,
         },
+        assignment: {
+          playlistId,
+          playlistName: assignment.playlist_name,
+          playlistDescription: assignment.playlist_description,
+          assignedAt: assignment.assigned_at,
+        },
         playlist,
-        refreshInterval: 300, // seconds until next playlist check
+        refreshInterval: 300,
       });
     } catch (error) {
       console.error("playlist fetch error:", error);
