@@ -67,6 +67,10 @@ for (const o of extraMedia) mediaOrigins.add(o);
 
 app.use(
   helmet({
+    // Allow the Vercel CMS frontend to load backend-served images/videos/thumbnails.
+    // Without this, browser requests for media from a different origin can be blocked
+    // with ERR_BLOCKED_BY_RESPONSE.NotSameOrigin.
+    crossOriginResourcePolicy: false,
     contentSecurityPolicy: {
       useDefaults: true,
       directives: {
