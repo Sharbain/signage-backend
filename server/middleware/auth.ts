@@ -7,11 +7,20 @@ import { pool } from "../db";
 // NOTE:
 // - User auth: Authorization: Bearer <jwt>
 // - Device auth supports:
-//   - ?token=<deviceKey>
+//   - ?token=<device token>
 //   - Authorization: Device <token>
 //   - Authorization: DeviceToken <token>
 //   - Authorization: Bearer <token>   (device endpoints only)
 //   - X-Device-Token: <token>
+//
+// SaaS-grade device auth model:
+// - Preferred: screens.api_key_hash (sha256 hex; indexed lookup)
+// - Transitional compatibility: screens.api_key_hash stored as bcrypt/plaintext
+// - Legacy fallback by device_id only: screens.password (bcrypt/plaintext)
+//
+// IMPORTANT:
+// - This backend/schema does NOT use screens.device_key.
+// - Do not query screens.device_key anywhere in this middleware.
 
 if (!process.env.JWT_SECRET) {
   throw new Error("JWT_SECRET environment variable must be set");
@@ -41,7 +50,7 @@ function getAuthHeader(req: Request): string | undefined {
 }
 
 function sha256Hex(input: string): string {
-  return crypto.createHash("sha256").update(input).digest("hex");
+  return crypto.createHash("sha256").update(input, "utf8").digest("hex");
 }
 
 function getFullPath(req: Request) {
@@ -109,6 +118,17 @@ function looksLikeBcrypt(value: string) {
   return value.startsWith("$2a$") || value.startsWith("$2b$") || value.startsWith("$2y$");
 }
 
+function looksLikeSha256Hex(value: string) {
+  return /^[0-9a-f]{64}$/i.test(value);
+}
+
+/**
+ * USER JWT AUTH (dashboard/admin)
+ *
+ * IMPORTANT:
+ * Some projects mount authenticateJWT on "/api" globally.
+ * We must bypass device/player APIs so they can use authenticateDevice.
+ */
 export async function authenticateJWT(req: Request, res: Response, next: NextFunction) {
   if (isDeviceOrPlayerPath(req)) return next();
 
@@ -142,13 +162,13 @@ export async function authenticateJWT(req: Request, res: Response, next: NextFun
 /**
  * DEVICE AUTH
  *
- * Current schema supported:
- * - screens.api_key_hash (preferred; sha256 hex or bcrypt)
- * - screens.password (legacy bcrypt/plaintext fallback)
+ * Fast path:
+ * - find the device by device_id
+ * - verify token against api_key_hash (preferred)
  *
- * IMPORTANT:
- * - This project does NOT have screens.device_key in DB.
- * - Do not query or rely on device_key here.
+ * Transitional compatibility:
+ * - if api_key_hash is bcrypt/plaintext, still accept and backfill sha256 hash
+ * - if password exists, verify only for this device (NO table scan), then backfill api_key_hash
  */
 export async function authenticateDevice(req: Request, res: Response, next: NextFunction) {
   const deviceId = readDeviceId(req);
@@ -185,22 +205,28 @@ export async function authenticateDevice(req: Request, res: Response, next: Next
     if (screen.api_key_hash && typeof screen.api_key_hash === "string") {
       const stored = screen.api_key_hash.trim();
 
-      // sha256-hex direct compare
-      if (/^[0-9a-f]{64}$/i.test(stored) && stored.toLowerCase() === tokenHash.toLowerCase()) {
+      if (looksLikeSha256Hex(stored) && stored.toLowerCase() === tokenHash.toLowerCase()) {
         req.device = { deviceId: screen.device_id, screenId: screen.id };
         return next();
       }
 
-      // bcrypt compare, if some rows were stored that way
       if (looksLikeBcrypt(stored)) {
         const ok = await bcrypt.compare(deviceToken, stored);
         if (ok) {
+          await pool.query(
+            `UPDATE screens
+             SET api_key_hash = $2,
+                 api_key_last4 = $3,
+                 rotated_at = NOW()
+             WHERE id = $1`,
+            [screen.id, tokenHash, deviceToken.slice(-4)],
+          );
           req.device = { deviceId: screen.device_id, screenId: screen.id };
           return next();
         }
       }
 
-      // very last-resort migration support: direct plaintext equality
+      // Transitional support if some rows accidentally stored plaintext in api_key_hash
       if (stored === deviceToken) {
         await pool.query(
           `UPDATE screens
@@ -210,14 +236,13 @@ export async function authenticateDevice(req: Request, res: Response, next: Next
            WHERE id = $1`,
           [screen.id, tokenHash, deviceToken.slice(-4)],
         );
-
         req.device = { deviceId: screen.device_id, screenId: screen.id };
         return next();
       }
     }
 
-    // 2) Legacy password fallback
-    if (screen.password && typeof screen.password === "string") {
+    // 2) Legacy per-device password fallback (NO full-table scan)
+    if (screen.password && typeof screen.password === "string" && screen.password.trim()) {
       const storedPassword = screen.password.trim();
 
       let ok = false;
@@ -236,7 +261,6 @@ export async function authenticateDevice(req: Request, res: Response, next: Next
            WHERE id = $1`,
           [screen.id, tokenHash, deviceToken.slice(-4)],
         );
-
         req.device = { deviceId: screen.device_id, screenId: screen.id };
         return next();
       }
@@ -253,6 +277,11 @@ export async function authenticateDevice(req: Request, res: Response, next: Next
  * USER OR DEVICE AUTH
  * - Bearer -> authenticateJWT
  * - Device token (any scheme) -> auth without requiring deviceId param
+ *
+ * SaaS-grade behavior:
+ * - indexed exact lookup by api_key_hash first
+ * - bounded compatibility scan only for transitional rows where api_key_hash
+ *   was stored as bcrypt/plaintext, or legacy password still holds the token
  */
 export async function authenticateUserOrDevice(req: Request, res: Response, next: NextFunction) {
   const auth = getAuthHeader(req);
@@ -265,9 +294,9 @@ export async function authenticateUserOrDevice(req: Request, res: Response, next
   try {
     const tokenHash = sha256Hex(deviceToken);
 
-    // 1) Fast path: api_key_hash exact sha256 match
+    // 1) Preferred exact indexed lookup
     const fast = await pool.query(
-      `SELECT id, device_id, api_key_hash, password, revoked_at
+      `SELECT id, device_id, revoked_at
        FROM screens
        WHERE api_key_hash = $1
        LIMIT 1`,
@@ -275,25 +304,18 @@ export async function authenticateUserOrDevice(req: Request, res: Response, next
     );
 
     if (fast.rows.length) {
-      const screen = fast.rows[0] as {
-        id: number;
-        device_id: string;
-        api_key_hash: string | null;
-        password: string | null;
-        revoked_at: string | null;
-      };
-
+      const screen = fast.rows[0] as { id: number; device_id: string; revoked_at: string | null };
       if (screen.revoked_at) return res.status(401).json({ error: "device_revoked" });
       req.device = { deviceId: screen.device_id, screenId: screen.id };
       return next();
     }
 
-    // 2) Compatibility scan for rows where api_key_hash may be bcrypt/plaintext,
-    //    or legacy password still holds the token.
+    // 2) Compatibility mode for transitional rows only
     const { rows } = await pool.query(
       `SELECT id, device_id, api_key_hash, password, revoked_at
        FROM screens
-       WHERE api_key_hash IS NOT NULL OR password IS NOT NULL
+       WHERE (api_key_hash IS NOT NULL OR password IS NOT NULL)
+         AND (api_key_hash IS NULL OR api_key_hash !~ '^[0-9a-f]{64}$')
        LIMIT 500`,
     );
 
@@ -306,16 +328,10 @@ export async function authenticateUserOrDevice(req: Request, res: Response, next
     }>) {
       if (r.revoked_at) continue;
 
-      // api_key_hash as bcrypt/plaintext compatibility
       if (r.api_key_hash) {
         const stored = r.api_key_hash.trim();
 
-        if (looksLikeBcrypt(stored)) {
-          if (await bcrypt.compare(deviceToken, stored)) {
-            req.device = { deviceId: r.device_id, screenId: r.id };
-            return next();
-          }
-        } else if (stored === deviceToken) {
+        if (looksLikeBcrypt(stored) && await bcrypt.compare(deviceToken, stored)) {
           await pool.query(
             `UPDATE screens
              SET api_key_hash = $2,
@@ -324,13 +340,24 @@ export async function authenticateUserOrDevice(req: Request, res: Response, next
              WHERE id = $1`,
             [r.id, tokenHash, deviceToken.slice(-4)],
           );
+          req.device = { deviceId: r.device_id, screenId: r.id };
+          return next();
+        }
 
+        if (stored === deviceToken) {
+          await pool.query(
+            `UPDATE screens
+             SET api_key_hash = $2,
+                 api_key_last4 = $3,
+                 rotated_at = NOW()
+             WHERE id = $1`,
+            [r.id, tokenHash, deviceToken.slice(-4)],
+          );
           req.device = { deviceId: r.device_id, screenId: r.id };
           return next();
         }
       }
 
-      // legacy password fallback
       if (r.password) {
         const storedPassword = r.password.trim();
         let ok = false;
@@ -350,7 +377,6 @@ export async function authenticateUserOrDevice(req: Request, res: Response, next
              WHERE id = $1`,
             [r.id, tokenHash, deviceToken.slice(-4)],
           );
-
           req.device = { deviceId: r.device_id, screenId: r.id };
           return next();
         }
