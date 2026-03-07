@@ -189,6 +189,98 @@ if (!process.env.JWT_SECRET) {
 }
 const JWT_SECRET = process.env.JWT_SECRET;
 
+function trimTrailingSlash(value: string) {
+  return value.replace(/\/+$/, "");
+}
+
+function getPublicBaseUrl(req: Request): string {
+  const configured = String(
+    process.env.PUBLIC_BASE_URL || process.env.BASE_URL || "",
+  ).trim();
+
+  const host =
+    (String(req.headers["x-forwarded-host"] || "").split(",")[0] || "").trim() ||
+    (req.get("host") || "").trim();
+
+  const forwardedProto =
+    (String(req.headers["x-forwarded-proto"] || "").split(",")[0] || "").trim() ||
+    "";
+
+  const looksLocal = (v: string) =>
+    /localhost|127\.0\.0\.1/i.test(v);
+
+  if (configured && !looksLocal(configured)) {
+    return trimTrailingSlash(configured);
+  }
+
+  if (host) {
+    const proto =
+      forwardedProto ||
+      (host.includes("onrender.com") || host.includes("vercel.app") ? "https" : req.protocol || "http");
+    return trimTrailingSlash(`${proto}://${host}`);
+  }
+
+  if (configured) {
+    return trimTrailingSlash(configured);
+  }
+
+  return `http://localhost:${process.env.PORT || 5000}`;
+}
+
+function absolutizeAssetUrl(req: Request, value: string | null | undefined): string | null {
+  if (!value) return null;
+
+  const raw = String(value).trim();
+  if (!raw) return null;
+
+  const base = getPublicBaseUrl(req);
+
+  if (raw.startsWith("/")) {
+    return `${base}${raw}`;
+  }
+
+  if (/^https?:\/\//i.test(raw)) {
+    return raw.replace(/^http:\/\/localhost:\d+/i, base);
+  }
+
+  if (raw.startsWith("uploads/")) {
+    return `${base}/${raw}`;
+  }
+
+  return raw;
+}
+
+function normalizeMediaRow<T extends Record<string, any>>(req: Request, row: T): T {
+  const next: T = { ...row };
+
+  if ("url" in next) {
+    next.url = absolutizeAssetUrl(req, next.url);
+  }
+
+  if ("thumbnail" in next) {
+    next.thumbnail = absolutizeAssetUrl(req, next.thumbnail);
+  }
+
+  if ("screenshot" in next) {
+    next.screenshot = absolutizeAssetUrl(req, next.screenshot);
+  }
+
+  if ("last_recording" in next) {
+    next.last_recording = absolutizeAssetUrl(req, next.last_recording);
+  }
+
+  if ("lastScreenshot" in next) {
+    next.lastScreenshot = absolutizeAssetUrl(req, next.lastScreenshot);
+  }
+
+  if ("file" in next) {
+    next.file = absolutizeAssetUrl(req, next.file);
+  }
+
+  return next;
+}
+
+
 // Simple in-memory command queue: { [deviceId]: [ { id, command, value, createdAt } ] }
 const pendingCommands: {
   [deviceId: string]: Array<{
@@ -717,9 +809,9 @@ app.get("/api/devices/:id/details", async (req, res) => {
       lastHeartbeat: device.lastHeartbeat,
       currentContentName: device.currentContentName,
       templateName: device.templateName,
-      lastScreenshot: device.screenshot,
+      lastScreenshot: absolutizeAssetUrl(req, device.screenshot),
       screenshotAt: device.screenshotAt,
-      thumbnail: device.thumbnail,
+      thumbnail: absolutizeAssetUrl(req, device.thumbnail),
       signalStrength: device.signalStrength,
       connectionType: device.connectionType || "wifi",
       freeStorage: device.freeStorage,
@@ -1153,7 +1245,7 @@ app.get(
       }
 
       return res.json({
-        file: result.rows[0].last_recording ?? null,
+        file: absolutizeAssetUrl(req, result.rows[0].last_recording ?? null),
         last_seen: result.rows[0].last_seen ?? null,
       });
     } catch (err) {
@@ -1190,7 +1282,7 @@ app.get(
       if (result.rows.length === 0) return res.status(404).json({ error: "device_not_found" });
 
       return res.json({
-        screenshot: result.rows[0].screenshot ?? null,
+        screenshot: absolutizeAssetUrl(req, result.rows[0].screenshot ?? null),
         screenshot_at: result.rows[0].screenshot_at ?? null,
       });
     } catch (err) {
@@ -1698,13 +1790,15 @@ const verifyDeviceTokenOrFail = async (
       // TODO (A1+): Replace this “all media” fallback with assigned playlist(s)
       // based on playlist_assignments / content_playlists etc.
       const allMedia = await storage.getAllMedia();
-      const playlist = allMedia.map((item) => ({
-        id: item.id,
-        type: item.type,
-        url: item.url,
-        name: item.name,
-        duration: item.duration || 10,
-      }));
+      const playlist = allMedia.map((item) =>
+        normalizeMediaRow(req, {
+          id: item.id,
+          type: item.type,
+          url: item.url,
+          name: item.name,
+          duration: item.duration || 10,
+        }),
+      );
 
       return res.json({
         screen: {
@@ -2924,7 +3018,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
           ORDER BY uploaded_at DESC
         `);
       }
-      res.json(result.rows);
+      res.json(result.rows.map((row) => normalizeMediaRow(req, row)));
     } catch (error) {
       res.status(500).json({ error: "Failed to fetch media" });
     }
@@ -2946,7 +3040,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         WHERE is_expired = true 
         ORDER BY expires_at DESC
       `);
-      res.json(result.rows);
+      res.json(result.rows.map((row) => normalizeMediaRow(req, row)));
     } catch (error) {
       res.status(500).json({ error: "Failed to fetch expired media" });
     }
@@ -3034,9 +3128,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
           return res.status(400).json({ error: "No file uploaded" });
         }
 
-        const baseUrl =
-          process.env.BASE_URL ||
-          `http://localhost:${process.env.PORT || 5000}`;
+        const baseUrl = getPublicBaseUrl(req);
         const fileUrl = `${baseUrl}/uploads/${req.file.filename}`;
         const fileType = req.file.mimetype.startsWith("video")
           ? "video"
@@ -3052,7 +3144,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
 
         res.status(201).json({
           message: "File uploaded",
-          media: mediaItem,
+          media: normalizeMediaRow(req, mediaItem as any),
         });
       } catch (error) {
         res.status(500).json({ error: "Failed to upload file" });
@@ -3104,7 +3196,14 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         GROUP BY cp.id
         ORDER BY cp.created_at DESC
       `);
-      res.json(result.rows);
+      res.json(
+        result.rows.map((row) => ({
+          ...row,
+          items: Array.isArray(row.items)
+            ? row.items.map((item: any) => normalizeMediaRow(req, item))
+            : row.items,
+        })),
+      );
     } catch (error) {
       console.error("Fetch playlists error:", error);
       res.status(500).json({ error: "Failed to fetch playlists" });
@@ -3360,13 +3459,15 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
     try {
       const allMedia = await storage.getAllMedia();
       // Return media as displayable content
-      const content = allMedia.map((item) => ({
-        id: item.id,
-        type: item.type,
-        url: item.url,
-        name: item.name,
-        duration: item.duration || 10, // default 10 seconds per slide
-      }));
+      const content = allMedia.map((item) =>
+        normalizeMediaRow(req, {
+          id: item.id,
+          type: item.type,
+          url: item.url,
+          name: item.name,
+          duration: item.duration || 10, // default 10 seconds per slide
+        }),
+      );
       res.json(content);
     } catch (error) {
       res.status(500).json({ error: "Failed to fetch content" });
@@ -3384,13 +3485,15 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
 
       // For now, return all media - later can be filtered by screen assignment
       const allMedia = await storage.getAllMedia();
-      const content = allMedia.map((item) => ({
-        id: item.id,
-        type: item.type,
-        url: item.url,
-        name: item.name,
-        duration: item.duration || 10,
-      }));
+      const content = allMedia.map((item) =>
+        normalizeMediaRow(req, {
+          id: item.id,
+          type: item.type,
+          url: item.url,
+          name: item.name,
+          duration: item.duration || 10,
+        }),
+      );
 
       res.json({
         screen: {
