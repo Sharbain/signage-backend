@@ -1285,6 +1285,34 @@ const handleDeviceGetCommands = async (req: Request, res: Response) => {
           [ids],
         );
       }
+
+      const publishJobIds: number[] = result.rows
+        .map((r: any) => {
+          try {
+            const payload = typeof r.payload === "string" ? JSON.parse(r.payload) : r.payload;
+            const raw = String(payload?.publishJobId ?? payload?.publish_job_id ?? "").trim();
+            const id = Number(raw);
+            return Number.isFinite(id) ? id : null;
+          } catch {
+            return null;
+          }
+        })
+        .filter((n: any) => Number.isFinite(n));
+
+      if (publishJobIds.length > 0) {
+        await pool.query(
+          `
+          UPDATE publish_jobs
+          SET
+            status = CASE WHEN status = 'completed' THEN status ELSE 'downloading' END,
+            progress = CASE WHEN progress >= 5 THEN progress ELSE 5 END,
+            updated_at = NOW()
+          WHERE id = ANY($1::int[])
+            AND status IN ('pending', 'downloading')
+          `,
+          [publishJobIds],
+        );
+      }
     }
 
     return res.json(
@@ -6045,6 +6073,42 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         toAbsoluteMediaUrl(req, contentUrl) ||
         absolutizeAssetUrl(req, contentUrl) ||
         contentUrl;
+
+      const duplicatePublishJob = await client.query(
+        `
+        SELECT id,
+               device_id as "deviceId",
+               device_name as "deviceName",
+               content_type as "contentType",
+               content_id as "contentId",
+               content_name as "contentName",
+               status,
+               progress,
+               total_bytes as "totalBytes",
+               downloaded_bytes as "downloadedBytes",
+               error_message as "errorMessage",
+               started_at as "startedAt",
+               completed_at as "completedAt"
+        FROM publish_jobs
+        WHERE device_id = $1
+          AND COALESCE(content_id, -1) = COALESCE($2, -1)
+          AND content_name = $3
+          AND status IN ('pending', 'downloading')
+          AND started_at > NOW() - INTERVAL '15 seconds'
+        ORDER BY started_at DESC
+        LIMIT 1
+        `,
+        [deviceId, numericContentId, contentName],
+      );
+
+      if (duplicatePublishJob.rowCount && duplicatePublishJob.rows[0]) {
+        return res.status(200).json({
+          success: true,
+          duplicate: true,
+          publishJob: duplicatePublishJob.rows[0],
+          queued: null,
+        });
+      }
 
       await client.query("BEGIN");
 
