@@ -1215,25 +1215,44 @@ app.get("/api/dashboard/live-content", authenticateJWT, async (_req, res) => {
         LIMIT 20
       `);
 
-      const commands = result.rows.map(cmd => {
-        const payload = typeof cmd.payload === 'string' ? JSON.parse(cmd.payload) : cmd.payload;
-        let status = 'queued';
+      const publishJobSyncs: Array<{ status: string; publishJobId: number }> = [];
+
+      const commands = result.rows.map((cmd) => {
+        const payload =
+          typeof cmd.payload === "string" ? JSON.parse(cmd.payload) : cmd.payload;
+        let status = "queued";
         let progress = 0;
-        
+
         if (cmd.executed) {
-          status = 'completed';
+          status = "completed";
           progress = 100;
         } else if (cmd.sent) {
-          status = 'delivering';
+          status = "delivering";
           progress = 50;
+        }
+
+        const rawPublishJobId = String(
+          payload?.publishJobId ?? payload?.publish_job_id ?? "",
+        ).trim();
+        const publishJobId = Number(rawPublishJobId);
+
+        if (Number.isFinite(publishJobId)) {
+          const publishStatus =
+            status === "queued"
+              ? "pending"
+              : status === "delivering"
+                ? "downloading"
+                : "completed";
+
+          publishJobSyncs.push({ status: publishStatus, publishJobId });
         }
 
         return {
           id: cmd.id,
           deviceId: cmd.device_id,
           deviceName: cmd.device_name || cmd.device_id,
-          type: payload.type,
-          contentName: payload.contentName || payload.type,
+          type: payload?.type,
+          contentName: payload?.contentName || payload?.type,
           status,
           progress,
           createdAt: cmd.created_at,
@@ -1241,12 +1260,42 @@ app.get("/api/dashboard/live-content", authenticateJWT, async (_req, res) => {
         };
       });
 
+      if (publishJobSyncs.length > 0) {
+        await Promise.all(
+          publishJobSyncs.map(({ status, publishJobId }) =>
+            pool.query(
+              `
+              UPDATE publish_jobs
+              SET
+                status = CASE
+                  WHEN status = 'completed' THEN status
+                  ELSE $1
+                END,
+                progress = CASE
+                  WHEN status = 'completed' THEN 100
+                  WHEN $1 = 'downloading' AND progress < 50 THEN 50
+                  ELSE progress
+                END,
+                completed_at = CASE
+                  WHEN $1 = 'completed' THEN COALESCE(completed_at, NOW())
+                  ELSE completed_at
+                END,
+                updated_at = NOW()
+              WHERE id = $2
+              `,
+              [status, publishJobId],
+            ),
+          ),
+        );
+      }
+
       res.json({ commands });
     } catch (err) {
       console.error("Active commands error:", err);
       res.status(500).json({ error: "failed_to_fetch_active_commands" });
     }
   });
+
 
 // =====================================================
 // DEVICE FETCHES ITS PENDING COMMANDS (DEVICE AUTH)
