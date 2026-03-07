@@ -488,16 +488,33 @@ export async function registerRoutes(
   // --------------------------------------------------
   app.use("/api", (req, res, next) => {
     const p = req.path;
+
+    // Public / auth endpoints
     if (p.startsWith("/auth/")) return next();
     if (p === "/ping") return next();
     if (p === "/screens/register") return next();
-    // Player (device) playlist fetch is device-authenticated (not user JWT)
+
+    // Pairing / activation must not require admin JWT
+    if (
+      p === "/device/claim" ||
+      p === "/device/activate" ||
+      p === "/devices/activate" ||
+      p === "/devices/pair"
+    ) {
+      return next();
+    }
+
+    // Player playlist fetch is device-authenticated separately
     if (/^\/screens\/[^\/]+\/playlist$/.test(p)) return next();
-    // Device claim (pairing) should not require user JWT
-    if (p === "/device/claim") return next();
+
+    // Device-token authenticated endpoints (singular + plural)
     if (p.startsWith("/device/")) return next();
+    if (/^\/devices\/[^\/]+\/(commands|heartbeat|assignment|schedule)$/.test(p)) return next();
+    if (/^\/devices\/[^\/]+\/commands\/[^\/]+\/ack$/.test(p)) return next();
+
     // Device progress updates for publish jobs use device token auth
     if (/^\/publish-jobs\/[^\/]+$/.test(p) && req.method === "PATCH") return next();
+
     return authenticateJWT(req, res, next);
   });
 
