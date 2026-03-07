@@ -5884,6 +5884,62 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
     }
   });
 
+
+  async function upsertInstantDevicePlaylist(
+    client: any,
+    deviceId: string,
+    mediaId: number,
+  ) {
+    const playlistName = `__instant__${deviceId}`;
+
+    const existingPlaylist = await client.query(
+      `
+      SELECT id
+      FROM content_playlists
+      WHERE name = $1
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [playlistName],
+    );
+
+    let playlistId: number;
+
+    if (existingPlaylist.rowCount && existingPlaylist.rows[0]?.id) {
+      playlistId = Number(existingPlaylist.rows[0].id);
+    } else {
+      const createdPlaylist = await client.query(
+        `
+        INSERT INTO content_playlists (name, description, created_at, updated_at)
+        VALUES ($1, $2, NOW(), NOW())
+        RETURNING id
+        `,
+        [playlistName, `Instant publish playlist for ${deviceId}`],
+      );
+      playlistId = Number(createdPlaylist.rows[0].id);
+    }
+
+    await client.query(`DELETE FROM playlist_items WHERE playlist_id = $1`, [playlistId]);
+
+    await client.query(
+      `
+      INSERT INTO playlist_items (playlist_id, media_id, position, duration, volume, created_at)
+      VALUES ($1, $2, 0, 10, 100, NOW())
+      `,
+      [playlistId, mediaId],
+    );
+
+    await client.query(
+      `
+      INSERT INTO playlist_assignments (playlist_id, device_id, assigned_at)
+      VALUES ($1, $2, NOW())
+      `,
+      [playlistId, deviceId],
+    );
+
+    return { playlistId, playlistName };
+  }
+
   // Publish Jobs API
   app.get("/api/publish-jobs", async (req, res) => {
     try {
@@ -5935,8 +5991,10 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
   });
 
 
-  // One-shot publish: create publish job and queue play_content command together
+  // One-shot publish: create publish job, update canonical playlist assignment,
+  // and queue a device command for immediate refresh/playback.
   app.post("/api/publish-jobs/queue", authenticateJWT, requireRole("admin", "manager"), async (req, res) => {
+    const client = await pool.connect();
     try {
       const {
         deviceId,
@@ -5952,7 +6010,13 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         return res.status(400).json({ error: "deviceId, contentName, and contentUrl are required" });
       }
 
-      const screenResult = await pool.query(
+      const normalizedContentType = String(contentType || "media").trim().toLowerCase();
+      const numericContentId =
+        contentId == null || contentId === "" || !Number.isFinite(Number(contentId))
+          ? null
+          : Number(contentId);
+
+      const screenResult = await client.query(
         `SELECT name FROM screens WHERE device_id = $1 LIMIT 1`,
         [deviceId],
       );
@@ -5960,7 +6024,14 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
       const resolvedDeviceName =
         String(deviceName || screenResult.rows[0]?.name || deviceId).trim() || deviceId;
 
-      const publishJob = await pool.query(
+      const normalizedContentUrl =
+        toAbsoluteMediaUrl(req, contentUrl) ||
+        absolutizeAssetUrl(req, contentUrl) ||
+        contentUrl;
+
+      await client.query("BEGIN");
+
+      const publishJob = await client.query(
         `INSERT INTO publish_jobs (
             device_id,
             device_name,
@@ -5978,43 +6049,57 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         [
           deviceId,
           resolvedDeviceName,
-          contentType || "media",
-          contentId ?? null,
+          normalizedContentType,
+          numericContentId,
           contentName,
           totalBytes ?? null,
         ]
       );
 
-      const normalizedContentUrl =
-        toAbsoluteMediaUrl(req, contentUrl) ||
-        absolutizeAssetUrl(req, contentUrl) ||
-        contentUrl;
+      let instantPlaylist: { playlistId: number; playlistName: string } | null = null;
+
+      if (
+        numericContentId != null &&
+        (normalizedContentType === "media" ||
+          normalizedContentType === "image" ||
+          normalizedContentType === "video")
+      ) {
+        instantPlaylist = await upsertInstantDevicePlaylist(client, deviceId, numericContentId);
+      }
 
       const payload = {
         type: "play_content",
-        contentId: contentId ?? null,
+        contentId: numericContentId,
         contentName,
         contentUrl: normalizedContentUrl,
-        contentType: contentType || "media",
+        contentType: normalizedContentType,
         publishJobId: String(publishJob.rows[0].id),
+        refreshPlaylist: true,
+        playlistId: instantPlaylist?.playlistId ?? null,
       };
 
-      const command = await pool.query(
+      const command = await client.query(
         `INSERT INTO device_commands (device_id, payload, sent, executed)
          VALUES ($1, $2, false, false)
          RETURNING id, created_at`,
         [deviceId, JSON.stringify(payload)]
       );
 
+      await client.query("COMMIT");
+
       return res.status(201).json({
         success: true,
         publishJob: publishJob.rows[0],
         commandId: command.rows[0].id,
+        instantPlaylist,
         queued: payload,
       });
     } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
       console.error("Queue publish job error:", err);
       return res.status(500).json({ error: "Failed to queue publish job" });
+    } finally {
+      client.release();
     }
   });
 
