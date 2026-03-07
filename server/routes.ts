@@ -3219,78 +3219,140 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
   // =====================================================
   // CONTENT PLAYLISTS API
   // =====================================================
-  
-  app.get("/api/content-playlists", async (_req, res) => {
+
+  app.get("/api/content-playlists", async (req, res) => {
     try {
-      const result = await pool.query(`
-        SELECT 
-          cp.*,
-          COUNT(pi.id) as item_count,
-          COALESCE(
-            json_agg(
-              json_build_object(
-                'id', m.id, 
-                'name', m.name, 
-                'type', m.type, 
-                'url', m.url,
-                'itemId', pi.id,
-                'duration', pi.duration,
-                'volume', pi.volume,
-                'position', pi.position
-              ) ORDER BY pi.position
-            ) FILTER (WHERE m.id IS NOT NULL), 
-            '[]'
-          ) as items
+      const playlistsResult = await pool.query(`
+        SELECT
+          cp.id,
+          cp.name,
+          cp.description
         FROM content_playlists cp
-        LEFT JOIN playlist_items pi ON pi.playlist_id = cp.id
-        LEFT JOIN media m ON m.id = pi.media_id
-        GROUP BY cp.id
-        ORDER BY cp.created_at DESC
+        ORDER BY cp.id DESC
       `);
-      res.json(
-        result.rows.map((row) => ({
-          ...row,
-          items: Array.isArray(row.items)
-            ? row.items.map((item: any) => normalizeMediaRow(req, item))
-            : row.items,
-        })),
-      );
+
+      const playlistIds = playlistsResult.rows
+        .map((r: any) => Number(r.id))
+        .filter((n: number) => Number.isFinite(n));
+
+      const itemsByPlaylist = new Map<number, any[]>();
+
+      if (playlistIds.length > 0) {
+        const itemsResult = await pool.query(
+          `
+          SELECT
+            pi.id AS "itemId",
+            pi.playlist_id,
+            pi.media_id,
+            pi.duration,
+            pi.volume,
+            pi.position,
+            m.id,
+            m.name,
+            m.type,
+            m.url
+          FROM playlist_items pi
+          LEFT JOIN media m ON m.id = pi.media_id
+          WHERE pi.playlist_id = ANY($1::int[])
+          ORDER BY pi.playlist_id ASC, pi.position ASC, pi.id ASC
+          `,
+          [playlistIds]
+        );
+
+        for (const row of itemsResult.rows) {
+          const playlistId = Number(row.playlist_id);
+          const current = itemsByPlaylist.get(playlistId) || [];
+
+          current.push(
+            normalizeMediaRow(req, {
+              id: row.id,
+              name: row.name,
+              type: row.type,
+              url: row.url,
+              itemId: row.itemId,
+              duration: row.duration,
+              volume: row.volume,
+              position: row.position,
+            })
+          );
+
+          itemsByPlaylist.set(playlistId, current);
+        }
+      }
+
+      const payload = playlistsResult.rows.map((playlist: any) => {
+        const items = itemsByPlaylist.get(Number(playlist.id)) || [];
+        return {
+          id: playlist.id,
+          name: playlist.name,
+          description: playlist.description,
+          item_count: items.length,
+          items,
+        };
+      });
+
+      return res.json(payload);
     } catch (error) {
       console.error("Fetch playlists error:", error);
-      res.status(500).json({ error: "Failed to fetch playlists" });
+      return res.status(500).json({ error: "Failed to fetch playlists" });
     }
   });
 
   app.post("/api/content-playlists", async (req, res) => {
     try {
-      const { name, description } = req.body;
+      const name = String(req.body?.name || "").trim();
+      const description =
+        typeof req.body?.description === "string" && req.body.description.trim()
+          ? req.body.description.trim()
+          : null;
+
       if (!name) {
         return res.status(400).json({ error: "Name is required" });
       }
+
       const result = await pool.query(
-        `INSERT INTO content_playlists (name, description) VALUES ($1, $2) RETURNING *`,
-        [name, description || null]
+        `
+        INSERT INTO content_playlists (name, description)
+        VALUES ($1, $2)
+        RETURNING id, name, description
+        `,
+        [name, description]
       );
-      res.status(201).json(result.rows[0]);
+
+      return res.status(201).json({
+        ...result.rows[0],
+        item_count: 0,
+        items: [],
+      });
     } catch (error) {
       console.error("Create playlist error:", error);
-      res.status(500).json({ error: "Failed to create playlist" });
+      return res.status(500).json({ error: "Failed to create playlist" });
     }
   });
 
   app.delete("/api/content-playlists/:id", async (req, res) => {
     try {
-      const id = parseInt(req.params.id);
+      const id = parseInt(req.params.id, 10);
+      if (!Number.isFinite(id)) {
+        return res.status(400).json({ error: "Invalid playlist id" });
+      }
+
       await pool.query(`DELETE FROM playlist_items WHERE playlist_id = $1`, [id]);
       await pool.query(`DELETE FROM playlist_assignments WHERE playlist_id = $1`, [id]);
-      const result = await pool.query(`DELETE FROM content_playlists WHERE id = $1 RETURNING *`, [id]);
+
+      const result = await pool.query(
+        `DELETE FROM content_playlists WHERE id = $1 RETURNING id`,
+        [id]
+      );
+
       if (result.rowCount === 0) {
         return res.status(404).json({ error: "Playlist not found" });
       }
-      res.json({ message: "Playlist deleted" });
+
+      return res.json({ message: "Playlist deleted" });
     } catch (error) {
       console.error("Delete playlist error:", error);
-      res.status(500).json({ error: "Failed to delete playlist" });
+      return res.status(500).json({ error: "Failed to delete playlist" });
     }
   });
 
@@ -3298,14 +3360,13 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
     try {
       const playlistId = parseInt(req.params.id);
       const { mediaId, mediaIds, duration } = req.body;
-      
-      // Support both single mediaId and array of mediaIds
+
       const idsToAdd = mediaIds ? mediaIds : (mediaId ? [mediaId] : []);
-      
+
       if (idsToAdd.length === 0) {
         return res.status(400).json({ error: "No media IDs provided" });
       }
-      
+
       const posResult = await pool.query(
         `SELECT COALESCE(MAX(position), -1) + 1 as next_pos FROM playlist_items WHERE playlist_id = $1`,
         [playlistId]
@@ -3321,11 +3382,11 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         insertedItems.push(result.rows[0]);
         position++;
       }
-      
-      res.status(201).json(insertedItems);
+
+      return res.status(201).json(insertedItems);
     } catch (error) {
       console.error("Add playlist item error:", error);
-      res.status(500).json({ error: "Failed to add item to playlist" });
+      return res.status(500).json({ error: "Failed to add item to playlist" });
     }
   });
 
@@ -3336,10 +3397,10 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
       if (result.rowCount === 0) {
         return res.status(404).json({ error: "Item not found" });
       }
-      res.json({ message: "Item removed from playlist" });
+      return res.json({ message: "Item removed from playlist" });
     } catch (error) {
       console.error("Remove playlist item error:", error);
-      res.status(500).json({ error: "Failed to remove item from playlist" });
+      return res.status(500).json({ error: "Failed to remove item from playlist" });
     }
   });
 
@@ -3347,11 +3408,11 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
     try {
       const itemId = parseInt(req.params.itemId);
       const { duration, volume } = req.body;
-      
+
       const updates: string[] = [];
       const values: any[] = [];
       let paramIndex = 1;
-      
+
       if (duration !== undefined) {
         updates.push(`duration = $${paramIndex++}`);
         values.push(duration);
@@ -3360,25 +3421,25 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         updates.push(`volume = $${paramIndex++}`);
         values.push(volume);
       }
-      
+
       if (updates.length === 0) {
         return res.status(400).json({ error: "No fields to update" });
       }
-      
+
       values.push(itemId);
       const result = await pool.query(
         `UPDATE playlist_items SET ${updates.join(", ")} WHERE id = $${paramIndex} RETURNING *`,
         values
       );
-      
+
       if (result.rowCount === 0) {
         return res.status(404).json({ error: "Item not found" });
       }
-      
-      res.json(result.rows[0]);
+
+      return res.json(result.rows[0]);
     } catch (error) {
       console.error("Update playlist item error:", error);
-      res.status(500).json({ error: "Failed to update playlist item" });
+      return res.status(500).json({ error: "Failed to update playlist item" });
     }
   });
 
@@ -3389,20 +3450,20 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
       if (!deviceId) {
         return res.status(400).json({ error: "Device ID is required" });
       }
-      
+
       await pool.query(
         `DELETE FROM playlist_assignments WHERE playlist_id = $1 AND device_id = $2`,
         [playlistId, deviceId]
       );
-      
+
       const result = await pool.query(
         `INSERT INTO playlist_assignments (playlist_id, device_id) VALUES ($1, $2) RETURNING *`,
         [playlistId, deviceId]
       );
-      res.status(201).json(result.rows[0]);
+      return res.status(201).json(result.rows[0]);
     } catch (error) {
       console.error("Assign playlist error:", error);
-      res.status(500).json({ error: "Failed to assign playlist" });
+      return res.status(500).json({ error: "Failed to assign playlist" });
     }
   });
 
@@ -3415,10 +3476,10 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         LEFT JOIN screens s ON s.device_id = pa.device_id
         WHERE pa.playlist_id = $1
       `, [playlistId]);
-      res.json(result.rows);
+      return res.json(result.rows);
     } catch (error) {
       console.error("Fetch assignments error:", error);
-      res.status(500).json({ error: "Failed to fetch assignments" });
+      return res.status(500).json({ error: "Failed to fetch assignments" });
     }
   });
 
@@ -3433,10 +3494,10 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
       if (result.rowCount === 0) {
         return res.status(404).json({ error: "Assignment not found" });
       }
-      res.json({ message: "Assignment removed" });
+      return res.json({ message: "Assignment removed" });
     } catch (error) {
       console.error("Remove assignment error:", error);
-      res.status(500).json({ error: "Failed to remove assignment" });
+      return res.status(500).json({ error: "Failed to remove assignment" });
     }
   });
 
