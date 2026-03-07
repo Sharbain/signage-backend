@@ -171,12 +171,12 @@ export async function authenticateDevice(req: Request, res: Response, next: Next
     // (your backend previously validated against screens.device_key)
     try {
       const v2 = await pool.query(
-        `SELECT id, device_id, device_key, api_key_hash, revoked_at
-         FROM screens
-         WHERE device_id = $1
-         LIMIT 1`,
-        [deviceId],
-      );
+        `SELECT id, device_id, api_key_hash, password, revoked_at
+        FROM screens
+        WHERE device_id = $1
+        LIMIT 1`,
+       [deviceId],
+       );
 
       if (!v2.rows.length) return res.status(401).json({ error: "unknown_device" });
 
@@ -353,3 +353,4 @@ export async function authenticateUserOrDevice(req: Request, res: Response, next
     return res.status(500).json({ error: "auth_failed" });
   }
 }
+
