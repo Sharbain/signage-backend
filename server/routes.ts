@@ -523,6 +523,82 @@ app.post("/api/devices/pair", handleDeviceActivate);
   });
 
   // =====================================================
+  // ADMIN DEVICE DELETE (CMS)
+  // Deletes by human-readable device_id (DEV-XXXX) and cleans dependent rows first.
+  // =====================================================
+  app.delete(
+    "/api/admin/devices/:deviceId",
+    authenticateJWT,
+    requireRole("admin", "manager"),
+    async (req, res) => {
+      const deviceId = String(req.params.deviceId || "").trim();
+      if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
+
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+
+        const screenResult = await client.query(
+          `SELECT id, device_id FROM screens WHERE device_id = $1 LIMIT 1`,
+          [deviceId],
+        );
+
+        if (screenResult.rowCount === 0) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "device_not_found" });
+        }
+
+        const screenId = screenResult.rows[0].id;
+
+        const safeDelete = async (sql: string, params: any[]) => {
+          try {
+            await client.query(sql, params);
+          } catch (cleanupErr) {
+            console.warn("device delete cleanup skipped:", sql, cleanupErr);
+          }
+        };
+
+        await safeDelete(`DELETE FROM device_group_map WHERE device_id = $1`, [deviceId]);
+        await safeDelete(`DELETE FROM playlist_assignments WHERE device_id = $1`, [deviceId]);
+        await safeDelete(`DELETE FROM device_commands WHERE device_id = $1`, [deviceId]);
+        await safeDelete(`DELETE FROM device_status_logs WHERE device_id = $1`, [deviceId]);
+        await safeDelete(`DELETE FROM device_data_usage WHERE device_id = $1`, [deviceId]);
+        await safeDelete(`DELETE FROM device_power_schedules WHERE device_id = $1`, [deviceId]);
+
+        // Best-effort cleanup for schemas that may reference the numeric screen id.
+        await safeDelete(`DELETE FROM playlists WHERE screen_id = $1`, [screenId]);
+        await safeDelete(`DELETE FROM publish_jobs WHERE device_id = $1`, [deviceId]);
+        await safeDelete(`DELETE FROM publish_jobs WHERE screen_id = $1`, [screenId]);
+
+        const deleteScreen = await client.query(
+          `DELETE FROM screens WHERE device_id = $1 RETURNING id, device_id, name`,
+          [deviceId],
+        );
+
+        await client.query("COMMIT");
+
+        delete pendingCommands[deviceId];
+        delete playlists[deviceId];
+        delete zonePlaylists[deviceId];
+        delete zoneRSSFeeds[deviceId];
+        delete socialZoneConfig[deviceId];
+        delete deviceTemplates[deviceId];
+
+        return res.json({
+          success: true,
+          removed: deleteScreen.rows[0] || { id: screenId, device_id: deviceId },
+        });
+      } catch (err) {
+        await client.query("ROLLBACK");
+        console.error("ADMIN DEVICE DELETE ERROR:", err);
+        return res.status(500).json({ error: "failed_to_delete_device" });
+      } finally {
+        client.release();
+      }
+    },
+  );
+
+  // =====================================================
   // DEVICE LOCATIONS (for DeviceMap)
   // =====================================================
   app.get("/api/devices/locations", async (_req, res) => {
