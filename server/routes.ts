@@ -1218,8 +1218,18 @@ app.get("/api/dashboard/live-content", authenticateJWT, async (_req, res) => {
       const publishJobSyncs: Array<{ status: string; publishJobId: number }> = [];
 
       const commands = result.rows.map((cmd) => {
-        const payload =
-          typeof cmd.payload === "string" ? JSON.parse(cmd.payload) : cmd.payload;
+        let payload: any = cmd.payload;
+        if (typeof payload === "string") {
+          try {
+            payload = JSON.parse(payload);
+          } catch {
+            payload = {};
+          }
+        }
+        if (!payload || typeof payload !== "object") {
+          payload = {};
+        }
+
         let status = "queued";
         let progress = 0;
 
