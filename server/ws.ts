@@ -9,38 +9,39 @@ const JWT_SECRET = process.env.JWT_SECRET || "";
 const dashboardClients = new Set<WebSocket>();
 
 export function initWebSocketServer(httpServer: Server) {
-  const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+  try {
+    const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
 
-  wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
-    // Authenticate via ?token=<jwt> query param
-    try {
-      const url = new URL(req.url || "", "http://localhost");
-      const token = url.searchParams.get("token");
+    wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
+      try {
+        const url = new URL(req.url || "", "http://localhost");
+        const token = url.searchParams.get("token");
 
-      if (!token) {
-        ws.close(4001, "missing_token");
-        return;
+        if (!token) {
+          ws.close(4001, "missing_token");
+          return;
+        }
+
+        jwt.verify(token, JWT_SECRET);
+        dashboardClients.add(ws);
+
+        ws.on("close", () => dashboardClients.delete(ws));
+        ws.on("error", () => dashboardClients.delete(ws));
+
+        ws.send(JSON.stringify({ type: "connected" }));
+      } catch {
+        ws.close(4003, "invalid_token");
       }
+    });
 
-      jwt.verify(token, JWT_SECRET);
-      dashboardClients.add(ws);
+    wss.on("error", (err) => {
+      console.error("[ws] WebSocketServer error:", err);
+    });
 
-      ws.on("close", () => {
-        dashboardClients.delete(ws);
-      });
-
-      ws.on("error", () => {
-        dashboardClients.delete(ws);
-      });
-
-      // Send a welcome ping so the client knows it's connected
-      ws.send(JSON.stringify({ type: "connected" }));
-    } catch {
-      ws.close(4003, "invalid_token");
-    }
-  });
-
-  console.log("[ws] WebSocket server ready on /ws");
+    console.log("[ws] WebSocket server ready on /ws");
+  } catch (err) {
+    console.error("[ws] FAILED to init WebSocket server:", err);
+  }
 }
 
 export function broadcastDeviceStatus(deviceId: string, isOnline: boolean, extra?: Record<string, any>) {
