@@ -3,6 +3,27 @@ import { pgTable, text, varchar, serial, timestamp, integer, jsonb, uuid, time, 
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
+
+// =====================================================
+// ORGANIZATIONS (multi-tenancy)
+// =====================================================
+export const organizations = pgTable("organizations", {
+  id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+  name: text("name").notNull(),
+  slug: text("slug").notNull().unique(),
+  plan: varchar("plan").notNull().default("starter"),
+  isActive: boolean("is_active").notNull().default(true),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const insertOrganizationSchema = createInsertSchema(organizations).omit({
+  id: true,
+  createdAt: true,
+});
+
+export type InsertOrganization = z.infer<typeof insertOrganizationSchema>;
+export type Organization = typeof organizations.$inferSelect;
+
 export const users = pgTable("users", {
   id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
   email: text("email").notNull().unique(),
@@ -10,7 +31,7 @@ export const users = pgTable("users", {
   name: text("name"),
   role: varchar("role").notNull().default("restricted"),
   preferences: jsonb("preferences").$type<Record<string, any>>().default({}),
-  createdAt: timestamp("created_at").defaultNow().notNull(),
+    orgId: uuid("org_id").references(() => organizations.id),
 });
 
 export const insertUserSchema = createInsertSchema(users).omit({
@@ -539,4 +560,3 @@ export const insertPublishJobSchema = createInsertSchema(publishJobs).omit({
 
 export type InsertPublishJob = z.infer<typeof insertPublishJobSchema>;
 export type PublishJob = typeof publishJobs.$inferSelect;
-
