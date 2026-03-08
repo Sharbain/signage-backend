@@ -298,7 +298,7 @@ export type TemplatePlaylistItem = typeof templatePlaylistItems.$inferSelect;
 
 export const templateSchedule = pgTable("template_schedule", {
   id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
-  templateId: uuid("template_id").references(() => templates.id),
+  templateId: varchar("template_id").references(() => templates.id),
   contentId: text("content_id"),
   targetType: text("target_type").notNull().default('device'), // 'device' or 'group'
   targetId: text("target_id").notNull(),
@@ -520,7 +520,7 @@ export const publishJobs = pgTable("publish_jobs", {
   deviceId: text("device_id").notNull(),
   deviceName: text("device_name").notNull(),
   contentType: text("content_type").notNull(),
-  contentId: integer("content_id").notNull(),
+  contentId: varchar("content_id").notNull(),
   contentName: text("content_name").notNull(),
   status: text("status").default("pending").notNull(),
   progress: integer("progress").default(0).notNull(),
@@ -539,3 +539,4 @@ export const insertPublishJobSchema = createInsertSchema(publishJobs).omit({
 
 export type InsertPublishJob = z.infer<typeof insertPublishJobSchema>;
 export type PublishJob = typeof publishJobs.$inferSelect;
+
