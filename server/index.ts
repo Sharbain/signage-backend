@@ -213,7 +213,6 @@ app.use((req, res, next) => {
 -------------------------------------------------- */
 (async () => {
   await registerRoutes(httpServer, app);
-  console.log("[debug] routes registered, initing WS now...");
   initWebSocketServer(httpServer);
 
   /* --------------------------------------------------
@@ -307,6 +306,7 @@ app.use((req, res, next) => {
     log(`API listening on port ${port}`);
   });
 })();
+
 
 
 
