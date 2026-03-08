@@ -6,6 +6,7 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { randomUUID } from "crypto";
 import { registerRoutes } from "./routes";
+import { initWebSocketServer } from "./ws";
 import { createServer } from "http";
 
 const app = express();
@@ -302,7 +303,9 @@ app.use((req, res, next) => {
   // Cloud-safe: bind to all interfaces
   httpServer.listen(port, "0.0.0.0", () => {
     log(`API listening on port ${port}`);
+    initWebSocketServer(httpServer);
   });
 })();
+
 
 
