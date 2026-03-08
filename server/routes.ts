@@ -34,6 +34,7 @@ import { requireRole } from "./middleware/permissions";
 import { authenticateJWT, authenticateDevice, authenticateUserOrDevice } from "./middleware/auth";
 import { registerAuthRoutes } from "./routes/auth.routes";
 import { registerDeviceRoutes } from "./routes/device.routes";
+import { broadcastDeviceStatus } from "./ws";
 
 const uploadsDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadsDir)) {
@@ -2290,6 +2291,11 @@ async function handleDeviceHeartbeat(req: Request, res: Response) {
       timestamp: Date.now(),
       payload: body,
     } as any);
+
+    broadcastDeviceStatus(deviceId, true, {
+      freeStorage: freeStorage ? Number(freeStorage) : undefined,
+      batteryLevel: req.body?.batteryLevel ?? null,
+    });
 
     return res.json({ ok: true, serverTime: new Date().toISOString() });
   } catch (err) {
