@@ -303,9 +303,12 @@ app.use((req, res, next) => {
   // Cloud-safe: bind to all interfaces
   httpServer.listen(port, "0.0.0.0", () => {
     log(`API listening on port ${port}`);
+    console.log("[debug] calling initWebSocketServer...");
     initWebSocketServer(httpServer);
+    console.log("[debug] initWebSocketServer returned");
   });
 })();
+
 
 
 
