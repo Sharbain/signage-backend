@@ -213,6 +213,8 @@ app.use((req, res, next) => {
 -------------------------------------------------- */
 (async () => {
   await registerRoutes(httpServer, app);
+  console.log("[debug] routes registered, initing WS now...");
+  initWebSocketServer(httpServer);
 
   /* --------------------------------------------------
      PLAYER DISPLAY ROUTES (Android WebView / TV Browser)
@@ -308,6 +310,7 @@ app.use((req, res, next) => {
     process.stdout.write("[ws-init] AFTER\n");
   });
 })();
+
 
 
 
