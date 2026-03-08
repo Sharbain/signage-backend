@@ -5,6 +5,7 @@ import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { randomUUID } from "crypto";
+import cookieParser from "cookie-parser";
 import { registerRoutes } from "./routes";
 import { initWebSocketServer } from "./ws";
 import { createServer } from "http";
@@ -39,14 +40,9 @@ app.use((req, res, next) => {
    SECURITY BASELINE (Helmet + CSP tuned for Supabase media)
 -------------------------------------------------- */
 
-// Build an allowlist of external media origins (for img/video) from env
-// - SUPABASE_URL example: https://rjivpixvpsxwftrrlefc.supabase.co
-// - MEDIA_ORIGINS example: https://cdn.yourdomain.com,https://*.supabase.co (wildcards may not work everywhere)
 function normalizeOrigin(raw: string): string | null {
   const v = String(raw || "").trim();
   if (!v) return null;
-  // allow special CSP keywords that include quotes, but we won't pass those via env in this app
-  // ensure no trailing slash
   return v.replace(/\/$/, "");
 }
 
@@ -55,7 +51,6 @@ const mediaOrigins = new Set<string>();
 const supabaseUrl = normalizeOrigin(process.env.SUPABASE_URL || "");
 if (supabaseUrl) mediaOrigins.add(supabaseUrl);
 
-// Optional: comma-separated additional media origins
 const extraMedia = (process.env.MEDIA_ORIGINS || "")
   .split(",")
   .map((s) => normalizeOrigin(s))
@@ -63,36 +58,16 @@ const extraMedia = (process.env.MEDIA_ORIGINS || "")
 
 for (const o of extraMedia) mediaOrigins.add(o);
 
-// If you didn't set SUPABASE_URL, but you're using Supabase storage,
-// you can also set MEDIA_ORIGINS to include your Supabase project origin.
-// Keeping it empty is allowed; then only 'self' works.
-
 app.use(
   helmet({
-    // Allow the Vercel CMS frontend to load backend-served images/videos/thumbnails.
-    // Without this, browser requests for media from a different origin can be blocked
-    // with ERR_BLOCKED_BY_RESPONSE.NotSameOrigin.
     crossOriginResourcePolicy: false,
     contentSecurityPolicy: {
       useDefaults: true,
       directives: {
-        // Start from Helmet defaults
         ...helmet.contentSecurityPolicy.getDefaultDirectives(),
-
-        // Signage player needs to load images/videos from Supabase (or CDN)
-        // Keep self + data, add blob for media playback/caching
         "img-src": ["'self'", "data:", "blob:", ...Array.from(mediaOrigins)],
         "media-src": ["'self'", "blob:", ...Array.from(mediaOrigins)],
-
-        // Display/app.js is served from same origin; connect-src should allow API calls
-        // Keep 'self' and allow your Supabase origin if you later fetch signed URLs etc.
         "connect-src": ["'self'", ...Array.from(mediaOrigins)],
-
-        // If you ever embed frames (usually no): keep locked down by default
-        // "frame-src": ["'none'"],
-
-        // Note: We are NOT loosening script-src beyond defaults here.
-        // Your display page loads /display/app.js from self, which is fine.
       },
     },
   }),
@@ -102,7 +77,6 @@ app.use(
    CORS (PRODUCTION-SAFE + VERCEL AUTO SUPPORT)
 -------------------------------------------------- */
 
-// Comma-separated allowlist from environment
 const corsOrigins = (process.env.CORS_ORIGIN || "")
   .split(",")
   .map((s) => s.trim())
@@ -110,27 +84,13 @@ const corsOrigins = (process.env.CORS_ORIGIN || "")
 
 const corsMiddleware = cors({
   origin: (origin, cb) => {
-    // Allow non-browser clients (curl, server-to-server)
     if (!origin) return cb(null, true);
-
-    // Allow ALL Vercel deployments automatically
-    if (origin.endsWith(".vercel.app")) {
-      return cb(null, true);
-    }
-
-    // If no env origins defined
+    if (origin.endsWith(".vercel.app")) return cb(null, true);
     if (corsOrigins.length === 0) {
-      if (process.env.NODE_ENV !== "production") {
-        return cb(null, true);
-      }
+      if (process.env.NODE_ENV !== "production") return cb(null, true);
       return cb(new Error("CORS blocked"));
     }
-
-    // Check allowlist
-    if (corsOrigins.includes(origin)) {
-      return cb(null, true);
-    }
-
+    if (corsOrigins.includes(origin)) return cb(null, true);
     return cb(new Error("CORS blocked"));
   },
   credentials: true,
@@ -142,7 +102,6 @@ app.use(corsMiddleware);
    RATE LIMITING
 -------------------------------------------------- */
 
-// Global API limit
 app.use(
   "/api",
   rateLimit({
@@ -153,7 +112,6 @@ app.use(
   }),
 );
 
-// Stricter auth limit
 app.use(
   "/api/auth",
   rateLimit({
@@ -177,6 +135,7 @@ app.use(
 );
 
 app.use(express.urlencoded({ extended: false, limit: "1mb" }));
+app.use(cookieParser());
 
 /* --------------------------------------------------
    REQUEST LOGGING
@@ -215,16 +174,9 @@ app.use((req, res, next) => {
   await registerRoutes(httpServer, app);
   initWebSocketServer(httpServer);
 
-  /* --------------------------------------------------
-     PLAYER DISPLAY ROUTES (Android WebView / TV Browser)
-     - /display shows a helpful message
-     - /display/:screenId renders a simple player page
-  -------------------------------------------------- */
   app.get("/display", (_req, res) => {
-    res
-      .status(200)
-      .send(
-        `<!doctype html>
+    res.status(200).send(
+      `<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
@@ -248,16 +200,13 @@ app.use((req, res, next) => {
     </div>
   </body>
 </html>`,
-      );
+    );
   });
 
   app.get("/display/:screenId", (req, res) => {
     const screenId = encodeURIComponent(req.params.screenId);
-
-    res
-      .status(200)
-      .send(
-        `<!doctype html>
+    res.status(200).send(
+      `<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
@@ -274,7 +223,7 @@ app.use((req, res, next) => {
     <script src="/display/app.js" defer></script>
   </body>
 </html>`,
-      );
+    );
   });
 
   /* --------------------------------------------------
@@ -301,16 +250,7 @@ app.use((req, res, next) => {
 
   const port = parseInt(process.env.PORT || "5000", 10);
 
-  // Cloud-safe: bind to all interfaces
   httpServer.listen(port, "0.0.0.0", () => {
     log(`API listening on port ${port}`);
   });
 })();
-
-
-
-
-
-
-
-
