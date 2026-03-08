@@ -1718,10 +1718,10 @@ const existingUser = await storage.getUserByEmail(email);
       const REFRESH_SECRET = process.env.REFRESH_TOKEN_SECRET || JWT_SECRET + "_refresh";
 
     const accessToken = jwt.sign(
-      { sub: user.id, email: user.email, role: user.role },
-      JWT_SECRET,
-      { expiresIn: "15m" },
-    );
+  { sub: user.id, email: user.email, role: user.role, org_id: user.org_id ?? null },
+  JWT_SECRET,
+  { expiresIn: "15m" },
+);
     const refreshToken = jwt.sign(
       { sub: user.id },
       REFRESH_SECRET,
@@ -1764,10 +1764,10 @@ app.post("/api/auth/refresh", async (req, res) => {
 
       const user = result.rows[0];
       const accessToken = jwt.sign(
-        { sub: user.id, email: user.email, role: user.role },
-        JWT_SECRET,
-        { expiresIn: "15m" },
-      );
+  { sub: user.id, email: user.email, role: user.role, org_id: user.org_id ?? null },
+  JWT_SECRET,
+  { expiresIn: "15m" },
+);
       return res.json({ accessToken });
     } catch (err) {
       console.error("Refresh token error:", err);
