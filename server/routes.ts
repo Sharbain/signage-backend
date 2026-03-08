@@ -1195,10 +1195,10 @@ app.get("/api/dashboard/live-content", authenticateJWT, async (_req, res) => {
   // =====================================================
   // ACTIVE COMMANDS STATUS (for progress tracking)
   // =====================================================
-  app.get("/api/commands/active", async (req, res) => {
+  app.get("/api/commands/active", async (_req, res) => {
     try {
-      // Get commands from last 5 minutes that are not yet fully executed
-      const result = await pool.query(`
+      const result = await pool.query(
+        `
         SELECT 
           dc.id,
           dc.device_id,
@@ -1213,19 +1213,24 @@ app.get("/api/dashboard/live-content", authenticateJWT, async (_req, res) => {
         WHERE dc.created_at > NOW() - INTERVAL '5 minutes'
         ORDER BY dc.created_at DESC
         LIMIT 20
-      `);
+        `
+      );
 
       const publishJobSyncs: Array<{ status: string; publishJobId: number }> = [];
 
-      const commands = result.rows.map((cmd) => {
-        let payload: any = cmd.payload;
-        if (typeof payload === "string") {
-          try {
-            payload = JSON.parse(payload);
-          } catch {
-            payload = {};
+      const commands = result.rows.map((cmd: any) => {
+        let payload: any = {};
+
+        try {
+          if (typeof cmd.payload === "string") {
+            payload = JSON.parse(cmd.payload);
+          } else if (cmd.payload && typeof cmd.payload === "object") {
+            payload = cmd.payload;
           }
+        } catch {
+          payload = {};
         }
+
         if (!payload || typeof payload !== "object") {
           payload = {};
         }
@@ -1242,11 +1247,11 @@ app.get("/api/dashboard/live-content", authenticateJWT, async (_req, res) => {
         }
 
         const rawPublishJobId = String(
-          payload?.publishJobId ?? payload?.publish_job_id ?? "",
+          payload.publishJobId ?? payload.publish_job_id ?? "",
         ).trim();
         const publishJobId = Number(rawPublishJobId);
 
-        if (Number.isFinite(publishJobId)) {
+        if (Number.isFinite(publishJobId) && publishJobId > 0) {
           const publishStatus =
             status === "queued"
               ? "pending"
@@ -1261,8 +1266,8 @@ app.get("/api/dashboard/live-content", authenticateJWT, async (_req, res) => {
           id: cmd.id,
           deviceId: cmd.device_id,
           deviceName: cmd.device_name || cmd.device_id,
-          type: payload?.type,
-          contentName: payload?.contentName || payload?.type,
+          type: payload.type || null,
+          contentName: payload.contentName || payload.content_name || payload.type || "command",
           status,
           progress,
           createdAt: cmd.created_at,
@@ -1271,8 +1276,14 @@ app.get("/api/dashboard/live-content", authenticateJWT, async (_req, res) => {
       });
 
       if (publishJobSyncs.length > 0) {
-        await Promise.all(
-          publishJobSyncs.map(({ status, publishJobId }) =>
+        const uniqueSyncs = Array.from(
+          new Map(
+            publishJobSyncs.map((sync) => [`${sync.publishJobId}:${sync.status}`, sync])
+          ).values()
+        );
+
+        void Promise.allSettled(
+          uniqueSyncs.map(({ status, publishJobId }) =>
             pool.query(
               `
               UPDATE publish_jobs
@@ -1283,29 +1294,29 @@ app.get("/api/dashboard/live-content", authenticateJWT, async (_req, res) => {
                 END,
                 progress = CASE
                   WHEN status = 'completed' THEN 100
-                  WHEN $1 = 'downloading' AND progress < 50 THEN 50
-                  ELSE progress
+                  WHEN $1 = 'downloading' AND COALESCE(progress, 0) < 50 THEN 50
+                  ELSE COALESCE(progress, 0)
                 END,
                 completed_at = CASE
                   WHEN $1 = 'completed' THEN COALESCE(completed_at, NOW())
                   ELSE completed_at
-                END,
-                updated_at = NOW()
+                END
               WHERE id = $2
               `,
-              [status, publishJobId],
-            ),
-          ),
-        );
+              [status, publishJobId]
+            )
+          )
+        ).catch((syncErr) => {
+          console.warn("Active commands publish job sync warning:", syncErr);
+        });
       }
 
-      res.json({ commands });
+      return res.json({ commands });
     } catch (err) {
       console.error("Active commands error:", err);
-      res.status(500).json({ error: "failed_to_fetch_active_commands" });
+      return res.json({ commands: [] });
     }
   });
-
 
 // =====================================================
 // DEVICE FETCHES ITS PENDING COMMANDS (DEVICE AUTH)
