@@ -2217,8 +2217,6 @@ async function handleDeviceHeartbeat(req: Request, res: Response) {
     const uptime = body.uptime ?? body.upTime ?? null;
     const localIp = body.localIp ?? body.local_ip ?? null;
     const publicIp = body.publicIp ?? body.public_ip ?? null;
-    const latitude = body.latitude ?? body.lat ?? null;
-    const longitude = body.longitude ?? body.lng ?? body.lon ?? null;
 
     const currentUrl =
       (body.currentUrl ?? body.current_url ?? body?.playback?.currentUrl ?? null) as string | null;
@@ -2256,10 +2254,8 @@ async function handleDeviceHeartbeat(req: Request, res: Response) {
         signal_strength = COALESCE($8, signal_strength),
         uptime = COALESCE($9, uptime),
         local_ip = COALESCE($10, local_ip),
-        public_ip = COALESCE($11, public_ip),
-        latitude = COALESCE($12, latitude),
-        longitude = COALESCE($13, longitude)
-      WHERE device_id = $14
+        public_ip = COALESCE($11, public_ip)
+      WHERE device_id = $12
       `,
       [
         brightness,
@@ -2273,8 +2269,6 @@ async function handleDeviceHeartbeat(req: Request, res: Response) {
         uptime,
         localIp,
         publicIp,
-        latitude,
-        longitude,
         deviceId,
       ],
     );
@@ -6125,10 +6119,23 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         contentName,
         contentUrl,
         totalBytes,
+        // playlist publish
+        playlistId: publishPlaylistId,
+        // template publish
+        templateId: publishTemplateId,
       } = req.body;
 
-      if (!deviceId || !contentName || !contentUrl) {
-        return res.status(400).json({ error: "deviceId, contentName, and contentUrl are required" });
+      if (!deviceId || !contentName) {
+        return res.status(400).json({ error: "deviceId and contentName are required" });
+      }
+
+      const normalizedType = String(contentType || "media").trim().toLowerCase();
+      const isPlaylistPublish = normalizedType === "playlist" && publishPlaylistId != null;
+      const isTemplatePublish = normalizedType === "template" && publishTemplateId != null;
+      const isMediaPublish    = !isPlaylistPublish && !isTemplatePublish;
+
+      if (isMediaPublish && !contentUrl) {
+        return res.status(400).json({ error: "contentUrl is required for media publish" });
       }
 
       const normalizedContentType = String(contentType || "media").trim().toLowerCase();
@@ -6215,24 +6222,43 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
 
       let instantPlaylist: { playlistId: number; playlistName: string } | null = null;
 
-      if (
-        numericContentId != null &&
-        (normalizedContentType === "media" ||
-          normalizedContentType === "image" ||
-          normalizedContentType === "video")
-      ) {
+      if (isPlaylistPublish) {
+        // Assign the playlist directly to the device
+        await client.query(
+          `INSERT INTO playlist_assignments (playlist_id, device_id, assigned_at)
+           VALUES ($1, $2, NOW())
+           ON CONFLICT (playlist_id, device_id) DO UPDATE SET assigned_at = NOW()`,
+          [Number(publishPlaylistId), deviceId]
+        );
+        instantPlaylist = { playlistId: Number(publishPlaylistId), playlistName: contentName };
+      } else if (isMediaPublish && numericContentId != null) {
         instantPlaylist = await upsertInstantDevicePlaylist(client, deviceId, numericContentId);
       }
 
-      const payload = {
-        type: "play_content",
+      // For template: store template assignment
+      if (isTemplatePublish && publishTemplateId != null) {
+        await client.query(
+          `INSERT INTO device_template_assignments (device_id, template_id, assigned_at)
+           VALUES ($1, $2, NOW())
+           ON CONFLICT (device_id) DO UPDATE SET template_id = $2, assigned_at = NOW()`,
+          [deviceId, Number(publishTemplateId)]
+        ).catch(() => {
+          // Table may not exist yet — best effort
+        });
+      }
+
+      const payload: any = {
+        type: isTemplatePublish ? "load_template"
+             : isPlaylistPublish ? "refresh_playlist"
+             : "play_content",
         contentId: numericContentId,
         contentName,
-        contentUrl: normalizedContentUrl,
+        contentUrl: isMediaPublish ? normalizedContentUrl : null,
         contentType: normalizedContentType,
         publishJobId: String(publishJob.rows[0].id),
         refreshPlaylist: true,
-        playlistId: instantPlaylist?.playlistId ?? null,
+        playlistId: isPlaylistPublish ? Number(publishPlaylistId) : (instantPlaylist?.playlistId ?? null),
+        templateId: isTemplatePublish ? Number(publishTemplateId) : null,
       };
 
       const command = await client.query(
