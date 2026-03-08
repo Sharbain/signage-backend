@@ -1459,7 +1459,8 @@ app.post(
     }
 
     const filePath = await uploadToSupabase(req.file.buffer, req.file.originalname, req.file.mimetype, "recordings");
-        await updateDeviceRecording(deviceId, filePath);
+    try {
+      await updateDeviceRecording(deviceId, filePath);
         return res.json({ ok: true, filePath });
     } catch (err) {
       console.error("Recording upload error:", err);
