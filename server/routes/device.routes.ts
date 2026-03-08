@@ -30,19 +30,30 @@ export function registerDeviceRoutes(app: Express) {
       const body = (req.body || {}) as Record<string, any>;
       const patch: Record<string, any> = {};
 
-      // “enterprise tolerant” updates: only set if provided
-      if (typeof body.status === "string") patch.status = body.status;
-      if (typeof body.currentContent === "string") patch.current_content = body.currentContent;
-      if (typeof body.currentContentName === "string") patch.current_content_name = body.currentContentName;
+      // "enterprise tolerant" updates: only set if provided
+      if (typeof body.currentContent === "string") patch.currentContent = body.currentContent;
+      if (typeof body.currentContentName === "string") patch.currentContentName = body.currentContentName;
       if (typeof body.temperature === "number") patch.temperature = body.temperature;
-      if (typeof body.freeStorage === "number") patch.free_storage = body.freeStorage;
-      if (typeof body.batteryLevel === "number") patch.battery_level = body.batteryLevel;
-      if (typeof body.signalStrength === "number") patch.signal_strength = body.signalStrength;
+      if (typeof body.freeStorage === "number") patch.freeStorage = body.freeStorage;
+      if (typeof body.batteryLevel === "number") patch.batteryLevel = body.batteryLevel;
+      if (typeof body.signalStrength === "number") patch.signalStrength = body.signalStrength;
       if (typeof body.latitude === "number") patch.latitude = body.latitude;
       if (typeof body.longitude === "number") patch.longitude = body.longitude;
-
-      // errors can be array of strings
       if (Array.isArray(body.errors)) patch.errors = body.errors;
+
+      // Explicit allowlist: maps body key -> exact DB column name
+      // NEVER interpolate user-supplied keys into SQL directly
+      const ALLOWED_PATCH_COLUMNS: Record<string, string> = {
+        currentContent:     "current_content",
+        currentContentName: "current_content_name",
+        temperature:        "temperature",
+        freeStorage:        "free_storage",
+        batteryLevel:       "battery_level",
+        signalStrength:     "signal_strength",
+        latitude:           "latitude",
+        longitude:          "longitude",
+        errors:             "errors",
+      };
 
       try {
         // Mark online + last_seen always
@@ -52,16 +63,15 @@ export function registerDeviceRoutes(app: Express) {
         // base columns (always)
         columns.push(`last_seen = NOW()`);
         columns.push(`is_online = TRUE`);
-        columns.push(`status = COALESCE($2, status)`); // optional below
+        columns.push(`status = COALESCE($2, status)`);
         values.push(typeof body.status === "string" ? body.status : null);
 
-        // dynamic patches (safe)
+        // Safe patch: only whitelisted body keys, mapped to known column names
         let idx = values.length + 1;
-        for (const [k, v] of Object.entries(patch)) {
-          // skip status because we already handled it above
-          if (k === "status") continue;
-          columns.push(`${k} = $${idx}`);
-          values.push(v);
+        for (const [bodyKey, colName] of Object.entries(ALLOWED_PATCH_COLUMNS)) {
+          if (patch[bodyKey] === undefined) continue;
+          columns.push(`${colName} = $${idx}`);
+          values.push(patch[bodyKey]);
           idx++;
         }
 
