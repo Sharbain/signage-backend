@@ -34,8 +34,6 @@ import { requireRole } from "./middleware/permissions";
 import { authenticateJWT, authenticateDevice, authenticateUserOrDevice } from "./middleware/auth";
 import { registerAuthRoutes } from "./routes/auth.routes";
 import { registerDeviceRoutes } from "./routes/device.routes";
-import { broadcastDeviceStatus } from "./ws";
-import { uploadToSupabase } from "./storage-supabase";
 
 const uploadsDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadsDir)) {
@@ -64,7 +62,13 @@ if (!fs.existsSync(deviceThumbnailsDir)) {
 
 const frontendDir = path.join(process.cwd(), "frontend");
 
-const multerStorage = multer.memoryStorage();
+const multerStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, uploadsDir),
+  filename: (_req, file, cb) => {
+    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    cb(null, uniqueSuffix + path.extname(file.originalname));
+  },
+});
 
 const upload = multer({
   storage: multerStorage,
@@ -91,7 +95,14 @@ const upload = multer({
 });
 
 // Recording upload configuration
-const recordingStorage = multer.memoryStorage();
+const recordingStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, recordingsDir),
+  filename: (req, file, cb) => {
+    const deviceId = (req.params as { deviceId: string }).deviceId || "unknown";
+    const timestamp = Date.now();
+    cb(null, `${deviceId}-${timestamp}${path.extname(file.originalname)}`);
+  },
+});
 
 const recordingUpload = multer({
   storage: recordingStorage,
@@ -106,7 +117,13 @@ const recordingUpload = multer({
 });
 
 // Group icon upload configuration
-const groupIconStorage = multer.memoryStorage();
+const groupIconStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, groupIconsDir),
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    cb(null, `group_${Date.now()}${ext}`);
+  },
+});
 
 const groupIconUpload = multer({
   storage: groupIconStorage,
@@ -121,7 +138,14 @@ const groupIconUpload = multer({
 });
 
 // Device thumbnail upload configuration
-const deviceThumbnailStorage = multer.memoryStorage();
+const deviceThumbnailStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, deviceThumbnailsDir),
+  filename: (req, file, cb) => {
+    const deviceId = (req.params as { deviceId: string }).deviceId || "unknown";
+    const ext = path.extname(file.originalname);
+    cb(null, `${deviceId}${ext}`);
+  },
+});
 
 const deviceThumbnailUpload = multer({
   storage: deviceThumbnailStorage,
@@ -139,7 +163,13 @@ const deviceThumbnailUpload = multer({
 const clientAttachmentsDir = path.join(process.cwd(), "uploads", "clients");
 fs.mkdirSync(clientAttachmentsDir, { recursive: true });
 
-const clientAttachmentStorage = multer.memoryStorage();
+const clientAttachmentStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, clientAttachmentsDir),
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    cb(null, `attachment_${Date.now()}_${Math.random().toString(36).slice(2)}${ext}`);
+  },
+});
 
 const clientAttachmentUpload = multer({
   storage: clientAttachmentStorage,
@@ -1458,10 +1488,11 @@ app.post(
       return res.status(400).json({ error: "no_file_uploaded" });
     }
 
-    const filePath = await uploadToSupabase(req.file.buffer, req.file.originalname, req.file.mimetype, "recordings");
+    const filePath = `/uploads/recordings/${req.file.filename}`;
+
     try {
       await updateDeviceRecording(deviceId, filePath);
-        return res.json({ ok: true, filePath });
+      return res.json({ ok: true, filePath });
     } catch (err) {
       console.error("Recording upload error:", err);
       return res.status(500).json({ error: "recording_upload_failed" });
@@ -1715,69 +1746,19 @@ const existingUser = await storage.getUserByEmail(email);
         return res.status(401).json({ error: "Invalid credentials" });
       }
 
-      const REFRESH_SECRET = process.env.REFRESH_TOKEN_SECRET || JWT_SECRET + "_refresh";
+      const accessToken = jwt.sign(
+        { sub: user.id, email: user.email, role: user.role },
+        JWT_SECRET,
+        { expiresIn: "24h" },
+      );
 
-    const accessToken = jwt.sign(
-      { sub: user.id, email: user.email, role: user.role, org_id: user.org_id ?? null },
-      JWT_SECRET,
-      { expiresIn: "15m" },
-    );
-    const refreshToken = jwt.sign(
-      { sub: user.id },
-      REFRESH_SECRET,
-      { expiresIn: "30d" },
-    );
-    res.cookie("refreshToken", refreshToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "strict",
-      maxAge: 30 * 24 * 60 * 60 * 1000,
-      path: "/api/auth",
-    });
-    res.json({ accessToken, user: { id: user.id, email: user.email, role: user.role } });
+      res.json({ accessToken, user: { id: user.id, email: user.email, role: user.role } });
     } catch (error) {
       if (error instanceof z.ZodError) {
         return res.status(400).json({ error: error.errors });
       }
       res.status(500).json({ error: "Internal server error" });
     }
-  });
-
-app.post("/api/auth/refresh", async (req, res) => {
-    try {
-      const REFRESH_SECRET = process.env.REFRESH_TOKEN_SECRET || JWT_SECRET + "_refresh";
-      const token = req.cookies?.refreshToken;
-      if (!token) return res.status(401).json({ error: "no_refresh_token" });
-
-      let payload: any;
-      try {
-        payload = jwt.verify(token, REFRESH_SECRET);
-      } catch {
-        return res.status(401).json({ error: "invalid_refresh_token" });
-      }
-
-      const result = await pool.query(
-        `SELECT id, email, role FROM users WHERE id = $1`,
-        [payload.sub],
-      );
-      if (result.rows.length === 0) return res.status(401).json({ error: "user_not_found" });
-
-      const user = result.rows[0];
-      const accessToken = jwt.sign(
-        { sub: user.id, email: user.email, role: user.role, org_id: user.org_id ?? null },
-        JWT_SECRET,
-        { expiresIn: "15m" },
-      );
-      return res.json({ accessToken });
-    } catch (err) {
-      console.error("Refresh token error:", err);
-      return res.status(500).json({ error: "server_error" });
-    }
-  });
-
-  app.post("/api/auth/logout", (req, res) => {
-    res.clearCookie("refreshToken", { path: "/api/auth" });
-    return res.json({ ok: true });
   });
 
 
@@ -2236,6 +2217,8 @@ async function handleDeviceHeartbeat(req: Request, res: Response) {
     const uptime = body.uptime ?? body.upTime ?? null;
     const localIp = body.localIp ?? body.local_ip ?? null;
     const publicIp = body.publicIp ?? body.public_ip ?? null;
+    const latitude = body.latitude ?? body.lat ?? null;
+    const longitude = body.longitude ?? body.lng ?? body.lon ?? null;
 
     const currentUrl =
       (body.currentUrl ?? body.current_url ?? body?.playback?.currentUrl ?? null) as string | null;
@@ -2273,8 +2256,10 @@ async function handleDeviceHeartbeat(req: Request, res: Response) {
         signal_strength = COALESCE($8, signal_strength),
         uptime = COALESCE($9, uptime),
         local_ip = COALESCE($10, local_ip),
-        public_ip = COALESCE($11, public_ip)
-      WHERE device_id = $12
+        public_ip = COALESCE($11, public_ip),
+        latitude = COALESCE($12, latitude),
+        longitude = COALESCE($13, longitude)
+      WHERE device_id = $14
       `,
       [
         brightness,
@@ -2288,6 +2273,8 @@ async function handleDeviceHeartbeat(req: Request, res: Response) {
         uptime,
         localIp,
         publicIp,
+        latitude,
+        longitude,
         deviceId,
       ],
     );
@@ -2309,11 +2296,6 @@ async function handleDeviceHeartbeat(req: Request, res: Response) {
       timestamp: Date.now(),
       payload: body,
     } as any);
-
-    broadcastDeviceStatus(deviceId, true, {
-      freeStorage: freeStorage ? Number(freeStorage) : undefined,
-      batteryLevel: req.body?.batteryLevel ?? null,
-    });
 
     return res.json({ ok: true, serverTime: new Date().toISOString() });
   } catch (err) {
@@ -2652,7 +2634,7 @@ app.post(
     if (!file) return res.status(400).json({ error: "No thumbnail file provided" });
 
     try {
-      const thumbnailUrl = await uploadToSupabase(file.buffer, file.originalname, file.mimetype, "thumbnails");
+      const thumbnailUrl = `/uploads/device-thumbnails/${file.filename}`;
 
       await pool.query(`UPDATE screens SET thumbnail = $1 WHERE device_id = $2`, [
         thumbnailUrl,
@@ -3569,7 +3551,8 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
           return res.status(400).json({ error: "No file uploaded" });
         }
 
-        const fileUrl = await uploadToSupabase(req.file.buffer, req.file.originalname, req.file.mimetype, "media");
+        const baseUrl = getPublicBaseUrl(req);
+        const fileUrl = `${baseUrl}/media/${req.file.filename}`;
         const fileType = req.file.mimetype.startsWith("video")
           ? "video"
           : "image";
@@ -4501,7 +4484,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         return res.status(400).json({ error: "No file uploaded" });
       }
 
-      const iconUrl = await uploadToSupabase(req.file.buffer, req.file.originalname, req.file.mimetype, "group-icons");
+      const iconUrl = `/uploads/group-icons/${req.file.filename}`;
 
       try {
         await storage.updateGroupIcon(id, iconUrl);
@@ -4526,7 +4509,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         return res.status(400).json({ error: "No file uploaded" });
       }
 
-      const iconUrl = await uploadToSupabase(req.file.buffer, req.file.originalname, req.file.mimetype, "group-icons");
+      const iconUrl = `/uploads/group-icons/${req.file.filename}`;
 
       try {
         await storage.updateGroupIcon(id, iconUrl);
@@ -5950,7 +5933,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
       const result = await pool.query(
         `INSERT INTO client_attachments (client_id, filename, original_name, mime_type, size) 
          VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-        [clientId, await uploadToSupabase(file.buffer, file.originalname, file.mimetype, "client-attachments"), file.originalname, file.mimetype, file.size]
+        [clientId, file.filename, file.originalname, file.mimetype, file.size]
       );
       
       res.status(201).json(result.rows[0]);
