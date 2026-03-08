@@ -305,11 +305,9 @@ app.use((req, res, next) => {
   // Cloud-safe: bind to all interfaces
   httpServer.listen(port, "0.0.0.0", () => {
     log(`API listening on port ${port}`);
-    process.stdout.write("[ws-init] BEFORE\n");
-    initWebSocketServer(httpServer);
-    process.stdout.write("[ws-init] AFTER\n");
   });
 })();
+
 
 
 
