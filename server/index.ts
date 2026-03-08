@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express, { type Request, Response, NextFunction } from "express";
 import path from "path";
 import cors from "cors";
@@ -303,4 +304,5 @@ app.use((req, res, next) => {
     log(`API listening on port ${port}`);
   });
 })();
+
 
