@@ -35,6 +35,7 @@ import { authenticateJWT, authenticateDevice, authenticateUserOrDevice } from ".
 import { registerAuthRoutes } from "./routes/auth.routes";
 import { registerDeviceRoutes } from "./routes/device.routes";
 import { broadcastDeviceStatus } from "./ws";
+import { uploadToSupabase } from "./storage-supabase";
 
 const uploadsDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadsDir)) {
@@ -63,13 +64,7 @@ if (!fs.existsSync(deviceThumbnailsDir)) {
 
 const frontendDir = path.join(process.cwd(), "frontend");
 
-const multerStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, uploadsDir),
-  filename: (_req, file, cb) => {
-    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
-  },
-});
+const multerStorage = multer.memoryStorage();
 
 const upload = multer({
   storage: multerStorage,
@@ -96,14 +91,7 @@ const upload = multer({
 });
 
 // Recording upload configuration
-const recordingStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, recordingsDir),
-  filename: (req, file, cb) => {
-    const deviceId = (req.params as { deviceId: string }).deviceId || "unknown";
-    const timestamp = Date.now();
-    cb(null, `${deviceId}-${timestamp}${path.extname(file.originalname)}`);
-  },
-});
+const recordingStorage = multer.memoryStorage();
 
 const recordingUpload = multer({
   storage: recordingStorage,
@@ -118,13 +106,7 @@ const recordingUpload = multer({
 });
 
 // Group icon upload configuration
-const groupIconStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, groupIconsDir),
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `group_${Date.now()}${ext}`);
-  },
-});
+const groupIconStorage = multer.memoryStorage();
 
 const groupIconUpload = multer({
   storage: groupIconStorage,
@@ -139,14 +121,7 @@ const groupIconUpload = multer({
 });
 
 // Device thumbnail upload configuration
-const deviceThumbnailStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, deviceThumbnailsDir),
-  filename: (req, file, cb) => {
-    const deviceId = (req.params as { deviceId: string }).deviceId || "unknown";
-    const ext = path.extname(file.originalname);
-    cb(null, `${deviceId}${ext}`);
-  },
-});
+const deviceThumbnailStorage = multer.memoryStorage();
 
 const deviceThumbnailUpload = multer({
   storage: deviceThumbnailStorage,
@@ -164,13 +139,7 @@ const deviceThumbnailUpload = multer({
 const clientAttachmentsDir = path.join(process.cwd(), "uploads", "clients");
 fs.mkdirSync(clientAttachmentsDir, { recursive: true });
 
-const clientAttachmentStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, clientAttachmentsDir),
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `attachment_${Date.now()}_${Math.random().toString(36).slice(2)}${ext}`);
-  },
-});
+const clientAttachmentStorage = multer.memoryStorage();
 
 const clientAttachmentUpload = multer({
   storage: clientAttachmentStorage,
@@ -1489,11 +1458,9 @@ app.post(
       return res.status(400).json({ error: "no_file_uploaded" });
     }
 
-    const filePath = `/uploads/recordings/${req.file.filename}`;
-
-    try {
-      await updateDeviceRecording(deviceId, filePath);
-      return res.json({ ok: true, filePath });
+    const filePath = await uploadToSupabase(req.file.buffer, req.file.originalname, req.file.mimetype, "recordings");
+        await updateDeviceRecording(deviceId, filePath);
+        return res.json({ ok: true, filePath });
     } catch (err) {
       console.error("Recording upload error:", err);
       return res.status(500).json({ error: "recording_upload_failed" });
@@ -2684,7 +2651,7 @@ app.post(
     if (!file) return res.status(400).json({ error: "No thumbnail file provided" });
 
     try {
-      const thumbnailUrl = `/uploads/device-thumbnails/${file.filename}`;
+      const thumbnailUrl = await uploadToSupabase(file.buffer, file.originalname, file.mimetype, "thumbnails");
 
       await pool.query(`UPDATE screens SET thumbnail = $1 WHERE device_id = $2`, [
         thumbnailUrl,
@@ -3601,8 +3568,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
           return res.status(400).json({ error: "No file uploaded" });
         }
 
-        const baseUrl = getPublicBaseUrl(req);
-        const fileUrl = `${baseUrl}/media/${req.file.filename}`;
+        const fileUrl = await uploadToSupabase(req.file.buffer, req.file.originalname, req.file.mimetype, "media");
         const fileType = req.file.mimetype.startsWith("video")
           ? "video"
           : "image";
@@ -4534,7 +4500,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         return res.status(400).json({ error: "No file uploaded" });
       }
 
-      const iconUrl = `/uploads/group-icons/${req.file.filename}`;
+      const iconUrl = await uploadToSupabase(req.file.buffer, req.file.originalname, req.file.mimetype, "group-icons");
 
       try {
         await storage.updateGroupIcon(id, iconUrl);
@@ -4559,7 +4525,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         return res.status(400).json({ error: "No file uploaded" });
       }
 
-      const iconUrl = `/uploads/group-icons/${req.file.filename}`;
+      const iconUrl = await uploadToSupabase(req.file.buffer, req.file.originalname, req.file.mimetype, "group-icons");
 
       try {
         await storage.updateGroupIcon(id, iconUrl);
@@ -5983,7 +5949,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
       const result = await pool.query(
         `INSERT INTO client_attachments (client_id, filename, original_name, mime_type, size) 
          VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-        [clientId, file.filename, file.originalname, file.mimetype, file.size]
+        [clientId, await uploadToSupabase(file.buffer, file.originalname, file.mimetype, "client-attachments"), file.originalname, file.mimetype, file.size]
       );
       
       res.status(201).json(result.rows[0]);
