@@ -1747,19 +1747,69 @@ const existingUser = await storage.getUserByEmail(email);
         return res.status(401).json({ error: "Invalid credentials" });
       }
 
-      const accessToken = jwt.sign(
-        { sub: user.id, email: user.email, role: user.role },
-        JWT_SECRET,
-        { expiresIn: "24h" },
-      );
+      const REFRESH_SECRET = process.env.REFRESH_TOKEN_SECRET || JWT_SECRET + "_refresh";
 
-      res.json({ accessToken, user: { id: user.id, email: user.email, role: user.role } });
+    const accessToken = jwt.sign(
+      { sub: user.id, email: user.email, role: user.role },
+      JWT_SECRET,
+      { expiresIn: "15m" },
+    );
+    const refreshToken = jwt.sign(
+      { sub: user.id },
+      REFRESH_SECRET,
+      { expiresIn: "30d" },
+    );
+    res.cookie("refreshToken", refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "strict",
+      maxAge: 30 * 24 * 60 * 60 * 1000,
+      path: "/api/auth",
+    });
+    res.json({ accessToken, user: { id: user.id, email: user.email, role: user.role } });
     } catch (error) {
       if (error instanceof z.ZodError) {
         return res.status(400).json({ error: error.errors });
       }
       res.status(500).json({ error: "Internal server error" });
     }
+  });
+
+app.post("/api/auth/refresh", async (req, res) => {
+    try {
+      const REFRESH_SECRET = process.env.REFRESH_TOKEN_SECRET || JWT_SECRET + "_refresh";
+      const token = req.cookies?.refreshToken;
+      if (!token) return res.status(401).json({ error: "no_refresh_token" });
+
+      let payload: any;
+      try {
+        payload = jwt.verify(token, REFRESH_SECRET);
+      } catch {
+        return res.status(401).json({ error: "invalid_refresh_token" });
+      }
+
+      const result = await pool.query(
+        `SELECT id, email, role FROM users WHERE id = $1`,
+        [payload.sub],
+      );
+      if (result.rows.length === 0) return res.status(401).json({ error: "user_not_found" });
+
+      const user = result.rows[0];
+      const accessToken = jwt.sign(
+        { sub: user.id, email: user.email, role: user.role },
+        JWT_SECRET,
+        { expiresIn: "15m" },
+      );
+      return res.json({ accessToken });
+    } catch (err) {
+      console.error("Refresh token error:", err);
+      return res.status(500).json({ error: "server_error" });
+    }
+  });
+
+  app.post("/api/auth/logout", (req, res) => {
+    res.clearCookie("refreshToken", { path: "/api/auth" });
+    return res.json({ ok: true });
   });
 
 
