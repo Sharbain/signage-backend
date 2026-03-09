@@ -4298,7 +4298,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
       const result = await pool.query(
         `SELECT dg.*, 
                 COALESCE((SELECT COUNT(*) FROM device_group_map dgm WHERE dgm.group_id = dg.id), 0)::int as device_count,
-                COALESCE((SELECT COUNT(*) FROM device_groups child WHERE child.parent_id = dg.id::text), 0)::int as subgroup_count
+                COALESCE((SELECT COUNT(*) FROM device_groups child WHERE child.parent_id = dg.id), 0)::int as subgroup_count
          FROM device_groups dg
          WHERE dg.parent_id IS NULL
          ORDER BY dg.name`
