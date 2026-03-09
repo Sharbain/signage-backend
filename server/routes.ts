@@ -6162,7 +6162,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         toAbsoluteMediaUrl(req, contentUrl) ||
         absolutizeAssetUrl(req, contentUrl) ||
         contentUrl;
-
+      await client.query("BEGIN");
       const duplicatePublishJob = await client.query(
         `
         SELECT id,
@@ -6200,7 +6200,6 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         });
       }
 
-      await client.query("BEGIN");
 
       const publishJob = await client.query(
         `INSERT INTO publish_jobs (
