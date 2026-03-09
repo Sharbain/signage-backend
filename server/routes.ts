@@ -2246,36 +2246,20 @@ async function handleDeviceHeartbeat(req: Request, res: Response) {
         last_seen = NOW(),
         status = 'online',
         is_online = TRUE,
-        brightness = COALESCE($1, brightness),
-        volume = COALESCE($2, volume),
-        screen_state = COALESCE($3, screen_state),
-        apk_version = COALESCE($4, apk_version),
-        temperature = COALESCE($5, temperature),
-        free_storage = COALESCE($6, free_storage),
-        total_storage = COALESCE($7, total_storage),
-        signal_strength = COALESCE($8, signal_strength),
-        uptime = COALESCE($9, uptime),
-        local_ip = COALESCE($10, local_ip),
-        public_ip = COALESCE($11, public_ip),
-        latitude = COALESCE($13, latitude),
-        longitude = COALESCE($14, longitude)
-      WHERE device_id = $12
+        apk_version = COALESCE($1, apk_version),
+        local_ip = COALESCE($2, local_ip),
+        public_ip = COALESCE($3, public_ip),
+        latitude = COALESCE($4, latitude),
+        longitude = COALESCE($5, longitude)
+      WHERE device_id = $6
       `,
       [
-        brightness,
-        volume,
-        screenState,
         apkVersion,
-        temperature,
-        freeStorage,
-        totalStorage,
-        signalStrength,
-        uptime,
         localIp,
         publicIp,
-        deviceId,
         latitude,
         longitude,
+        deviceId,
       ],
     );
 
