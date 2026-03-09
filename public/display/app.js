@@ -573,6 +573,30 @@
     }
   }
 
+// ---- Remote inject (from ContentBridge / Android) ----
+  window.__LUMINA_INJECT_PLAYLIST__ = function (items) {
+    try {
+      if (!Array.isArray(items) || !items.length) return;
+      clearTimers();
+      state.stopped = false;
+      state.playlist = items.map(function (item) {
+        return {
+          url: String(item.url || ""),
+          type: String(item.type || "image"),
+          name: String(item.name || "Content"),
+          duration: Number(item.duration) > 0 ? Number(item.duration) : 30,
+        };
+      });
+      state.index = 0;
+      state.mode = "online";
+      state.lastError = "";
+      startWatchdog();
+      scheduleNextItem();
+    } catch (e) {
+      console.error("__LUMINA_INJECT_PLAYLIST__ error:", e);
+    }
+  };
+
   // Boot
   state.screenId = getScreenIdFromPath();
   start();
