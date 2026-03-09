@@ -6098,10 +6098,11 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
       
       const result = await pool.query(
         `INSERT INTO publish_jobs (device_id, device_name, content_type, content_id, content_name, total_bytes) 
-         VALUES ($1, $2, $3, $4, $5, $6) 
-         RETURNING id, device_id as "deviceId", device_name as "deviceName", content_type as "contentType", 
-                   content_id as "contentId", content_name as "contentName", status, progress, 
-                   total_bytes as "totalBytes", started_at as "startedAt"`,
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT DO NOTHING
+           RETURNING id, device_id as "deviceId", device_name as "deviceName", content_type as "contentType", 
+           content_id as "contentId", content_name as "contentName", status, progress,
+           total_bytes as "totalBytes", started_at as "startedAt"`,
         [deviceId, deviceName, contentType, contentId, contentName, totalBytes || null]
       );
       res.status(201).json(result.rows[0]);
