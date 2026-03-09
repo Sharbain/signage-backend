@@ -6202,6 +6202,15 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
 
 
         const publishJob = await client.query(
+
+// Clean up old completed jobs for this device+content to prevent Monitor clutter
+await client.query(
+  `DELETE FROM publish_jobs 
+   WHERE device_id = $1 AND content_name = $2 AND content_type = $3 
+   AND status IN ('completed', 'failed')`,
+  [deviceId, contentName, normalizedContentType]
+);
+
           `INSERT INTO publish_jobs (
               device_id,
               device_name,
