@@ -6201,30 +6201,47 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
       }
 
 
-      const publishJob = await client.query(
-        `INSERT INTO publish_jobs (
-            device_id,
-            device_name,
-            content_type,
-            content_id,
-            content_name,
-            total_bytes,
-            status,
-            progress
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0)
-         RETURNING id, device_id as "deviceId", device_name as "deviceName", content_type as "contentType",
-                   content_id as "contentId", content_name as "contentName", status, progress,
-                   total_bytes as "totalBytes", started_at as "startedAt"`,
-        [
-          deviceId,
-          resolvedDeviceName,
-          normalizedContentType,
-          numericContentId,
-          contentName,
-          totalBytes ?? null,
-        ]
-      );
+        const publishJob = await client.query(
+          `INSERT INTO publish_jobs (
+              device_id,
+              device_name,
+              content_type,
+              content_id,
+              content_name,
+              total_bytes,
+              status,
+              progress
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0)
+          ON CONFLICT DO NOTHING
+          RETURNING id, device_id as "deviceId", device_name as "deviceName", content_type as "contentType",
+                    content_id as "contentId", content_name as "contentName", status, progress,
+                    total_bytes as "totalBytes", started_at as "startedAt"`,
+          [
+            deviceId,
+            resolvedDeviceName,
+            normalizedContentType,
+            numericContentId,
+            contentName,
+            totalBytes ?? null,
+          ]
+        );
+
+        if (!publishJob.rows[0]) {
+        // Duplicate blocked by unique index — return existing job
+        await client.query("ROLLBACK");
+        const existing = await pool.query(
+          `SELECT id, device_id as "deviceId", device_name as "deviceName", content_type as "contentType",
+                  content_id as "contentId", content_name as "contentName", status, progress,
+                  total_bytes as "totalBytes", started_at as "startedAt"
+           FROM publish_jobs 
+           WHERE device_id=$1 AND content_name=$2 AND content_type=$3 
+           AND status IN ('pending','downloading') 
+           ORDER BY started_at DESC LIMIT 1`,
+          [deviceId, contentName, normalizedContentType]
+        );
+        return res.status(200).json({ success: true, duplicate: true, publishJob: existing.rows[0], queued: null });
+      }
 
       let instantPlaylist: { playlistId: number; playlistName: string } | null = null;
 
