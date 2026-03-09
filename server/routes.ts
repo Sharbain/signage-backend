@@ -2217,6 +2217,8 @@ async function handleDeviceHeartbeat(req: Request, res: Response) {
     const uptime = body.uptime ?? body.upTime ?? null;
     const localIp = body.localIp ?? body.local_ip ?? null;
     const publicIp = body.publicIp ?? body.public_ip ?? null;
+    const latitude = body.latitude ?? body.lat ?? body?.location?.latitude ?? null;
+    const longitude = body.longitude ?? body.lng ?? body.lon ?? body?.location?.longitude ?? null;
 
     const currentUrl =
       (body.currentUrl ?? body.current_url ?? body?.playback?.currentUrl ?? null) as string | null;
@@ -2254,7 +2256,9 @@ async function handleDeviceHeartbeat(req: Request, res: Response) {
         signal_strength = COALESCE($8, signal_strength),
         uptime = COALESCE($9, uptime),
         local_ip = COALESCE($10, local_ip),
-        public_ip = COALESCE($11, public_ip)
+        public_ip = COALESCE($11, public_ip),
+        latitude = COALESCE($13, latitude),
+        longitude = COALESCE($14, longitude)
       WHERE device_id = $12
       `,
       [
@@ -2270,6 +2274,8 @@ async function handleDeviceHeartbeat(req: Request, res: Response) {
         localIp,
         publicIp,
         deviceId,
+        latitude,
+        longitude,
       ],
     );
 
@@ -6176,12 +6182,13 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         WHERE device_id = $1
           AND COALESCE(content_id, -1) = COALESCE($2, -1)
           AND content_name = $3
+          AND content_type = $4
           AND status IN ('pending', 'downloading')
-          AND started_at > NOW() - INTERVAL '15 seconds'
+          AND started_at > NOW() - INTERVAL '30 seconds'
         ORDER BY started_at DESC
         LIMIT 1
         `,
-        [deviceId, numericContentId, contentName],
+        [deviceId, numericContentId, contentName, normalizedContentType],
       );
 
       if (duplicatePublishJob.rowCount && duplicatePublishJob.rows[0]) {
