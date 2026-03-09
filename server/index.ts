@@ -9,6 +9,7 @@ import cookieParser from "cookie-parser";
 import { registerRoutes } from "./routes";
 import { initWebSocketServer } from "./ws";
 import { createServer } from "http";
+import { pool } from "./db";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -173,6 +174,33 @@ app.use((req, res, next) => {
 (async () => {
   await registerRoutes(httpServer, app);
   initWebSocketServer(httpServer);
+
+  /* --------------------------------------------------
+     HEARTBEAT WATCHDOG
+     Marks devices offline if no heartbeat in 5 minutes.
+     Runs every 2 minutes.
+  -------------------------------------------------- */
+  async function markStaleDevicesOffline() {
+    try {
+      const result = await pool.query(`
+        UPDATE screens
+        SET is_online = false, status = 'offline'
+        WHERE is_online = true
+          AND (last_seen IS NULL OR last_seen < NOW() - INTERVAL '5 minutes')
+      `);
+      if (result.rowCount && result.rowCount > 0) {
+        log(`[watchdog] Marked ${result.rowCount} stale device(s) offline`);
+      }
+    } catch (err) {
+      console.error("[watchdog] Failed to mark stale devices:", err);
+    }
+  }
+
+  // Run once at startup to immediately fix any stale devices
+  markStaleDevicesOffline();
+
+  // Then every 2 minutes
+  setInterval(markStaleDevicesOffline, 2 * 60 * 1000);
 
   app.get("/display", (_req, res) => {
     res.status(200).send(
