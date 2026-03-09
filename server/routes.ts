@@ -6201,31 +6201,29 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
       }
 
 
-        const publishJob = await client.query(
-
-// Clean up old completed jobs for this device+content to prevent Monitor clutter
-await client.query(
-  `DELETE FROM publish_jobs 
-   WHERE device_id = $1 AND content_name = $2 AND content_type = $3 
-   AND status IN ('completed', 'failed')`,
-  [deviceId, contentName, normalizedContentType]
-);
-
-          `INSERT INTO publish_jobs (
-              device_id,
-              device_name,
-              content_type,
-              content_id,
-              content_name,
-              total_bytes,
-              status,
-              progress
-          )
-          VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0)
-          ON CONFLICT DO NOTHING
-          RETURNING id, device_id as "deviceId", device_name as "deviceName", content_type as "contentType",
-                    content_id as "contentId", content_name as "contentName", status, progress,
-                    total_bytes as "totalBytes", started_at as "startedAt"`,
+      // Clean up old completed jobs for this device+content to prevent Monitor clutter
+      await client.query(
+        `DELETE FROM publish_jobs
+         WHERE device_id = $1 AND content_name = $2 AND content_type = $3
+         AND status IN ('completed', 'failed')`,
+        [deviceId, contentName, normalizedContentType]
+      );
+      const publishJob = await client.query(
+        `INSERT INTO publish_jobs (
+            device_id,
+            device_name,
+            content_type,
+            content_id,
+            content_name,
+            total_bytes,
+            status,
+            progress
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0)
+         ON CONFLICT DO NOTHING
+         RETURNING id, device_id as "deviceId", device_name as "deviceName", content_type as "contentType",
+                   content_id as "contentId", content_name as "contentName", status, progress,
+                   total_bytes as "totalBytes", started_at as "startedAt"`,
           [
             deviceId,
             resolvedDeviceName,
