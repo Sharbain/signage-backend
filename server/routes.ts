@@ -2615,6 +2615,66 @@ app.get(
   },
 );
 
+// ── Device state: last known brightness, volume, mute from command history ──
+app.get(
+  "/api/admin/devices/:deviceId/state",
+  authenticateJWT,
+  requireRole("admin", "manager"),
+  async (req, res) => {
+    const deviceId = String(req.params.deviceId || "").trim();
+    if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
+
+    try {
+      // Grab the most recent command of each relevant type
+      const result = await pool.query(
+        `
+        SELECT DISTINCT ON (payload->>'type')
+          payload,
+          created_at
+        FROM device_commands
+        WHERE device_id = $1
+          AND payload->>'type' IN ('brightness', 'volume', 'mute', 'unmute')
+        ORDER BY payload->>'type', created_at DESC
+        `,
+        [deviceId]
+      );
+
+      let brightness: number | null = null;
+      let volume: number | null = null;
+      let muted: boolean | null = null;
+      let muteTime: Date | null = null;
+      let unmuteTime: Date | null = null;
+
+      for (const row of result.rows) {
+        const p = typeof row.payload === "string" ? JSON.parse(row.payload) : row.payload;
+        const type = (p?.type || "").toLowerCase();
+
+        if (type === "brightness" && p.value != null) {
+          brightness = Number(p.value);
+        } else if (type === "volume" && p.value != null) {
+          volume = Number(p.value);
+        } else if (type === "mute") {
+          muteTime = new Date(row.created_at);
+        } else if (type === "unmute") {
+          unmuteTime = new Date(row.created_at);
+        }
+      }
+
+      // Determine current mute state by whichever happened more recently
+      if (muteTime || unmuteTime) {
+        if (!unmuteTime) muted = true;
+        else if (!muteTime) muted = false;
+        else muted = muteTime > unmuteTime;
+      }
+
+      return res.json({ brightness, volume, muted });
+    } catch (err) {
+      console.error("Device state error:", err);
+      return res.status(500).json({ error: "failed_to_fetch_device_state" });
+    }
+  }
+);
+
 // ❌ Deprecated (device should NOT send commands here)
 app.post("/api/device/:deviceId/command", (_req, res) => {
   return res.status(410).json({ error: "moved_to_/api/admin/devices/:deviceId/command" });
