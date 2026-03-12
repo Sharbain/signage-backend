@@ -6096,11 +6096,12 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
     );
 
     await client.query(
-      `
-      INSERT INTO playlist_assignments (playlist_id, device_id, assigned_at)
-      VALUES ($1, $2, NOW())
-      `,
-      [playlistId, deviceId],
+  `
+  INSERT INTO playlist_assignments (playlist_id, device_id, assigned_at)
+  VALUES ($1, $2, NOW())
+  ON CONFLICT (playlist_id, device_id) DO UPDATE SET assigned_at = NOW()
+  `,
+  [playlistId, deviceId],
     );
 
     return { playlistId, playlistName };
