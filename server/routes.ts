@@ -34,6 +34,13 @@ import { requireRole } from "./middleware/permissions";
 import { authenticateJWT, authenticateDevice, authenticateUserOrDevice } from "./middleware/auth";
 import { registerAuthRoutes } from "./routes/auth.routes";
 import { registerDeviceRoutes } from "./routes/device.routes";
+import { createClient } from "@supabase/supabase-js";
+
+// Supabase Storage client (server-side, uses service role key)
+const supabaseAdmin = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+);
 
 const uploadsDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadsDir)) {
@@ -89,6 +96,23 @@ const upload = multer({
     const ext = path.extname(file.originalname).toLowerCase();
     const mime = String(file.mimetype || "").toLowerCase();
 
+    if (allowedExts.has(ext) && allowedMimes.has(mime)) cb(null, true);
+    else cb(new Error("Only JPG/JPEG/PNG/GIF/WebP/MP4/WebM/MOV files allowed"));
+  },
+});
+
+// Supabase Storage upload — uses memory buffer instead of disk
+const uploadMemory = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 500 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const allowedExts = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".webm", ".mov"]);
+    const allowedMimes = new Set([
+      "image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp",
+      "video/mp4", "video/webm", "video/quicktime",
+    ]);
+    const ext = path.extname(file.originalname).toLowerCase();
+    const mime = String(file.mimetype || "").toLowerCase();
     if (allowedExts.has(ext) && allowedMimes.has(mime)) cb(null, true);
     else cb(new Error("Only JPG/JPEG/PNG/GIF/WebP/MP4/WebM/MOV files allowed"));
   },
@@ -3544,18 +3568,38 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
 
   app.post(
     "/api/media/upload",
-    upload.single("file"),
+    uploadMemory.single("file"),
     async (req, res) => {
       try {
         if (!req.file) {
           return res.status(400).json({ error: "No file uploaded" });
         }
 
-        const baseUrl = getPublicBaseUrl(req);
-        const fileUrl = `${baseUrl}/media/${req.file.filename}`;
-        const fileType = req.file.mimetype.startsWith("video")
-          ? "video"
-          : "image";
+        // Generate unique filename
+        const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+        const ext = path.extname(req.file.originalname);
+        const filename = uniqueSuffix + ext;
+
+        // Upload buffer to Supabase Storage bucket "media"
+        const { error: uploadError } = await supabaseAdmin.storage
+          .from("media")
+          .upload(filename, req.file.buffer, {
+            contentType: req.file.mimetype,
+            upsert: false,
+          });
+
+        if (uploadError) {
+          console.error("Supabase Storage upload error:", uploadError);
+          return res.status(500).json({ error: "Failed to upload to storage" });
+        }
+
+        // Get permanent public URL
+        const { data: urlData } = supabaseAdmin.storage
+          .from("media")
+          .getPublicUrl(filename);
+
+        const fileUrl = urlData.publicUrl;
+        const fileType = req.file.mimetype.startsWith("video") ? "video" : "image";
 
         const mediaItem = await storage.createMedia({
           name: req.file.originalname,
@@ -3570,6 +3614,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
           media: normalizeMediaRow(req, mediaItem as any),
         });
       } catch (error) {
+        console.error("Media upload error:", error);
         res.status(500).json({ error: "Failed to upload file" });
       }
     },
