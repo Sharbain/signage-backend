@@ -807,22 +807,12 @@ app.post("/api/devices/pair", handleDeviceActivate);
         await safeDelete(`DELETE FROM publish_jobs WHERE device_id = $1`, [deviceId]);
         await safeDelete(`DELETE FROM publish_jobs WHERE screen_id = $1`, [screenId]);
 
-        const archiveScreen = await client.query(
-          `
-          UPDATE screens
-          SET
-            archived = true,
-            status = 'offline',
-            is_online = false,
-            updated_at = NOW()
-          WHERE device_id = $1
-          RETURNING id, device_id, name, archived
-          `,
-          [deviceId],
-        );
+        // Hard-delete the screen row (no archived column in schema)
+        await client.query(`DELETE FROM screens WHERE device_id = $1`, [deviceId]);
 
         await client.query("COMMIT");
 
+        // Clear any in-memory caches keyed by deviceId
         if (typeof pendingCommands !== "undefined") delete pendingCommands[deviceId];
         if (typeof playlists !== "undefined") delete playlists[deviceId];
         if (typeof zonePlaylists !== "undefined") delete zonePlaylists[deviceId];
@@ -832,19 +822,12 @@ app.post("/api/devices/pair", handleDeviceActivate);
 
         return res.json({
           success: true,
-          archived: true,
-          removed:
-            archiveScreen.rows[0] || {
-              id: screenId,
-              device_id: deviceId,
-              name: screen.name,
-              archived: true,
-            },
+          removed: { id: screenId, device_id: deviceId, name: screen.name },
         });
       } catch (err) {
         await client.query("ROLLBACK");
-        console.error("ADMIN DEVICE ARCHIVE ERROR:", err);
-        return res.status(500).json({ error: "failed_to_archive_device" });
+        console.error("ADMIN DEVICE DELETE ERROR:", err);
+        return res.status(500).json({ error: "failed_to_delete_device" });
       } finally {
         client.release();
       }
