@@ -1249,7 +1249,20 @@ app.get("/api/dashboard/live-content", authenticateJWT, async (_req, res) => {
         let status = "queued";
         let progress = 0;
 
+        // Fire-and-forget commands: treat as completed once sent — no ack expected
+        const FIRE_AND_FORGET = new Set([
+          "reboot", "restart_app", "screen_on", "screen_off",
+          "mute", "unmute", "kiosk_on", "kiosk_off", "refresh",
+          "brightness", "volume", "set_pin",
+        ]);
+        const cmdType = (payload.type || "").toLowerCase();
+        const isFireAndForget = FIRE_AND_FORGET.has(cmdType);
+
         if (cmd.executed) {
+          status = "completed";
+          progress = 100;
+        } else if (cmd.sent && isFireAndForget) {
+          // Treat as completed — device executed it but won't send an ack
           status = "completed";
           progress = 100;
         } else if (cmd.sent) {
