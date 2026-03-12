@@ -787,11 +787,15 @@ app.post("/api/devices/pair", handleDeviceActivate);
         const screen = screenResult.rows[0];
         const screenId = screen.id;
 
+        // safeDelete uses savepoints so a missing table doesn't abort the transaction
         const safeDelete = async (sql: string, params: any[]) => {
           try {
+            await client.query("SAVEPOINT pre_cleanup");
             await client.query(sql, params);
-          } catch (cleanupErr) {
-            console.warn("device archive cleanup skipped:", sql, cleanupErr);
+            await client.query("RELEASE SAVEPOINT pre_cleanup");
+          } catch (cleanupErr: any) {
+            await client.query("ROLLBACK TO SAVEPOINT pre_cleanup").catch(() => {});
+            console.warn("device cleanup skipped (table may not exist):", cleanupErr?.message);
           }
         };
 
