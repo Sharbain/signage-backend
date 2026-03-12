@@ -16,7 +16,7 @@
   "dependencies": {
     "@jridgewell/trace-mapping": "^0.3.25",
     "@neondatabase/serverless": "^0.10.4",
-    "@supabase/supabase-js": "^2.97.0",
+    "@supabase/supabase-js": "^2.99.1",
     "@types/bcrypt": "^6.0.0",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/multer": "^2.0.0",
