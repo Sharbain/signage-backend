@@ -44,17 +44,9 @@ export function initWebSocketServer(httpServer: Server) {
   }
 }
 
-export function broadcastDeviceStatus(deviceId: string, isOnline: boolean, extra?: Record<string, any>) {
-  if (dashboardClients.size === 0) return;
+// ── Internal helper ────────────────────────────────────────────────────────
 
-  const message = JSON.stringify({
-    type: "device_status",
-    deviceId,
-    isOnline,
-    timestamp: new Date().toISOString(),
-    ...extra,
-  });
-
+function broadcast(message: string) {
   for (const client of dashboardClients) {
     if (client.readyState === WebSocket.OPEN) {
       try {
@@ -64,4 +56,55 @@ export function broadcastDeviceStatus(deviceId: string, isOnline: boolean, extra
       }
     }
   }
+}
+
+// ── Public broadcast functions ─────────────────────────────────────────────
+
+export function broadcastDeviceStatus(
+  deviceId: string,
+  isOnline: boolean,
+  extra?: Record<string, any>,
+) {
+  if (dashboardClients.size === 0) return;
+  broadcast(
+    JSON.stringify({
+      type: "device_status",
+      deviceId,
+      isOnline,
+      timestamp: new Date().toISOString(),
+      ...extra,
+    }),
+  );
+}
+
+export interface PublishJobPayload {
+  id: number;
+  deviceId: string;
+  deviceName: string;
+  contentType: string;
+  contentId: number | null;
+  contentName: string;
+  status: string;
+  progress: number | null;
+  totalBytes: number | null;
+  downloadedBytes: number | null;
+  errorMessage: string | null;
+  startedAt: string;
+  completedAt: string | null;
+}
+
+/**
+ * Broadcast a publish job state change to all connected CMS dashboard clients.
+ * Called from the PATCH /api/publish-jobs/:id handler after every Android progress report.
+ * Lets Monitor.tsx receive instant updates via WebSocket instead of waiting for the 3s poll.
+ */
+export function broadcastPublishJobUpdate(job: PublishJobPayload) {
+  if (dashboardClients.size === 0) return;
+  broadcast(
+    JSON.stringify({
+      type: "publish_job_update",
+      job,
+      timestamp: new Date().toISOString(),
+    }),
+  );
 }
