@@ -1594,6 +1594,51 @@ app.get(
   },
 );
 
+  // =====================================================
+  // DEVICE STATE (brightness + volume last known values)
+  // =====================================================
+  app.get(
+    "/api/admin/devices/:deviceId/state",
+    authenticateJWT,
+    requireRole("admin", "manager"),
+    async (req, res) => {
+      const deviceId = String(req.params.deviceId || "").trim();
+      if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
+
+      try {
+        // Pull last brightness and volume from device_commands history
+        const result = await pool.query(
+          `SELECT payload FROM device_commands
+           WHERE device_id = $1
+             AND payload->>'type' IN ('brightness', 'volume')
+             AND sent = true
+           ORDER BY created_at DESC
+           LIMIT 20`,
+          [deviceId]
+        );
+
+        let brightness: number | null = null;
+        let volume: number | null = null;
+
+        for (const row of result.rows) {
+          const p = row.payload || {};
+          if (brightness === null && p.type === 'brightness' && p.value != null) {
+            brightness = Number(p.value);
+          }
+          if (volume === null && p.type === 'volume' && p.value != null) {
+            volume = Number(p.value);
+          }
+          if (brightness !== null && volume !== null) break;
+        }
+
+        return res.json({ brightness, volume });
+      } catch (err) {
+        console.error("Device state error:", err);
+        return res.status(500).json({ error: "failed_to_get_state" });
+      }
+    }
+  );
+
   // GET LAST RECORDING FOR A DEVICE (CMS uses this)
   
 
