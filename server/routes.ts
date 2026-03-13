@@ -35,6 +35,7 @@ import { authenticateJWT, authenticateDevice, authenticateUserOrDevice } from ".
 import { registerAuthRoutes } from "./routes/auth.routes";
 import { registerDeviceRoutes } from "./routes/device.routes";
 import { createClient } from "@supabase/supabase-js";
+import { broadcastPublishJobUpdate } from "./ws";
 
 // Supabase Storage client (server-side, uses service role key)
 const supabaseAdmin = createClient(
@@ -6601,7 +6602,9 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         return res.status(404).json({ error: "Publish job not found" });
       }
       
-      res.json(result.rows[0]);
+      const updatedJob = result.rows[0];
+      broadcastPublishJobUpdate(updatedJob);  // instant WS push to Monitor
+      res.json(updatedJob);
     } catch (err) {
       console.error("Update publish job error:", err);
       res.status(500).json({ error: "Failed to update publish job" });
