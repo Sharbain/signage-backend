@@ -2560,7 +2560,36 @@ app.post(
         const deviceName =
           String(raw?.deviceName || screenResult.rows[0]?.name || deviceId).trim() || deviceId;
 
-        const totalBytesRaw = raw?.totalBytes ?? raw?.size ?? raw?.contentSize ?? null;
+        let totalBytesRaw = raw?.totalBytes ?? raw?.size ?? raw?.contentSize ?? null;
+
+        // Auto-calculate total bytes from playlist media items if not provided
+        if ((totalBytesRaw == null || totalBytesRaw === "") &&
+            (payload.contentType === "playlist" || raw?.contentType === "playlist")) {
+          const playlistId = payload.contentId ?? raw?.contentId ?? null;
+          if (playlistId) {
+            try {
+              const sizeResult = await pool.query(
+                `SELECT COALESCE(SUM(m.size), 0) as total
+                 FROM playlist_items pi
+                 JOIN media m ON m.id = pi.media_id
+                 WHERE pi.playlist_id = $1 AND m.size IS NOT NULL`,
+                [playlistId]
+              );
+              const sum = Number(sizeResult.rows[0]?.total ?? 0);
+              if (sum > 0) totalBytesRaw = sum;
+
+              // Also store files_total count
+              const countResult = await pool.query(
+                `SELECT COUNT(*) as cnt FROM playlist_items WHERE playlist_id = $1`,
+                [playlistId]
+              );
+              payload._filesTotal = Number(countResult.rows[0]?.cnt ?? 0);
+            } catch (e) {
+              console.warn("Failed to calculate playlist size:", e);
+            }
+          }
+        }
+
         const totalBytes =
           totalBytesRaw == null || totalBytesRaw === ""
             ? null
@@ -2581,7 +2610,7 @@ app.post(
               status,
               progress
             )
-            VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0)
+            VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0, $7)
             RETURNING id, started_at
             `,
             [
@@ -2591,6 +2620,7 @@ app.post(
               payload.contentId ?? raw?.contentId ?? null,
               String(payload.contentName || raw?.contentName || payload.type || "content"),
               totalBytes,
+              payload._filesTotal ?? null,
             ],
           );
 
