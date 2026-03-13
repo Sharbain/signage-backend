@@ -4000,6 +4000,40 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
     }
   });
 
+  // Reorder playlist items
+  app.patch("/api/content-playlists/:id/reorder", async (req, res) => {
+    try {
+      const playlistId = parseInt(req.params.id);
+      const { orderedItemIds } = req.body; // array of itemIds in new order
+
+      if (!Array.isArray(orderedItemIds) || orderedItemIds.length === 0) {
+        return res.status(400).json({ error: "orderedItemIds array required" });
+      }
+
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        for (let i = 0; i < orderedItemIds.length; i++) {
+          await client.query(
+            `UPDATE playlist_items SET position = $1 WHERE id = $2 AND playlist_id = $3`,
+            [i, orderedItemIds[i], playlistId]
+          );
+        }
+        await client.query("COMMIT");
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      } finally {
+        client.release();
+      }
+
+      return res.json({ message: "Reordered successfully" });
+    } catch (error) {
+      console.error("Reorder playlist error:", error);
+      return res.status(500).json({ error: "Failed to reorder playlist" });
+    }
+  });
+
   // Playlist Routes
   app.get("/api/playlists/:screenId", async (req, res) => {
     try {
