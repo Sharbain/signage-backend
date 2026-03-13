@@ -2629,7 +2629,7 @@ app.post(
               progress,
               files_total
             )
-            VALUES ($1, $2, $3, COALESCE($4::text, '0'), $5, $6, 'pending', 0, COALESCE($7, 0))
+            VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0, COALESCE($7, 0))
             RETURNING id, started_at
             `,
             [
@@ -6317,7 +6317,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
       
       const result = await pool.query(
         `INSERT INTO publish_jobs (device_id, device_name, content_type, content_id, content_name, total_bytes) 
-           VALUES ($1, $2, $3, COALESCE($4::text, '0'), $5, $6)
+           VALUES ($1, $2, $3, $4, $5, $6)
            RETURNING id, device_id as "deviceId", device_name as "deviceName", content_type as "contentType", 
            content_id as "contentId", content_name as "contentName", status, progress,
            total_bytes as "totalBytes", started_at as "startedAt"`,
@@ -6439,7 +6439,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
             progress,
             files_total
          )
-         VALUES ($1, $2, $3, COALESCE($4::text, '0'), $5, $6, 'pending', 0, COALESCE($7, 0))
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0, COALESCE($7, 0))
          RETURNING id, device_id as "deviceId", device_name as "deviceName", content_type as "contentType",
                    content_id as "contentId", content_name as "contentName", status, progress,
                    total_bytes as "totalBytes", started_at as "startedAt"`,
