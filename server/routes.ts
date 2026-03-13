@@ -6224,6 +6224,12 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
   }
 
   // Publish Jobs API
+  // Migrate: add files_downloaded / files_total columns if missing
+  try {
+    await pool.query(`ALTER TABLE publish_jobs ADD COLUMN IF NOT EXISTS files_downloaded INTEGER DEFAULT 0`);
+    await pool.query(`ALTER TABLE publish_jobs ADD COLUMN IF NOT EXISTS files_total INTEGER DEFAULT 0`);
+  } catch (e) { /* columns may already exist */ }
+
   app.get("/api/publish-jobs", async (req, res) => {
     try {
       const result = await pool.query(
@@ -6238,6 +6244,8 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
           progress, 
           total_bytes as "totalBytes", 
           downloaded_bytes as "downloadedBytes", 
+          files_downloaded as "filesDownloaded",
+          files_total as "filesTotal",
           error_message as "errorMessage", 
           started_at as "startedAt", 
           completed_at as "completedAt"
@@ -6507,6 +6515,14 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
       if (downloadedBytes !== undefined) {
         updates.push(`downloaded_bytes = $${paramCount++}`);
         values.push(downloadedBytes);
+      }
+      if (req.body.filesDownloaded !== undefined) {
+        updates.push(`files_downloaded = $${paramCount++}`);
+        values.push(req.body.filesDownloaded);
+      }
+      if (req.body.filesTotal !== undefined) {
+        updates.push(`files_total = $${paramCount++}`);
+        values.push(req.body.filesTotal);
       }
       if (errorMessage !== undefined) {
         updates.push(`error_message = $${paramCount++}`);
