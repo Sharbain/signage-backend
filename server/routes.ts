@@ -462,7 +462,7 @@ export async function registerRoutes(
   registerAuthRoutes(app);
   registerDeviceRoutes(app);
   await registerPublishJobRoutes(app);
-  registerScreensRoutes(app);
+  await registerScreensRoutes(app);
   registerClientRoutes(app);
   registerScheduleRoutes(app);
 
