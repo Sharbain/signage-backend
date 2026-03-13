@@ -1199,17 +1199,25 @@ app.get("/api/devices/:id", async (req, res) => {
   app.get("/api/dashboard/alerts", async (_req, res) => {
     try {
       const result = await pool.query(`
-        SELECT name, device_id
+        SELECT
+          name,
+          device_id,
+          COALESCE(last_seen, last_seen_at, updated_at) AS last_seen,
+          EXTRACT(EPOCH FROM (NOW() - COALESCE(last_seen, last_seen_at, updated_at))) / 60 AS offline_minutes
         FROM screens
         WHERE is_online = false
           AND COALESCE(archived, false) = false
-        ORDER BY last_seen DESC
-        LIMIT 10
+          AND COALESCE(last_seen, last_seen_at, updated_at) < NOW() - INTERVAL '5 minutes'
+        ORDER BY last_seen ASC
+        LIMIT 20
       `);
 
       const alerts = result.rows.map((d) => ({
-        message: `Device "${d.name}" has gone offline.`,
         deviceId: d.device_id,
+        deviceName: d.name,
+        lastSeen: d.last_seen ? new Date(d.last_seen).toISOString() : null,
+        offlineMinutes: Math.floor(Number(d.offline_minutes ?? 0)),
+        message: `Device "${d.name}" has gone offline.`,
         type: "offline",
       }));
 
