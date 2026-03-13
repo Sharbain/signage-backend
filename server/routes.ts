@@ -34,8 +34,8 @@ import { requireRole } from "./middleware/permissions";
 import { authenticateJWT, authenticateDevice, authenticateUserOrDevice } from "./middleware/auth";
 import { registerAuthRoutes } from "./routes/auth.routes";
 import { registerDeviceRoutes } from "./routes/device.routes";
-import { createClient } from "@supabase/supabase-js";
 import { broadcastPublishJobUpdate } from "./ws";
+import { createClient } from "@supabase/supabase-js";
 
 // Supabase Storage client (server-side, uses service role key)
 const supabaseAdmin = createClient(
@@ -6440,8 +6440,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
             progress,
             files_total
          )
-         VALUES ($1, $2, $3, COALESCE($4::text, '0'), $5, $6, 'pending', 0, $7)
-         ON CONFLICT DO NOTHING
+         VALUES ($1, $2, $3, COALESCE($4::text, '0'), $5, $6, 'pending', 0, COALESCE($7, 0))
          RETURNING id, device_id as "deviceId", device_name as "deviceName", content_type as "contentType",
                    content_id as "contentId", content_name as "contentName", status, progress,
                    total_bytes as "totalBytes", started_at as "startedAt"`,
@@ -6457,19 +6456,9 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
         );
 
         if (!publishJob.rows[0]) {
-        // Duplicate blocked by unique index — return existing job
         await client.query("ROLLBACK");
-        const existing = await pool.query(
-          `SELECT id, device_id as "deviceId", device_name as "deviceName", content_type as "contentType",
-                  content_id as "contentId", content_name as "contentName", status, progress,
-                  total_bytes as "totalBytes", started_at as "startedAt"
-           FROM publish_jobs 
-           WHERE device_id=$1 AND content_name=$2 AND content_type=$3 
-           AND status IN ('pending','downloading') 
-           ORDER BY started_at DESC LIMIT 1`,
-          [deviceId, contentName, normalizedContentType]
-        );
-        return res.status(200).json({ success: true, duplicate: true, publishJob: existing.rows[0], queued: null });
+        console.error("Queue publish job: INSERT returned no rows — unexpected");
+        return res.status(500).json({ error: "Failed to create publish job" });
       }
 
       let instantPlaylist: { playlistId: number; playlistName: string } | null = null;
