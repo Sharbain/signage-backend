@@ -787,15 +787,11 @@ app.post("/api/devices/pair", handleDeviceActivate);
         const screen = screenResult.rows[0];
         const screenId = screen.id;
 
-        // safeDelete uses savepoints so a missing table doesn't abort the transaction
         const safeDelete = async (sql: string, params: any[]) => {
           try {
-            await client.query("SAVEPOINT pre_cleanup");
             await client.query(sql, params);
-            await client.query("RELEASE SAVEPOINT pre_cleanup");
-          } catch (cleanupErr: any) {
-            await client.query("ROLLBACK TO SAVEPOINT pre_cleanup").catch(() => {});
-            console.warn("device cleanup skipped (table may not exist):", cleanupErr?.message);
+          } catch (cleanupErr) {
+            console.warn("device archive cleanup skipped:", sql, cleanupErr);
           }
         };
 
@@ -811,12 +807,22 @@ app.post("/api/devices/pair", handleDeviceActivate);
         await safeDelete(`DELETE FROM publish_jobs WHERE device_id = $1`, [deviceId]);
         await safeDelete(`DELETE FROM publish_jobs WHERE screen_id = $1`, [screenId]);
 
-        // Hard-delete the screen row (no archived column in schema)
-        await client.query(`DELETE FROM screens WHERE device_id = $1`, [deviceId]);
+        const archiveScreen = await client.query(
+          `
+          UPDATE screens
+          SET
+            archived = true,
+            status = 'offline',
+            is_online = false,
+            updated_at = NOW()
+          WHERE device_id = $1
+          RETURNING id, device_id, name, archived
+          `,
+          [deviceId],
+        );
 
         await client.query("COMMIT");
 
-        // Clear any in-memory caches keyed by deviceId
         if (typeof pendingCommands !== "undefined") delete pendingCommands[deviceId];
         if (typeof playlists !== "undefined") delete playlists[deviceId];
         if (typeof zonePlaylists !== "undefined") delete zonePlaylists[deviceId];
@@ -826,12 +832,19 @@ app.post("/api/devices/pair", handleDeviceActivate);
 
         return res.json({
           success: true,
-          removed: { id: screenId, device_id: deviceId, name: screen.name },
+          archived: true,
+          removed:
+            archiveScreen.rows[0] || {
+              id: screenId,
+              device_id: deviceId,
+              name: screen.name,
+              archived: true,
+            },
         });
       } catch (err) {
         await client.query("ROLLBACK");
-        console.error("ADMIN DEVICE DELETE ERROR:", err);
-        return res.status(500).json({ error: "failed_to_delete_device" });
+        console.error("ADMIN DEVICE ARCHIVE ERROR:", err);
+        return res.status(500).json({ error: "failed_to_archive_device" });
       } finally {
         client.release();
       }
@@ -1249,20 +1262,7 @@ app.get("/api/dashboard/live-content", authenticateJWT, async (_req, res) => {
         let status = "queued";
         let progress = 0;
 
-        // Fire-and-forget commands: treat as completed once sent — no ack expected
-        const FIRE_AND_FORGET = new Set([
-          "reboot", "restart_app", "screen_on", "screen_off",
-          "mute", "unmute", "kiosk_on", "kiosk_off", "refresh",
-          "brightness", "volume", "set_pin",
-        ]);
-        const cmdType = (payload.type || "").toLowerCase();
-        const isFireAndForget = FIRE_AND_FORGET.has(cmdType);
-
         if (cmd.executed) {
-          status = "completed";
-          progress = 100;
-        } else if (cmd.sent && isFireAndForget) {
-          // Treat as completed — device executed it but won't send an ack
           status = "completed";
           progress = 100;
         } else if (cmd.sent) {
@@ -2615,66 +2615,6 @@ app.get(
   },
 );
 
-// ── Device state: last known brightness, volume, mute from command history ──
-app.get(
-  "/api/admin/devices/:deviceId/state",
-  authenticateJWT,
-  requireRole("admin", "manager"),
-  async (req, res) => {
-    const deviceId = String(req.params.deviceId || "").trim();
-    if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
-
-    try {
-      // Grab the most recent command of each relevant type
-      const result = await pool.query(
-        `
-        SELECT DISTINCT ON (payload->>'type')
-          payload,
-          created_at
-        FROM device_commands
-        WHERE device_id = $1
-          AND payload->>'type' IN ('brightness', 'volume', 'mute', 'unmute')
-        ORDER BY payload->>'type', created_at DESC
-        `,
-        [deviceId]
-      );
-
-      let brightness: number | null = null;
-      let volume: number | null = null;
-      let muted: boolean | null = null;
-      let muteTime: Date | null = null;
-      let unmuteTime: Date | null = null;
-
-      for (const row of result.rows) {
-        const p = typeof row.payload === "string" ? JSON.parse(row.payload) : row.payload;
-        const type = (p?.type || "").toLowerCase();
-
-        if (type === "brightness" && p.value != null) {
-          brightness = Number(p.value);
-        } else if (type === "volume" && p.value != null) {
-          volume = Number(p.value);
-        } else if (type === "mute") {
-          muteTime = new Date(row.created_at);
-        } else if (type === "unmute") {
-          unmuteTime = new Date(row.created_at);
-        }
-      }
-
-      // Determine current mute state by whichever happened more recently
-      if (muteTime || unmuteTime) {
-        if (!unmuteTime) muted = true;
-        else if (!muteTime) muted = false;
-        else muted = muteTime > unmuteTime;
-      }
-
-      return res.json({ brightness, volume, muted });
-    } catch (err) {
-      console.error("Device state error:", err);
-      return res.status(500).json({ error: "failed_to_fetch_device_state" });
-    }
-  }
-);
-
 // ❌ Deprecated (device should NOT send commands here)
 app.post("/api/device/:deviceId/command", (_req, res) => {
   return res.status(410).json({ error: "moved_to_/api/admin/devices/:deviceId/command" });
@@ -2691,6 +2631,38 @@ app.post("/api/device/:deviceId/screenshot", authenticateDevice, async (req, res
   if (!screenshot) return res.status(400).json({ error: "screenshot_required" });
 
   try {
+    let screenshotUrl: string = screenshot;
+
+    // If base64 data URI, upload to Supabase Storage
+    if (screenshot.startsWith("data:")) {
+      const matches = screenshot.match(/^data:([^;]+);base64,(.+)$/);
+      if (!matches) return res.status(400).json({ error: "invalid_screenshot_format" });
+
+      const mimeType = matches[1];
+      const base64Data = matches[2];
+      const buffer = Buffer.from(base64Data, "base64");
+      const ext = mimeType.includes("png") ? "png" : "jpg";
+      const filename = `screenshots/${deviceId}_${Date.now()}.${ext}`;
+
+      const { error: uploadError } = await supabaseAdmin.storage
+        .from("media")
+        .upload(filename, buffer, {
+          contentType: mimeType,
+          upsert: true,
+        });
+
+      if (uploadError) {
+        console.error("Screenshot Supabase upload error:", uploadError);
+        return res.status(500).json({ error: "screenshot_storage_failed" });
+      }
+
+      const { data: urlData } = supabaseAdmin.storage
+        .from("media")
+        .getPublicUrl(filename);
+
+      screenshotUrl = urlData.publicUrl;
+    }
+
     await pool.query(
       `
       UPDATE screens SET
@@ -2698,10 +2670,10 @@ app.post("/api/device/:deviceId/screenshot", authenticateDevice, async (req, res
         screenshot_at = NOW()
       WHERE device_id = $2
       `,
-      [screenshot, deviceId],
+      [screenshotUrl, deviceId],
     );
 
-    res.json({ success: true });
+    res.json({ success: true, url: screenshotUrl });
   } catch (err) {
     console.error("Screenshot upload error:", err);
     res.status(500).json({ error: "screenshot_upload_failed" });
