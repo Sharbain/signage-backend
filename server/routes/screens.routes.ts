@@ -12,7 +12,7 @@ import { pool } from "../db";
 import { storage, saveDeviceStatus } from "../storage";
 import { normalizeMediaRow, verifyDeviceTokenOrFail } from "./_shared";
 
-export function registerScreensRoutes(app: Express) {
+export async function registerScreensRoutes(app: Express) {
 
   // ---------------------------------------------------------------------------
   // POST /api/screens/register — device self-registration
@@ -252,4 +252,110 @@ export function registerScreensRoutes(app: Express) {
 
   app.post("/api/devices/:deviceId/heartbeat", handleDeviceHeartbeat);
   app.post("/api/device/:deviceId/heartbeat",  handleDeviceHeartbeat);
+
+  // ---------------------------------------------------------------------------
+  // Proof of Play — DB migration (runs once on startup, idempotent)
+  // ---------------------------------------------------------------------------
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS proof_of_play (
+      id            BIGSERIAL    PRIMARY KEY,
+      device_id     TEXT         NOT NULL,
+      media_id      INTEGER,
+      media_name    TEXT         NOT NULL,
+      media_type    TEXT,
+      playlist_id   INTEGER,
+      duration_ms   INTEGER,
+      played_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_pop_device_played
+    ON proof_of_play (device_id, played_at DESC)
+  `);
+
+  // ---------------------------------------------------------------------------
+  // POST /api/devices/:deviceId/proof-of-play
+  // Android calls this when each media item finishes playing.
+  // Body: { mediaId?, mediaName, mediaType?, playlistId?, durationMs? }
+  // Auth: device token (same as heartbeat)
+  // ---------------------------------------------------------------------------
+  app.post("/api/devices/:deviceId/proof-of-play", async (req, res) => {
+    try {
+      const deviceId = String(req.params.deviceId || "").trim();
+      if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
+
+      const verified = await verifyDeviceTokenOrFail(req, res, deviceId);
+      if (!verified) return;
+
+      const { mediaId, mediaName, mediaType, playlistId, durationMs } = req.body;
+      if (!mediaName) return res.status(400).json({ error: "mediaName is required" });
+
+      const result = await pool.query(
+        `INSERT INTO proof_of_play
+           (device_id, media_id, media_name, media_type, playlist_id, duration_ms)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id, played_at AS "playedAt"`,
+        [
+          deviceId,
+          mediaId    ? Number(mediaId)    : null,
+          mediaName,
+          mediaType  ?? null,
+          playlistId ? Number(playlistId) : null,
+          durationMs ? Number(durationMs) : null,
+        ],
+      );
+
+      return res.status(201).json({
+        ok: true,
+        id: result.rows[0].id,
+        playedAt: result.rows[0].playedAt,
+      });
+    } catch (err) {
+      console.error("proof-of-play error:", err);
+      return res.status(500).json({ error: "failed_to_record_play" });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // GET /api/devices/:deviceId/proof-of-play
+  // Dashboard reads this to show playback history.
+  // Query params: ?limit=50&before=<ISO timestamp>
+  // Auth: JWT (dashboard)
+  // ---------------------------------------------------------------------------
+  app.get("/api/devices/:deviceId/proof-of-play", async (req, res) => {
+    try {
+      const deviceId = String(req.params.deviceId || "").trim();
+      const limit  = Math.min(Number(req.query.limit ?? 50), 200);
+      const before = req.query.before ? new Date(req.query.before as string) : null;
+
+      const params: any[] = [deviceId, limit];
+      let whereExtra = "";
+      if (before && !isNaN(before.getTime())) {
+        params.push(before);
+        whereExtra = `AND played_at < $3`;
+      }
+
+      const result = await pool.query(
+        `SELECT
+           id,
+           device_id   AS "deviceId",
+           media_id    AS "mediaId",
+           media_name  AS "mediaName",
+           media_type  AS "mediaType",
+           playlist_id AS "playlistId",
+           duration_ms AS "durationMs",
+           played_at   AS "playedAt"
+         FROM proof_of_play
+         WHERE device_id = $1 ${whereExtra}
+         ORDER BY played_at DESC
+         LIMIT $2`,
+        params,
+      );
+
+      res.json(result.rows);
+    } catch (err) {
+      console.error("get proof-of-play error:", err);
+      res.status(500).json({ error: "failed_to_get_play_log" });
+    }
+  });
 }
