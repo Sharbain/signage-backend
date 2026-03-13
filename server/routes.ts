@@ -6280,7 +6280,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
           error_message as "errorMessage", 
           started_at as "startedAt", 
           completed_at as "completedAt"
-        FROM publish_jobs ORDER BY started_at DESC LIMIT 100`
+        FROM publish_jobs WHERE status != 'archived' ORDER BY started_at DESC LIMIT 100`
       );
       res.json(result.rows);
     } catch (err) {
@@ -6403,9 +6403,9 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
       }
 
 
-      // Clean up old completed jobs for this device+content to prevent Monitor clutter
+      // Mark old completed jobs as archived (keep for history, don't delete)
       await client.query(
-        `DELETE FROM publish_jobs
+        `UPDATE publish_jobs SET status = 'archived'
          WHERE device_id = $1 AND content_name = $2 AND content_type = $3
          AND status IN ('completed', 'failed')`,
         [deviceId, contentName, normalizedContentType]
@@ -6419,9 +6419,10 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
             content_name,
             total_bytes,
             status,
-            progress
+            progress,
+            files_total
          )
-         VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0, $7)
          ON CONFLICT DO NOTHING
          RETURNING id, device_id as "deviceId", device_name as "deviceName", content_type as "contentType",
                    content_id as "contentId", content_name as "contentName", status, progress,
@@ -6433,6 +6434,7 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
             numericContentId,
             contentName,
             totalBytes ?? null,
+            null,
           ]
         );
 
