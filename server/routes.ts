@@ -2172,6 +2172,12 @@ const verifyDeviceTokenOrFail = async (
       );
 
       if (assignmentResult.rowCount === 0) {
+        const jobResult = await pool.query(
+          `SELECT id FROM publish_jobs
+           WHERE device_id = $1 AND status IN ('pending', 'downloading')
+           ORDER BY started_at DESC LIMIT 1`,
+          [deviceId]
+        );
         return res.json({
           screen: {
             id: screen.id,
@@ -2182,6 +2188,7 @@ const verifyDeviceTokenOrFail = async (
           playlist: [],
           assignment: null,
           refreshInterval: 300,
+          publishJobId: jobResult.rows[0]?.id ?? null,
         });
       }
 
@@ -2224,6 +2231,15 @@ const verifyDeviceTokenOrFail = async (
         }),
       );
 
+      // Look up the most recent active publish job for this device
+      const jobResult = await pool.query(
+        `SELECT id FROM publish_jobs
+         WHERE device_id = $1 AND status IN ('pending', 'downloading')
+         ORDER BY started_at DESC LIMIT 1`,
+        [deviceId]
+      );
+      const publishJobId = jobResult.rows[0]?.id ?? null;
+
       return res.json({
         screen: {
           id: screen.id,
@@ -2239,6 +2255,7 @@ const verifyDeviceTokenOrFail = async (
         },
         playlist,
         refreshInterval: 300,
+        publishJobId,
       });
     } catch (error) {
       console.error("playlist fetch error:", error);
