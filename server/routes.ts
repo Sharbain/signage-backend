@@ -2608,7 +2608,8 @@ app.post(
               content_name,
               total_bytes,
               status,
-              progress
+              progress,
+              files_total
             )
             VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0, $7)
             RETURNING id, started_at
@@ -6274,8 +6275,8 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
           progress, 
           total_bytes as "totalBytes", 
           downloaded_bytes as "downloadedBytes", 
-          files_downloaded as "filesDownloaded",
-          files_total as "filesTotal",
+          COALESCE(files_downloaded, 0) as "filesDownloaded",
+          COALESCE(files_total, 0) as "filesTotal",
           error_message as "errorMessage", 
           started_at as "startedAt", 
           completed_at as "completedAt"
