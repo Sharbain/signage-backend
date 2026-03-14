@@ -5568,7 +5568,7 @@ app.post("/api/data-proxy/test", authenticateJWT, async (req: Request, res: Resp
     try {
       const result = await pool.query(
         `SELECT dg.*, 
-                COALESCE((SELECT COUNT(*) FROM device_group_map dgm WHERE dgm.group_id = dg.id), 0)::int as device_count,
+                COALESCE((SELECT COUNT(*) FROM device_group_map dgm WHERE dgm.group_id::text = dg.id::text), 0)::int as device_count,
                 COALESCE((SELECT COUNT(*) FROM device_groups child WHERE child.parent_id = dg.id), 0)::int as subgroup_count
          FROM device_groups dg
          WHERE dg.parent_id IS NULL
@@ -5586,7 +5586,7 @@ app.post("/api/data-proxy/test", authenticateJWT, async (req: Request, res: Resp
       const { groupId } = req.params;
       const result = await pool.query(
         `SELECT dg.*, 
-                COALESCE((SELECT COUNT(*) FROM device_group_map dgm WHERE dgm.group_id = dg.id), 0)::int as device_count,
+                COALESCE((SELECT COUNT(*) FROM device_group_map dgm WHERE dgm.group_id::text = dg.id::text), 0)::int as device_count,
                 COALESCE((SELECT COUNT(*) FROM device_groups child WHERE child.parent_id = dg.id::text), 0)::int as subgroup_count
          FROM device_groups dg
          WHERE dg.parent_id = $1
@@ -5605,7 +5605,7 @@ app.post("/api/data-proxy/test", authenticateJWT, async (req: Request, res: Resp
       const { groupId } = req.params;
       const result = await pool.query(
         `SELECT dg.*, 
-                COALESCE((SELECT COUNT(*) FROM device_group_map dgm WHERE dgm.group_id = dg.id), 0)::int as device_count
+                COALESCE((SELECT COUNT(*) FROM device_group_map dgm WHERE dgm.group_id::text = dg.id::text), 0)::int as device_count
          FROM device_groups dg
          WHERE dg.id::text = $1`,
         [groupId]
@@ -5868,7 +5868,7 @@ app.post("/api/data-proxy/test", authenticateJWT, async (req: Request, res: Resp
           SELECT id FROM device_groups WHERE id = $1
           UNION ALL
           SELECT dg.id FROM device_groups dg
-          JOIN group_tree gt ON dg.parent_id = gt.id
+          JOIN group_tree gt ON dg.parent_id::text = gt.id::text
         )
         SELECT s.device_id, s.name
         FROM screens s
