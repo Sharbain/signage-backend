@@ -3756,6 +3756,65 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
     }
   });
 
+  // ── GET /api/templates/:id/render ─────────────────────────────────────────
+  // Self-contained HTML renderer for Android WebView template playback.
+  // PUBLIC — no auth required (Android WebView cannot send JWT headers).
+  app.get("/api/templates/:id/render", async (req, res) => {
+    try {
+      const { id } = req.params;
+      const template = await storage.getTemplate(id);
+      if (!template) return res.status(404).send("<h1>Template not found</h1>");
+
+      const elements = template.elements || template.layout?.elements || [];
+      const bg = template.background || template.layout?.background || "#0f1117";
+      const w = template.width || 1920;
+      const h = template.height || 1080;
+
+      const html = `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>${template.name || "Template"}</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100vw;height:100vh;background:${bg};overflow:hidden;font-family:'Inter','Segoe UI',sans-serif}
+#canvas{position:absolute;top:0;left:0;width:100vw;height:100vh}
+.zone{position:absolute;overflow:hidden}
+.zone img,.zone video{width:100%;height:100%;object-fit:cover}
+.ticker-wrap{width:100%;height:100%;overflow:hidden;display:flex;align-items:center;position:relative}
+.ticker-text{white-space:nowrap;position:absolute;animation:ticker-scroll linear infinite}
+@keyframes ticker-scroll{from{transform:translateX(100vw)}to{transform:translateX(-100%)}}
+.rss-list{width:100%;height:100%;overflow:hidden;padding:8px;display:flex;flex-direction:column;gap:4px}
+.rss-item{color:rgba(255,255,255,0.85);font-size:13px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.08);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rss-item:before{content:"\\203A ";color:#4ade80}
+.rss-header{color:#4ade80;font-size:11px;font-weight:600;margin-bottom:6px}
+.flex-center{width:100%;height:100%;display:flex;align-items:center;justify-content:center}
+</style></head>
+<body><div id="canvas"></div>
+<script>
+const CANVAS_W=${w},CANVAS_H=${h};
+const elements=${JSON.stringify(elements)};
+async function fetchRss(url,max){const proxies=["https://api.allorigins.win/get?url="+encodeURIComponent(url),"https://corsproxy.io/?"+encodeURIComponent(url)];for(const p of proxies){try{const r=await fetch(p,{signal:AbortSignal.timeout(6000)});if(!r.ok)continue;const j=await r.json().catch(()=>null);const text=j?.contents||"";const doc=new DOMParser().parseFromString(text,"text/xml");const items=[...doc.querySelectorAll("item title,entry title")];const t=items.map(n=>n.textContent?.trim()).filter(Boolean);if(t.length)return t.slice(0,max||5);}catch{}}return[];}
+function sp(el){const sx=window.innerWidth/CANVAS_W,sy=window.innerHeight/CANVAS_H;return{l:el.x*sx,t:el.y*sy,w:el.w*sx,h:el.h*sy,sx,sy};}
+async function render(el){const p=sp(el);const zone=document.createElement("div");zone.className="zone";zone.style.cssText="left:"+p.l+"px;top:"+p.t+"px;width:"+p.w+"px;height:"+p.h+"px;"+(el.borderRadius?"border-radius:"+(el.borderRadius*p.sx)+"px;":"")+(el.zIndex!=null?"z-index:"+el.zIndex+";":"");const canvas=document.getElementById("canvas");
+if(el.type==="image"&&el.url){const img=document.createElement("img");img.src=el.url;img.style.objectFit=el.fit||"cover";zone.appendChild(img);}
+else if(el.type==="video"&&el.url){const v=document.createElement("video");v.src=el.url;v.autoplay=true;v.muted=true;v.loop=true;v.playsInline=true;v.style.objectFit=el.fit||"cover";zone.appendChild(v);}
+else if(el.type==="text"){zone.style.background=el.bgColor||"transparent";zone.style.display="flex";zone.style.alignItems="center";zone.style.justifyContent="center";zone.style.padding=(4*p.sx)+"px";const s=document.createElement("span");s.textContent=el.text||"";s.style.cssText="color:"+(el.color||"#fff")+";font-size:"+((el.fontSize||24)*p.sx)+"px;font-family:"+(el.fontFamily||"Inter")+";font-weight:"+(el.fontWeight||400)+";text-align:"+(el.align||"center")+";white-space:pre-wrap;word-break:break-word;width:100%";zone.appendChild(s);}
+else if(el.type==="ticker"){zone.style.background=el.tickerBg||"#111827";let text=el.tickerText||"";if(el.tickerRssUrl){const h=await fetchRss(el.tickerRssUrl,20);if(h.length)text=h.join("   \\u00B7   ");}const wrap=document.createElement("div");wrap.className="ticker-wrap";const t=document.createElement("div");t.className="ticker-text";t.textContent=text;t.style.cssText="color:"+(el.tickerColor||"#fff")+";font-size:"+((el.fontSize||20)*p.sx)+"px;font-family:"+(el.fontFamily||"Inter")+";animation-duration:"+(200/((el.tickerSpeed||60)*p.sx))+"s";wrap.appendChild(t);zone.appendChild(wrap);}
+else if(el.type==="rss"){zone.style.background=el.bgColor||"rgba(15,23,42,0.92)";zone.style.border="1px solid rgba(74,222,128,0.15)";zone.style.borderRadius=((el.borderRadius||4)*p.sx)+"px";const list=document.createElement("div");list.className="rss-list";const hdr=document.createElement("div");hdr.className="rss-header";hdr.textContent="RSS Feed";list.appendChild(hdr);if(el.rssUrl)fetchRss(el.rssUrl,el.rssMaxItems||5).then(headlines=>{headlines.forEach(h=>{const item=document.createElement("div");item.className="rss-item";item.textContent=h;item.style.fontSize=((el.fontSize||13)*p.sx)+"px";list.appendChild(item);});});zone.appendChild(list);}
+else if(el.type==="clock"){zone.style.background=el.bgColor||"rgba(15,23,42,0.8)";zone.style.borderRadius=((el.borderRadius||4)*p.sx)+"px";const d=document.createElement("div");d.className="flex-center";const s=document.createElement("span");s.style.cssText="color:"+(el.color||"#fff")+";font-size:"+((el.fontSize||48)*p.sx)+"px;font-family:"+(el.fontFamily||"Inter")+";font-weight:700;font-variant-numeric:tabular-nums";function tick(){const n=new Date();const pad=x=>x.toString().padStart(2,"0");s.textContent=(el.format||"HH:mm").replace("HH",pad(n.getHours())).replace("mm",pad(n.getMinutes())).replace("ss",pad(n.getSeconds()));}tick();setInterval(tick,1000);d.appendChild(s);zone.appendChild(d);}
+else if(el.type==="date"){zone.style.background=el.bgColor||"rgba(15,23,42,0.8)";const d=document.createElement("div");d.className="flex-center";const s=document.createElement("span");s.style.cssText="color:"+(el.color||"#fff")+";font-size:"+((el.fontSize||32)*p.sx)+"px;font-family:"+(el.fontFamily||"Inter")+";font-weight:600";const n=new Date();const pad=x=>x.toString().padStart(2,"0");s.textContent=(el.format||"YYYY-MM-DD").replace("YYYY",n.getFullYear()).replace("MM",pad(n.getMonth()+1)).replace("DD",pad(n.getDate()));d.appendChild(s);zone.appendChild(d);}
+canvas.appendChild(zone);}
+(async()=>{const sorted=[...elements].sort((a,b)=>(a.zIndex||0)-(b.zIndex||0));for(const el of sorted)await render(el);})();
+setTimeout(()=>location.reload(),5*60*1000);
+</script></body></html>`;
+
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache");
+      return res.send(html);
+    } catch (err) {
+      console.error("Template render error:", err);
+      return res.status(500).send("<h1>Template render failed</h1>");
+    }
+  });
+
   app.patch("/api/templates/:id", async (req, res) => {
     try {
       const { id } = req.params;
