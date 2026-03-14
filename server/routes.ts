@@ -4350,7 +4350,7 @@ async function renderEl(el) {
           div.innerHTML = '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(255,100,100,.5);font-size:' + (11*p.sx) + 'px">Equiti prices unavailable</div>';
         });
 
-      // Auto-refresh every 15 seconds
+      // Auto-refresh every 1 second — Equiti stream pushes ~3 updates/sec
       setInterval(() => {
         fetch(BACKEND + '/api/equiti-proxy', { signal: AbortSignal.timeout(10000) })
           .then(r => r.json())
@@ -4713,98 +4713,121 @@ app.get("/api/stocks-proxy", async (req: Request, res: Response) => {
 });
 
 
-// ── GET /api/equiti-proxy ──────────────────────────────────────────────────
-// Returns live forex prices for the Equiti symbols using free API.
-// Equiti's own page uses WebSocket JS to populate prices (not in HTML),
-// so we fetch from exchangerate/yfinance instead with the same symbols.
-app.get("/api/equiti-proxy", async (req: Request, res: Response) => {
-  // Equiti shows these symbols in their ticker
-  const EQUITI_SYMBOLS = ['GBPUSD', 'EURUSD', 'EURGBP', 'USDJPY', 'XAUUSD', 'XAGUSD'];
+// ── Equiti WebSocket Price Proxy ─────────────────────────────────────────────
+// Connects to Equiti's live price streaming WebSocket and caches the latest
+// prices server-side. All devices poll /api/equiti-proxy to get live data
+// without each device needing its own WebSocket connection.
+//
+// Protocol:
+//   Server pushes: QUOTES:{"GBPUSD.p":{"Direction":"down","Bid":"1.32217","Ask":"1.32233",...},...}
+//   Client sends:  GETQUOTES:  (keepalive every 330ms)
 
+const EQUITI_WS_URL = "wss://eqpricestream01z-prod.azurewebsites.net/PriceStreaming.axd";
+const EQUITI_ORIGIN = "https://www.equiti.com";
+
+// Cache of latest prices indexed by symbol
+let equitiPrices: Record<string, {
+  symbol: string; bid: string; ask: string;
+  direction: string; timestamp: string;
+}> = {};
+let equitiWs: any = null;
+let equitiPingInterval: any = null;
+let equitiReconnectTimeout: any = null;
+let equitiConnected = false;
+let equitiLastUpdate = 0;
+
+function connectEquitiWs() {
   try {
-    // Use ExchangeRate API for forex + metals (free, no key needed)
-    const [forexRes, metalsRes] = await Promise.allSettled([
-      fetch('https://open.er-api.com/v6/latest/USD', { signal: AbortSignal.timeout(6000) }),
-      fetch('https://api.metals.live/v1/spot/gold,silver', { signal: AbortSignal.timeout(6000) }),
-    ]);
+    const WebSocket = require("ws");
+    equitiWs = new WebSocket(EQUITI_WS_URL, {
+      headers: {
+        "Origin": EQUITI_ORIGIN,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      },
+      perMessageDeflate: { clientMaxWindowBits: true },
+    });
 
-    let rates: Record<string, number> = {};
+    equitiWs.on("open", () => {
+      equitiConnected = true;
+      console.log("[equiti-ws] Connected to Equiti price stream");
 
-    if (forexRes.status === 'fulfilled' && forexRes.value.ok) {
-      const data = await forexRes.value.json();
-      if (data.rates) rates = data.rates;
-    }
+      // Send GETQUOTES: keepalive every 330ms (matches browser behavior)
+      equitiPingInterval = setInterval(() => {
+        if (equitiWs?.readyState === 1) {
+          equitiWs.send("GETQUOTES:");
+        }
+      }, 330);
+    });
 
-    // Build prices in Equiti format
-    const prices: { symbol: string; bid: string; ask: string; direction: string }[] = [];
+    equitiWs.on("message", (data: any) => {
+      const msg = data.toString();
+      if (!msg.startsWith("QUOTES:")) return;
 
-    function getRate(base: string, quote: string): number | null {
-      if (base === 'USD') return rates[quote] ?? null;
-      if (quote === 'USD') return rates[base] ? 1 / rates[base] : null;
-      if (rates[base] && rates[quote]) return rates[quote] / rates[base];
-      return null;
-    }
+      try {
+        const json = JSON.parse(msg.slice(7)); // strip "QUOTES:"
+        equitiLastUpdate = Date.now();
 
-    function fmt(n: number, decimals = 5): string {
-      return n.toFixed(decimals);
-    }
-
-    // Forex pairs
-    const pairs: [string, string, string, number][] = [
-      ['GBPUSD', 'GBP', 'USD', 5],
-      ['EURUSD', 'EUR', 'USD', 5],
-      ['EURGBP', 'EUR', 'GBP', 5],
-      ['USDJPY', 'USD', 'JPY', 3],
-    ];
-
-    for (const [sym, base, quote, dec] of pairs) {
-      const rate = getRate(base, quote);
-      if (rate) {
-        const spread = sym === 'USDJPY' ? 0.02 : 0.0002;
-        prices.push({
-          symbol: sym,
-          bid: fmt(rate, dec),
-          ask: fmt(rate + spread, dec),
-          direction: 'up',
-        });
+        for (const [key, val] of Object.entries(json) as [string, any][]) {
+          // key is like "GBPUSD.p" — strip the ".p" suffix
+          const symbol = key.replace(/\.p$/, "");
+          equitiPrices[symbol] = {
+            symbol,
+            bid: val.Bid || "",
+            ask: val.Ask || "",
+            direction: (val.Direction || "up").toLowerCase(),
+            timestamp: val.TimeStamp || new Date().toISOString(),
+          };
+        }
+      } catch (e) {
+        // ignore parse errors
       }
-    }
+    });
 
-    // Metals from metals API
-    if (metalsRes.status === 'fulfilled' && metalsRes.value.ok) {
-      const metals = await metalsRes.value.json();
-      const gold = metals.find((m: any) => m.metal === 'gold' || m.XAU);
-      const silver = metals.find((m: any) => m.metal === 'silver' || m.XAG);
-      if (gold?.price || gold?.XAU) {
-        const p = parseFloat(gold.price || gold.XAU);
-        prices.push({ symbol: 'XAUUSD', bid: fmt(p, 2), ask: fmt(p + 0.5, 2), direction: 'up' });
-      }
-      if (silver?.price || silver?.XAG) {
-        const p = parseFloat(silver.price || silver.XAG);
-        prices.push({ symbol: 'XAGUSD', bid: fmt(p, 3), ask: fmt(p + 0.01, 3), direction: 'up' });
-      }
-    }
+    equitiWs.on("close", (code: number, reason: string) => {
+      equitiConnected = false;
+      if (equitiPingInterval) clearInterval(equitiPingInterval);
+      console.log(`[equiti-ws] Disconnected (${code}), reconnecting in 3s...`);
+      equitiReconnectTimeout = setTimeout(connectEquitiWs, 3000);
+    });
 
-    // Fallback: if metals API failed, use USD rates for XAU/XAG if available
-    if (!prices.find(p => p.symbol === 'XAUUSD') && rates['XAU']) {
-      const p = 1 / rates['XAU'];
-      prices.push({ symbol: 'XAUUSD', bid: fmt(p, 2), ask: fmt(p + 0.5, 2), direction: 'up' });
-    }
-    if (!prices.find(p => p.symbol === 'XAGUSD') && rates['XAG']) {
-      const p = 1 / rates['XAG'];
-      prices.push({ symbol: 'XAGUSD', bid: fmt(p, 3), ask: fmt(p + 0.01, 3), direction: 'up' });
-    }
+    equitiWs.on("error", (err: any) => {
+      console.error("[equiti-ws] Error:", err?.message);
+      equitiConnected = false;
+      try { equitiWs?.terminate(); } catch {}
+    });
 
-    if (!prices.length) {
-      return res.status(502).json({ error: 'Could not fetch live prices', prices: [] });
-    }
-
-    res.setHeader("Cache-Control", "public, max-age=15");
-    return res.json({ prices, fetchedAt: new Date().toISOString() });
   } catch (err: any) {
-    return res.status(504).json({ error: "Failed to fetch prices", detail: err?.message });
+    console.error("[equiti-ws] Failed to connect:", err?.message);
+    equitiReconnectTimeout = setTimeout(connectEquitiWs, 5000);
   }
+}
+
+// Start the WebSocket connection when the server boots
+connectEquitiWs();
+
+// ── GET /api/equiti-proxy ──────────────────────────────────────────────────
+// Returns cached live prices from the Equiti WebSocket feed.
+app.get("/api/equiti-proxy", (req: Request, res: Response) => {
+  const prices = Object.values(equitiPrices);
+  const staleMs = Date.now() - equitiLastUpdate;
+
+  if (!prices.length) {
+    return res.status(503).json({
+      prices: [],
+      connected: equitiConnected,
+      error: equitiConnected ? "Waiting for first price update..." : "Connecting to Equiti stream...",
+    });
+  }
+
+  res.setHeader("Cache-Control", "no-cache"); // always fresh
+  return res.json({
+    prices,
+    connected: equitiConnected,
+    staleMs,
+    fetchedAt: new Date().toISOString(),
+  });
 });
+
 
 // ── GET /api/data-proxy ────────────────────────────────────────────────────
 // Server-side JSON data fetcher for the REST API connector zone.
