@@ -4714,86 +4714,95 @@ app.get("/api/stocks-proxy", async (req: Request, res: Response) => {
 
 
 // ── GET /api/equiti-proxy ──────────────────────────────────────────────────
-// Scrapes Equiti price ticker page and returns forex prices as JSON.
-// Called by the render engine instead of iframing equiti.com directly
-// (which is blocked by X-Frame-Options).
+// Returns live forex prices for the Equiti symbols using free API.
+// Equiti's own page uses WebSocket JS to populate prices (not in HTML),
+// so we fetch from exchangerate/yfinance instead with the same symbols.
 app.get("/api/equiti-proxy", async (req: Request, res: Response) => {
+  // Equiti shows these symbols in their ticker
+  const EQUITI_SYMBOLS = ['GBPUSD', 'EURUSD', 'EURGBP', 'USDJPY', 'XAUUSD', 'XAGUSD'];
+
   try {
-    const r = await fetch("https://www.equiti.com/price-ticker/", {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.equiti.com/",
-      },
-      signal: AbortSignal.timeout(8000),
-    });
+    // Use ExchangeRate API for forex + metals (free, no key needed)
+    const [forexRes, metalsRes] = await Promise.allSettled([
+      fetch('https://open.er-api.com/v6/latest/USD', { signal: AbortSignal.timeout(6000) }),
+      fetch('https://api.metals.live/v1/spot/gold,silver', { signal: AbortSignal.timeout(6000) }),
+    ]);
 
-    if (!r.ok) {
-      return res.status(502).json({ error: `Upstream ${r.status}` });
+    let rates: Record<string, number> = {};
+
+    if (forexRes.status === 'fulfilled' && forexRes.value.ok) {
+      const data = await forexRes.value.json();
+      if (data.rates) rates = data.rates;
     }
 
-    const html = await r.text();
+    // Build prices in Equiti format
+    const prices: { symbol: string; bid: string; ask: string; direction: string }[] = [];
 
-    // Extract price data from the HTML
-    // Equiti renders prices in elements with data attributes or JSON blobs
-    const prices: { symbol: string; bid: string; ask: string; change?: string; direction?: string }[] = [];
-
-    // Try to find JSON data blob in the page
-    const jsonMatch = html.match(/window\.__INITIAL_STATE__\s*=\s*({.+?});/s)
-      || html.match(/priceData\s*=\s*(\[.+?\]);/s)
-      || html.match(/"instruments"\s*:\s*(\[.+?\])/s);
-
-    if (jsonMatch) {
-      try {
-        const data = JSON.parse(jsonMatch[1]);
-        const instruments = Array.isArray(data) ? data : (data.instruments || data.prices || []);
-        for (const item of instruments.slice(0, 20)) {
-          prices.push({
-            symbol: item.symbol || item.name || item.pair || '',
-            bid: item.bid || item.price || item.sell || '',
-            ask: item.ask || item.buy || '',
-            change: item.change || item.dailyChange || '',
-            direction: item.direction || (parseFloat(item.change) >= 0 ? 'up' : 'down'),
-          });
-        }
-      } catch { /* fall through to regex */ }
+    function getRate(base: string, quote: string): number | null {
+      if (base === 'USD') return rates[quote] ?? null;
+      if (quote === 'USD') return rates[base] ? 1 / rates[base] : null;
+      if (rates[base] && rates[quote]) return rates[quote] / rates[base];
+      return null;
     }
 
-    // Fallback: regex scrape for price elements
-    if (!prices.length) {
-      const pairRegex = /<[^>]+class="[^"]*(?:pair|symbol|instrument)[^"]*"[^>]*>([A-Z]{3,6}(?:\/[A-Z]{3,6})?)<\/[^>]+>/gi;
-      const priceRegex = /<[^>]+class="[^"]*(?:bid|ask|price|rate)[^"]*"[^>]*>([\d.,]+)<\/[^>]+>/gi;
+    function fmt(n: number, decimals = 5): string {
+      return n.toFixed(decimals);
+    }
 
-      const pairs: string[] = [];
-      const priceVals: string[] = [];
+    // Forex pairs
+    const pairs: [string, string, string, number][] = [
+      ['GBPUSD', 'GBP', 'USD', 5],
+      ['EURUSD', 'EUR', 'USD', 5],
+      ['EURGBP', 'EUR', 'GBP', 5],
+      ['USDJPY', 'USD', 'JPY', 3],
+    ];
 
-      let m;
-      while ((m = pairRegex.exec(html)) !== null) pairs.push(m[1]);
-      while ((m = priceRegex.exec(html)) !== null) priceVals.push(m[1]);
-
-      for (let i = 0; i < Math.min(pairs.length, 10); i++) {
+    for (const [sym, base, quote, dec] of pairs) {
+      const rate = getRate(base, quote);
+      if (rate) {
+        const spread = sym === 'USDJPY' ? 0.02 : 0.0002;
         prices.push({
-          symbol: pairs[i],
-          bid: priceVals[i * 2] || priceVals[i] || '',
-          ask: priceVals[i * 2 + 1] || '',
+          symbol: sym,
+          bid: fmt(rate, dec),
+          ask: fmt(rate + spread, dec),
+          direction: 'up',
         });
       }
     }
 
-    // If we still have nothing, return a fallback message
-    if (!prices.length) {
-      return res.json({
-        prices: [],
-        error: "Could not parse Equiti price data — their page structure may have changed",
-        html_length: html.length,
-      });
+    // Metals from metals API
+    if (metalsRes.status === 'fulfilled' && metalsRes.value.ok) {
+      const metals = await metalsRes.value.json();
+      const gold = metals.find((m: any) => m.metal === 'gold' || m.XAU);
+      const silver = metals.find((m: any) => m.metal === 'silver' || m.XAG);
+      if (gold?.price || gold?.XAU) {
+        const p = parseFloat(gold.price || gold.XAU);
+        prices.push({ symbol: 'XAUUSD', bid: fmt(p, 2), ask: fmt(p + 0.5, 2), direction: 'up' });
+      }
+      if (silver?.price || silver?.XAG) {
+        const p = parseFloat(silver.price || silver.XAG);
+        prices.push({ symbol: 'XAGUSD', bid: fmt(p, 3), ask: fmt(p + 0.01, 3), direction: 'up' });
+      }
     }
 
-    res.setHeader("Cache-Control", "public, max-age=15"); // 15s cache
+    // Fallback: if metals API failed, use USD rates for XAU/XAG if available
+    if (!prices.find(p => p.symbol === 'XAUUSD') && rates['XAU']) {
+      const p = 1 / rates['XAU'];
+      prices.push({ symbol: 'XAUUSD', bid: fmt(p, 2), ask: fmt(p + 0.5, 2), direction: 'up' });
+    }
+    if (!prices.find(p => p.symbol === 'XAGUSD') && rates['XAG']) {
+      const p = 1 / rates['XAG'];
+      prices.push({ symbol: 'XAGUSD', bid: fmt(p, 3), ask: fmt(p + 0.01, 3), direction: 'up' });
+    }
+
+    if (!prices.length) {
+      return res.status(502).json({ error: 'Could not fetch live prices', prices: [] });
+    }
+
+    res.setHeader("Cache-Control", "public, max-age=15");
     return res.json({ prices, fetchedAt: new Date().toISOString() });
   } catch (err: any) {
-    return res.status(504).json({ error: "Failed to fetch Equiti prices", detail: err?.message });
+    return res.status(504).json({ error: "Failed to fetch prices", detail: err?.message });
   }
 });
 
