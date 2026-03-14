@@ -2621,67 +2621,51 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
     }
   });
 
-  // RSS proxy for template designer preview
-  app.get("/api/rss-proxy", async (req, res) => {
+  // RSS proxy — server-side fetch, avoids CORS issues on Android WebView
+  // Used by both template render engine and template designer preview
+  app.get("/api/rss-proxy", async (req: Request, res: Response) => {
     const { url } = req.query;
     if (!url || typeof url !== "string") {
       return res.status(400).json({ error: "URL is required" });
     }
-
-    console.log("Fetching RSS from:", url);
-
+    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+      return res.status(400).json({ error: "Invalid URL" });
+    }
     try {
-      const response = await fetch(url);
-      const text = await response.text();
-      
-      // Simple RSS parsing - try both RSS (<item>) and Atom (<entry>) formats
+      const r = await fetch(url, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; LuminaSignage/1.0; +https://lumina.app)",
+          "Accept": "application/rss+xml, application/atom+xml, text/xml, application/xml, */*",
+        },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!r.ok) return res.status(502).json({ error: `Upstream returned ${r.status}` });
+      const text = await r.text();
+
       const items: { title: string; description: string; link: string; pubDate: string; image?: string }[] = [];
-      
-      // Try RSS format first
-      let itemMatches = text.match(/<item>[\s\S]*?<\/item>/g) || [];
-      
-      // If no RSS items, try Atom format
-      if (itemMatches.length === 0) {
-        itemMatches = text.match(/<entry>[\s\S]*?<\/entry>/g) || [];
-      }
-      
-      console.log("Found", itemMatches.length, "feed items");
-      
-      for (const item of itemMatches.slice(0, 10)) {
-        const title = item.match(/<title[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/)?.[1]?.trim() || "";
-        const description = item.match(/<(?:description|summary)[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/(?:description|summary)>/)?.[1]?.trim() || "";
-        const link = item.match(/<link[^>]*href="([^"]+)"/) ?.[1] || item.match(/<link>([\s\S]*?)<\/link>/)?.[1]?.trim() || "";
+
+      // Parse both RSS <item> and Atom <entry>
+      let matches = text.match(/<item[\s>][\s\S]*?<\/item>/g) || [];
+      if (!matches.length) matches = text.match(/<entry[\s>][\s\S]*?<\/entry>/g) || [];
+
+      for (const item of matches.slice(0, 20)) {
+        const title = item.match(/<title[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/)?.[1]?.trim().replace(/<[^>]+>/g, '') || "";
+        const description = item.match(/<(?:description|summary)[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/(?:description|summary)>/)?.[1]?.trim().replace(/<[^>]+>/g, '').substring(0, 200) || "";
+        const link = item.match(/<link[^>]*href="([^"]+)"/)?.[1] || item.match(/<link>([\s\S]*?)<\/link>/)?.[1]?.trim() || "";
         const pubDate = item.match(/<(?:pubDate|published|updated)>([\s\S]*?)<\/(?:pubDate|published|updated)>/)?.[1]?.trim() || "";
-        
-        // Extract image from various RSS formats
-        let image: string | undefined;
-        
-        // Try media:content or media:thumbnail (common in news feeds like BBC, CNN)
-        const mediaContent = item.match(/<media:content[^>]*url="([^"]+)"/)?.[1];
-        const mediaThumbnail = item.match(/<media:thumbnail[^>]*url="([^"]+)"/)?.[1];
-        
-        // Try enclosure tag (podcasts and some RSS feeds)
-        const enclosure = item.match(/<enclosure[^>]*url="([^"]+)"[^>]*type="image/)?.[1];
-        
-        // Try image tag directly in item
-        const imageTag = item.match(/<image[^>]*>[\s\S]*?<url>([\s\S]*?)<\/url>/)?.[1]?.trim();
-        
-        // Try extracting image from description/content (img src in HTML)
-        const imgInContent = item.match(/<img[^>]*src=["']([^"']+)["']/)?.[1];
-        
-        // Try content:encoded for embedded images
-        const contentEncoded = item.match(/<content:encoded>[\s\S]*?<img[^>]*src=["']([^"']+)["']/)?.[1];
-        
-        image = mediaContent || mediaThumbnail || enclosure || imageTag || imgInContent || contentEncoded;
-        
-        if (title) {
-          items.push({ title, description, link, pubDate, image });
-        }
+        const image =
+          item.match(/<media:content[^>]*url="([^"]+)"/)?.[1] ||
+          item.match(/<media:thumbnail[^>]*url="([^"]+)"/)?.[1] ||
+          item.match(/<enclosure[^>]*url="([^"]+)"[^>]*type="image/)?.[1] ||
+          item.match(/<img[^>]*src=["']([^"']+)["']/)?.[1] ||
+          undefined;
+        if (title) items.push({ title, description, link, pubDate, image });
       }
-      
-      res.json({ items, isValidFeed: itemMatches.length > 0 });
-    } catch (error) {
-      console.error("RSS fetch error:", error);
+
+      res.setHeader("Cache-Control", "public, max-age=300"); // cache 5 min
+      res.json({ items, isValidFeed: matches.length > 0, count: items.length });
+    } catch (err: any) {
+      console.error("RSS proxy error:", err?.message);
       res.status(500).json({ error: "Failed to fetch RSS feed" });
     }
   });
@@ -3759,62 +3743,554 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
   // ── GET /api/templates/:id/render ─────────────────────────────────────────
   // Self-contained HTML renderer for Android WebView template playback.
   // PUBLIC — no auth required (Android WebView cannot send JWT headers).
-  app.get("/api/templates/:id/render", async (req, res) => {
-    try {
-      const { id } = req.params;
-      const template = await storage.getTemplate(id);
-      if (!template) return res.status(404).send("<h1>Template not found</h1>");
+// ── GET /api/templates/:id/render ──────────────────────────────────────────
+// Self-contained HTML renderer for Android WebView template playback.
+// PUBLIC — no auth required (Android WebView cannot send JWT headers).
+//
+// Supported element types:
+//   image, video, text, clock, date, rss, ticker, playlist, weather, stocks
+//
+// RSS/ticker data is fetched SERVER-SIDE via /api/rss-proxy to avoid
+// CORS and Samsung WebView compatibility issues with third-party proxies.
 
-      const elements = template.elements || template.layout?.elements || [];
-      const bg = template.background || template.layout?.background || "#0f1117";
-      const w = template.width || 1920;
-      const h = template.height || 1080;
+app.get("/api/templates/:id/render", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const template = await storage.getTemplate(id);
+    if (!template) return res.status(404).send("<h1>Template not found</h1>");
 
-      const html = `<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>${template.name || "Template"}</title>
+    const elements: any[] = template.elements || (template as any).layout?.elements || [];
+    const bg = (template as any).background || (template as any).layout?.background || "#0f1117";
+    const w = (template as any).width  || 1920;
+    const h = (template as any).height || 1080;
+
+    // Build the backend base URL for server-side proxy calls from the rendered page
+    const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
+    const host  = (req.headers["x-forwarded-host"] as string || req.get("host") || "").split(",")[0].trim();
+    const backendBase = `${proto}://${host}`;
+
+    const html = `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${template.name || "Template"}</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{width:100vw;height:100vh;background:${bg};overflow:hidden;font-family:'Inter','Segoe UI',sans-serif}
-#canvas{position:absolute;top:0;left:0;width:100vw;height:100vh}
+#canvas{position:absolute;inset:0}
 .zone{position:absolute;overflow:hidden}
+/* Images & video */
 .zone img,.zone video{width:100%;height:100%;object-fit:cover}
-.ticker-wrap{width:100%;height:100%;overflow:hidden;display:flex;align-items:center;position:relative}
-.ticker-text{white-space:nowrap;position:absolute;animation:ticker-scroll linear infinite}
-@keyframes ticker-scroll{from{transform:translateX(100vw)}to{transform:translateX(-100%)}}
-.rss-list{width:100%;height:100%;overflow:hidden;padding:8px;display:flex;flex-direction:column;gap:4px}
-.rss-item{color:rgba(255,255,255,0.85);font-size:13px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.08);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.rss-item:before{content:"\\203A ";color:#4ade80}
-.rss-header{color:#4ade80;font-size:11px;font-weight:600;margin-bottom:6px}
-.flex-center{width:100%;height:100%;display:flex;align-items:center;justify-content:center}
-</style></head>
-<body><div id="canvas"></div>
+/* Text */
+.text-zone{display:flex;align-items:center;justify-content:center;padding:8px}
+/* Clock / Date */
+.center-zone{width:100%;height:100%;display:flex;align-items:center;justify-content:center}
+/* RSS card list */
+.rss-wrap{width:100%;height:100%;overflow:hidden;padding:10px 12px;display:flex;flex-direction:column;gap:0}
+.rss-header{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;opacity:.6;margin-bottom:8px;display:flex;align-items:center;gap:6px}
+.rss-header-dot{width:6px;height:6px;border-radius:50%;background:#4ade80;display:inline-block}
+.rss-items{flex:1;overflow:hidden;display:flex;flex-direction:column;gap:0}
+.rss-item{padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.07);overflow:hidden;display:flex;align-items:flex-start;gap:8px;flex-shrink:0}
+.rss-item-bullet{color:#4ade80;flex-shrink:0;margin-top:2px}
+.rss-item-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+/* Ticker */
+.ticker-outer{width:100%;height:100%;display:flex;align-items:center;overflow:hidden;position:relative}
+.ticker-label{flex-shrink:0;font-weight:700;padding:0 12px;height:100%;display:flex;align-items:center;font-size:.85em;letter-spacing:.05em;text-transform:uppercase}
+.ticker-track{flex:1;overflow:hidden;position:relative;height:100%}
+.ticker-inner{white-space:nowrap;position:absolute;top:50%;transform:translateY(-50%);will-change:transform}
+@keyframes tickerL{from{transform:translateY(-50%) translateX(100vw)}to{transform:translateY(-50%) translateX(-100%)}}
+@keyframes tickerR{from{transform:translateY(-50%) translateX(-100%)}to{transform:translateY(-50%) translateX(100vw)}}
+/* Stocks */
+.stocks-wrap{width:100%;height:100%;overflow:hidden;padding:8px 10px;display:flex;flex-direction:column;gap:4px}
+.stocks-header{font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;opacity:.5;margin-bottom:4px}
+.stock-row{display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.06)}
+.stock-sym{font-weight:700;letter-spacing:.04em}
+.stock-price{font-variant-numeric:tabular-nums}
+.stock-chg{font-size:.85em;padding:1px 5px;border-radius:3px;font-variant-numeric:tabular-nums}
+.up{color:#4ade80;background:rgba(74,222,128,.12)}
+.dn{color:#f87171;background:rgba(248,113,113,.12)}
+/* Playlist zone */
+.playlist-zone{width:100%;height:100%;position:relative;background:#000}
+.playlist-zone img,.playlist-zone video{position:absolute;inset:0;width:100%;height:100%}
+/* Weather */
+.weather-wrap{width:100%;height:100%;overflow:hidden;padding:10px;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:4px}
+.weather-icon{font-size:3em;line-height:1}
+.weather-temp{font-size:2.2em;font-weight:700}
+.weather-desc{font-size:.9em;opacity:.7;text-transform:capitalize}
+.weather-loc{font-size:.75em;opacity:.5;margin-top:2px}
+/* Fade-in animation for content */
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+.fade-in{animation:fadeIn .4s ease}
+</style>
+</head><body>
+<div id="canvas"></div>
 <script>
-const CANVAS_W=${w},CANVAS_H=${h};
+'use strict';
+const CANVAS_W=${w}, CANVAS_H=${h};
+const BACKEND='${backendBase}';
 const elements=${JSON.stringify(elements)};
-async function fetchRss(url,max){const proxies=["https://api.allorigins.win/get?url="+encodeURIComponent(url),"https://corsproxy.io/?"+encodeURIComponent(url)];for(const p of proxies){try{const r=await fetch(p,{signal:AbortSignal.timeout(6000)});if(!r.ok)continue;const j=await r.json().catch(()=>null);const text=j?.contents||"";const doc=new DOMParser().parseFromString(text,"text/xml");const items=[...doc.querySelectorAll("item title,entry title")];const t=items.map(n=>n.textContent?.trim()).filter(Boolean);if(t.length)return t.slice(0,max||5);}catch{}}return[];}
-function sp(el){const sx=window.innerWidth/CANVAS_W,sy=window.innerHeight/CANVAS_H;return{l:el.x*sx,t:el.y*sy,w:el.w*sx,h:el.h*sy,sx,sy};}
-async function render(el){const p=sp(el);const zone=document.createElement("div");zone.className="zone";zone.style.cssText="left:"+p.l+"px;top:"+p.t+"px;width:"+p.w+"px;height:"+p.h+"px;"+(el.borderRadius?"border-radius:"+(el.borderRadius*p.sx)+"px;":"")+(el.zIndex!=null?"z-index:"+el.zIndex+";":el.z!=null?"z-index:"+el.z+";":"");const canvas=document.getElementById("canvas");
-if(el.type==="image"&&el.url){const img=document.createElement("img");img.src=el.url;img.style.objectFit=el.fit||"cover";zone.appendChild(img);}
-else if(el.type==="video"&&el.url){const v=document.createElement("video");v.src=el.url;v.autoplay=true;v.muted=true;v.loop=true;v.playsInline=true;v.style.objectFit=el.fit||"cover";zone.appendChild(v);}
-else if(el.type==="text"){zone.style.background=el.bgColor||"transparent";zone.style.display="flex";zone.style.alignItems="center";zone.style.justifyContent="center";zone.style.padding=(4*p.sx)+"px";const s=document.createElement("span");s.textContent=el.text||"";s.style.cssText="color:"+(el.color||"#fff")+";font-size:"+((el.fontSize||24)*p.sx)+"px;font-family:"+(el.fontFamily||"Inter")+";font-weight:"+(el.fontWeight||400)+";text-align:"+(el.align||"center")+";white-space:pre-wrap;word-break:break-word;width:100%";zone.appendChild(s);}
-else if(el.type==="ticker"){zone.style.background=el.tickerBg||"#111827";let text=el.tickerText||"";if(el.tickerRssUrl){const h=await fetchRss(el.tickerRssUrl,20);if(h.length)text=h.join("   \\u00B7   ");}const wrap=document.createElement("div");wrap.className="ticker-wrap";const t=document.createElement("div");t.className="ticker-text";t.textContent=text;t.style.cssText="color:"+(el.tickerColor||"#fff")+";font-size:"+((el.fontSize||20)*p.sx)+"px;font-family:"+(el.fontFamily||"Inter")+";animation-duration:"+(200/((el.tickerSpeed||60)*p.sx))+"s";wrap.appendChild(t);zone.appendChild(wrap);}
-else if(el.type==="rss"){zone.style.background=el.bgColor||"rgba(15,23,42,0.92)";zone.style.border="1px solid rgba(74,222,128,0.15)";zone.style.borderRadius=((el.borderRadius||4)*p.sx)+"px";const list=document.createElement("div");list.className="rss-list";const hdr=document.createElement("div");hdr.className="rss-header";hdr.textContent="RSS Feed";list.appendChild(hdr);if(el.rssUrl)fetchRss(el.rssUrl,el.rssMaxItems||5).then(headlines=>{headlines.forEach(h=>{const item=document.createElement("div");item.className="rss-item";item.textContent=h;item.style.fontSize=((el.fontSize||13)*p.sx)+"px";list.appendChild(item);});});zone.appendChild(list);}
-else if(el.type==="clock"){zone.style.background=el.bgColor||"rgba(15,23,42,0.8)";zone.style.borderRadius=((el.borderRadius||4)*p.sx)+"px";const d=document.createElement("div");d.className="flex-center";const s=document.createElement("span");s.style.cssText="color:"+(el.color||"#fff")+";font-size:"+((el.fontSize||48)*p.sx)+"px;font-family:"+(el.fontFamily||"Inter")+";font-weight:700;font-variant-numeric:tabular-nums";function tick(){const n=new Date();const pad=x=>x.toString().padStart(2,"0");s.textContent=(el.format||"HH:mm").replace("HH",pad(n.getHours())).replace("mm",pad(n.getMinutes())).replace("ss",pad(n.getSeconds()));}tick();setInterval(tick,1000);d.appendChild(s);zone.appendChild(d);}
-else if(el.type==="date"){zone.style.background=el.bgColor||"rgba(15,23,42,0.8)";const d=document.createElement("div");d.className="flex-center";const s=document.createElement("span");s.style.cssText="color:"+(el.color||"#fff")+";font-size:"+((el.fontSize||32)*p.sx)+"px;font-family:"+(el.fontFamily||"Inter")+";font-weight:600";const n=new Date();const pad=x=>x.toString().padStart(2,"0");s.textContent=(el.format||"YYYY-MM-DD").replace("MMMM",["January","February","March","April","May","June","July","August","September","October","November","December"][n.getMonth()]).replace("MMM",["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][n.getMonth()]).replace("MMMM",["January","February","March","April","May","June","July","August","September","October","November","December"][n.getMonth()]).replace("MMM",["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][n.getMonth()]).replace("YYYY",n.getFullYear()).replace("MM",pad(n.getMonth()+1)).replace("DD",pad(n.getDate()));d.appendChild(s);zone.appendChild(d);}
-canvas.appendChild(zone);}
-(async()=>{const sorted=[...elements].sort((a,b)=>(a.z!=null?a.z:a.zIndex||0)-(b.z!=null?b.z:b.zIndex||0));for(const el of sorted)await render(el);})();
-setTimeout(()=>location.reload(),5*60*1000);
-</script></body></html>`;
 
-      res.setHeader("Content-Type", "text/html; charset=utf-8");
-      res.setHeader("Cache-Control", "no-cache");
-      res.setHeader("Content-Security-Policy", "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src * 'unsafe-inline' 'unsafe-eval'; style-src * 'unsafe-inline'; img-src * data: blob:; media-src * blob:; connect-src *;");
-      return res.send(html);
-    } catch (err) {
-      console.error("Template render error:", err);
-      return res.status(500).send("<h1>Template render failed</h1>");
+// ── Curated feed presets ────────────────────────────────────────────────────
+const FEED_PRESETS = {
+  // International News
+  'bbc_world':    { label:'BBC World News',   url:'https://feeds.bbci.co.uk/news/world/rss.xml' },
+  'bbc_tech':     { label:'BBC Technology',   url:'https://feeds.bbci.co.uk/news/technology/rss.xml' },
+  'reuters_world':{ label:'Reuters World',    url:'https://feeds.reuters.com/reuters/worldNews' },
+  'reuters_biz':  { label:'Reuters Business', url:'https://feeds.reuters.com/reuters/businessNews' },
+  'aljazeera':    { label:'Al Jazeera',       url:'https://www.aljazeera.com/xml/rss/all.xml' },
+  'ap_top':       { label:'AP Top News',      url:'https://rsshub.app/apnews/topics/ap-top-news' },
+  // Tech
+  'techcrunch':   { label:'TechCrunch',       url:'https://techcrunch.com/feed/' },
+  'verge':        { label:'The Verge',        url:'https://www.theverge.com/rss/index.xml' },
+  'hackernews':   { label:'Hacker News',      url:'https://hnrss.org/frontpage' },
+  // Business & Finance
+  'ft':           { label:'Financial Times',  url:'https://www.ft.com/rss/home/uk' },
+  'cnbc_top':     { label:'CNBC Top News',    url:'https://www.cnbc.com/id/100003114/device/rss/rss.html' },
+  'bloomberg':    { label:'Bloomberg Markets', url:'https://feeds.bloomberg.com/markets/news.rss' },
+  // Sports
+  'bbc_sport':    { label:'BBC Sport',        url:'https://feeds.bbci.co.uk/sport/rss.xml' },
+  'espn':         { label:'ESPN Headlines',   url:'https://www.espn.com/espn/rss/news' },
+};
+
+// ── Scale helper ────────────────────────────────────────────────────────────
+function sp(el) {
+  const sx = window.innerWidth  / CANVAS_W;
+  const sy = window.innerHeight / CANVAS_H;
+  return { l: el.x*sx, t: el.y*sy, w: (el.w||200)*sx, h: (el.h||100)*sy, sx, sy };
+}
+
+// ── RSS fetch via backend proxy (avoids CORS + WebView issues) ──────────────
+async function fetchRss(url, max) {
+  if (!url) return [];
+  try {
+    const r = await fetch(BACKEND + '/api/rss-proxy?url=' + encodeURIComponent(url),
+      { signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return [];
+    const j = await r.json();
+    return (j.items || []).slice(0, max || 8).map(i => i.title).filter(Boolean);
+  } catch { return []; }
+}
+
+// ── Resolve feed URL from preset or custom ──────────────────────────────────
+function resolveFeedUrl(el, urlField) {
+  const preset = el.feedPreset || el.rssPreset || el.tickerPreset;
+  if (preset && FEED_PRESETS[preset]) return FEED_PRESETS[preset].url;
+  return el[urlField] || '';
+}
+
+// ── Zone factory ────────────────────────────────────────────────────────────
+async function renderEl(el) {
+  const p   = sp(el);
+  const div = document.createElement('div');
+  div.className = 'zone';
+  div.style.cssText = [
+    'left:'   + p.l + 'px',
+    'top:'    + p.t + 'px',
+    'width:'  + p.w + 'px',
+    'height:' + p.h + 'px',
+    el.borderRadius ? 'border-radius:' + (el.borderRadius * p.sx) + 'px' : '',
+    el.zIndex != null ? 'z-index:' + el.zIndex : (el.z != null ? 'z-index:' + el.z : ''),
+    el.bgColor && el.type !== 'ticker' ? 'background:' + el.bgColor : '',
+    el.opacity != null ? 'opacity:' + el.opacity : '',
+    el.shadow ? 'box-shadow:0 4px 24px rgba(0,0,0,.4)' : '',
+  ].filter(Boolean).join(';') + ';';
+
+  const type = el.type || 'text';
+
+  // ── IMAGE ─────────────────────────────────────────────────────────────────
+  if (type === 'image') {
+    if (!el.url) { div.style.background = '#1a1a2e'; return div; }
+    const img = document.createElement('img');
+    img.src = el.url;
+    img.style.objectFit = el.fit || 'cover';
+    img.className = 'fade-in';
+    div.appendChild(img);
+  }
+
+  // ── VIDEO ─────────────────────────────────────────────────────────────────
+  else if (type === 'video') {
+    if (!el.url) { div.style.background = '#000'; return div; }
+    const v = document.createElement('video');
+    v.src = el.url; v.autoplay = true; v.muted = true; v.loop = true; v.playsInline = true;
+    v.style.objectFit = el.fit || 'cover';
+    div.appendChild(v);
+  }
+
+  // ── TEXT ──────────────────────────────────────────────────────────────────
+  else if (type === 'text') {
+    div.classList.add('text-zone');
+    div.style.background = el.bgColor || 'transparent';
+    const s = document.createElement('span');
+    s.textContent = el.text || '';
+    s.style.cssText = [
+      'color:' + (el.color || '#fff'),
+      'font-size:' + ((el.fontSize || 24) * p.sx) + 'px',
+      'font-family:' + (el.fontFamily || 'Inter'),
+      'font-weight:' + (el.fontWeight || (el.bold ? 700 : 400)),
+      'font-style:' + (el.italic ? 'italic' : 'normal'),
+      'text-decoration:' + (el.underline ? 'underline' : 'none'),
+      'text-align:' + (el.textAlign || el.align || 'center'),
+      'white-space:pre-wrap',
+      'word-break:break-word',
+      'width:100%',
+      el.lineHeight ? 'line-height:' + el.lineHeight : '',
+      el.letterSpacing ? 'letter-spacing:' + el.letterSpacing + 'em' : '',
+    ].filter(Boolean).join(';');
+    div.appendChild(s);
+  }
+
+  // ── CLOCK ─────────────────────────────────────────────────────────────────
+  else if (type === 'clock') {
+    div.style.background = el.bgColor || 'rgba(15,23,42,0.8)';
+    div.style.borderRadius = ((el.borderRadius || 4) * p.sx) + 'px';
+    const c = document.createElement('div');
+    c.className = 'center-zone';
+    const s = document.createElement('span');
+    s.style.cssText = 'color:' + (el.color || '#fff') + ';font-size:' + ((el.fontSize || 48) * p.sx) + 'px;font-family:' + (el.fontFamily || 'Inter') + ';font-weight:700;font-variant-numeric:tabular-nums';
+    const fmt = el.format || 'HH:mm';
+    function tick() {
+      const n = new Date(); const pad = x => String(x).padStart(2,'0');
+      let t = fmt.replace('HH',pad(n.getHours())).replace('mm',pad(n.getMinutes())).replace('ss',pad(n.getSeconds()));
+      if (fmt.includes('hh')) {
+        const h12 = n.getHours() % 12 || 12;
+        t = t.replace('hh', pad(h12)).replace('A', n.getHours() < 12 ? 'AM' : 'PM');
+      }
+      s.textContent = t;
     }
-  });
+    tick(); setInterval(tick, 1000);
+    c.appendChild(s); div.appendChild(c);
+  }
+
+  // ── DATE ──────────────────────────────────────────────────────────────────
+  else if (type === 'date') {
+    div.style.background = el.bgColor || 'rgba(15,23,42,0.8)';
+    const MONTHS_LONG  = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+    const MONTHS_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const DAYS_LONG    = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+    const DAYS_SHORT   = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+    const c = document.createElement('div'); c.className = 'center-zone';
+    const s = document.createElement('span');
+    s.style.cssText = 'color:' + (el.color || '#fff') + ';font-size:' + ((el.fontSize || 32) * p.sx) + 'px;font-family:' + (el.fontFamily || 'Inter') + ';font-weight:600;text-align:center';
+    const n = new Date(); const pad = x => String(x).padStart(2,'0');
+    s.textContent = (el.format || 'MMMM DD, YYYY')
+      .replace('DDDD', DAYS_LONG[n.getDay()])
+      .replace('DDD',  DAYS_SHORT[n.getDay()])
+      .replace('MMMM', MONTHS_LONG[n.getMonth()])
+      .replace('MMM',  MONTHS_SHORT[n.getMonth()])
+      .replace('YYYY', n.getFullYear())
+      .replace('MM',   pad(n.getMonth() + 1))
+      .replace('DD',   pad(n.getDate()));
+    c.appendChild(s); div.appendChild(c);
+  }
+
+  // ── RSS CARD LIST ─────────────────────────────────────────────────────────
+  else if (type === 'rss') {
+    div.style.background = el.bgColor || 'rgba(10,15,30,0.92)';
+    div.style.border      = '1px solid rgba(74,222,128,0.12)';
+    div.style.borderRadius = ((el.borderRadius || 6) * p.sx) + 'px';
+    const wrap = document.createElement('div'); wrap.className = 'rss-wrap';
+
+    // Header row
+    const hdr = document.createElement('div'); hdr.className = 'rss-header';
+    hdr.style.color = el.headerColor || '#4ade80';
+    hdr.style.fontSize = (10 * p.sx) + 'px';
+    const dot = document.createElement('span'); dot.className = 'rss-header-dot';
+    dot.style.background = el.headerColor || '#4ade80';
+    hdr.appendChild(dot);
+    const feedUrl = resolveFeedUrl(el, 'rssUrl');
+    const presetLabel = (el.feedPreset && FEED_PRESETS[el.feedPreset]) ? FEED_PRESETS[el.feedPreset].label : (el.rssLabel || 'Live Feed');
+    hdr.appendChild(document.createTextNode(' ' + presetLabel.toUpperCase()));
+    wrap.appendChild(hdr);
+
+    // Items container
+    const listEl = document.createElement('div'); listEl.className = 'rss-items';
+    wrap.appendChild(listEl);
+    div.appendChild(wrap);
+
+    // Async fill
+    if (feedUrl) {
+      fetchRss(feedUrl, el.rssMaxItems || 6).then(headlines => {
+        listEl.innerHTML = '';
+        if (!headlines.length) {
+          listEl.innerHTML = '<div style="opacity:.4;font-size:' + (12*p.sx) + 'px;padding:8px 0">No headlines available</div>';
+          return;
+        }
+        headlines.forEach(h => {
+          const item = document.createElement('div'); item.className = 'rss-item fade-in';
+          item.style.fontSize = ((el.fontSize || 13) * p.sx) + 'px';
+          item.style.color = el.color || 'rgba(255,255,255,0.88)';
+          const bullet = document.createElement('span'); bullet.className = 'rss-item-bullet';
+          bullet.style.color = el.headerColor || '#4ade80';
+          bullet.textContent = '›';
+          const text = document.createElement('span'); text.className = 'rss-item-text';
+          text.textContent = h;
+          item.appendChild(bullet); item.appendChild(text);
+          listEl.appendChild(item);
+        });
+      });
+    } else {
+      listEl.innerHTML = '<div style="opacity:.35;font-size:' + (12*p.sx) + 'px;padding:8px 0">Configure RSS URL in template designer</div>';
+    }
+
+    // Auto-refresh every 5 minutes
+    setInterval(() => {
+      if (!feedUrl) return;
+      fetchRss(feedUrl, el.rssMaxItems || 6).then(headlines => {
+        if (!headlines.length) return;
+        listEl.innerHTML = '';
+        headlines.forEach(h => {
+          const item = document.createElement('div'); item.className = 'rss-item fade-in';
+          item.style.fontSize = ((el.fontSize || 13) * p.sx) + 'px';
+          item.style.color = el.color || 'rgba(255,255,255,0.88)';
+          const bullet = document.createElement('span'); bullet.className = 'rss-item-bullet';
+          bullet.style.color = el.headerColor || '#4ade80'; bullet.textContent = '›';
+          const text = document.createElement('span'); text.className = 'rss-item-text'; text.textContent = h;
+          item.appendChild(bullet); item.appendChild(text); listEl.appendChild(item);
+        });
+      });
+    }, 5 * 60 * 1000);
+  }
+
+  // ── TICKER ────────────────────────────────────────────────────────────────
+  else if (type === 'ticker') {
+    div.style.background = el.tickerBg || '#0f172a';
+    const outer = document.createElement('div'); outer.className = 'ticker-outer';
+
+    // Optional label badge
+    const labelText = el.tickerLabel || (el.feedPreset && FEED_PRESETS[el.feedPreset] ? FEED_PRESETS[el.feedPreset].label : null);
+    if (labelText) {
+      const label = document.createElement('div'); label.className = 'ticker-label';
+      label.style.cssText = 'background:' + (el.tickerColor || '#4ade80') + ';color:#000;font-size:' + (11 * p.sx) + 'px';
+      label.textContent = labelText;
+      outer.appendChild(label);
+    }
+
+    const track = document.createElement('div'); track.className = 'ticker-track';
+    const inner = document.createElement('div'); inner.className = 'ticker-inner';
+    inner.style.cssText = 'color:' + (el.tickerColor || '#fff') + ';font-size:' + ((el.fontSize || 20) * p.sx) + 'px;font-family:' + (el.fontFamily || 'Inter');
+    track.appendChild(inner); outer.appendChild(track); div.appendChild(outer);
+
+    async function startTicker() {
+      let text = el.tickerText || '';
+      const feedUrl = resolveFeedUrl(el, 'tickerRssUrl');
+      if (feedUrl) {
+        const items = await fetchRss(feedUrl, el.tickerItems || 20);
+        if (items.length) text = items.join('   \u00B7   ');
+      }
+      if (!text) text = 'No ticker content — configure RSS URL or text in template designer';
+      inner.textContent = text;
+
+      // Calculate animation duration based on text length and speed
+      const speed = (el.tickerSpeed || 80) * p.sx; // px/sec
+      const trackW = track.offsetWidth || p.w;
+      const textW  = inner.scrollWidth || text.length * ((el.fontSize || 20) * p.sx * 0.6);
+      const totalDist = trackW + textW;
+      const dur = totalDist / speed;
+      const dir = el.tickerDirection === 'right' ? 'tickerR' : 'tickerL';
+      inner.style.animationName = dir;
+      inner.style.animationDuration = dur + 's';
+      inner.style.animationTimingFunction = 'linear';
+      inner.style.animationIterationCount = 'infinite';
+    }
+
+    startTicker();
+    // Refresh ticker content every 10 minutes
+    setInterval(startTicker, 10 * 60 * 1000);
+  }
+
+  // ── PLAYLIST ZONE ─────────────────────────────────────────────────────────
+  else if (type === 'playlist') {
+    div.style.background = '#000';
+    const pWrap = document.createElement('div'); pWrap.className = 'playlist-zone';
+    div.appendChild(pWrap);
+
+    const items = (el.playlistItems || []).filter(i => i.url || i.mediaUrl);
+    if (!items.length) {
+      pWrap.innerHTML = '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.25);font-size:' + (14*p.sx) + 'px">No playlist items</div>';
+    } else {
+      let idx = 0;
+      let timer = null;
+
+      function playItem(i) {
+        pWrap.innerHTML = '';
+        const item = items[i];
+        const url  = item.url || item.mediaUrl || '';
+        const mtype = (item.type || item.mediaType || '').toLowerCase();
+        const dur  = (item.duration || 10) * 1000;
+
+        if (mtype === 'video' || /\\.mp4|webm|ogg/i.test(url)) {
+          const v = document.createElement('video');
+          v.src = url; v.autoplay = true; v.muted = !item.volume || item.volume === 0; v.playsInline = true;
+          v.style.objectFit = el.fit || 'cover';
+          v.className = 'fade-in';
+          v.onended = () => advance();
+          v.onerror = () => { if (timer) clearTimeout(timer); advance(); };
+          pWrap.appendChild(v);
+          // Fallback timer in case video doesn't end (e.g. looping source)
+          timer = setTimeout(advance, dur + 2000);
+        } else {
+          const img = document.createElement('img');
+          img.src = url;
+          img.style.objectFit = el.fit || 'cover';
+          img.className = 'fade-in';
+          pWrap.appendChild(img);
+          timer = setTimeout(advance, dur);
+        }
+      }
+
+      function advance() {
+        if (timer) clearTimeout(timer);
+        idx = (idx + 1) % items.length;
+        if (!el.playlistLoop && idx === 0) return; // stop if no loop
+        playItem(idx);
+      }
+
+      if (el.playlistAutoplay !== false) playItem(0);
+    }
+  }
+
+  // ── WEATHER ───────────────────────────────────────────────────────────────
+  else if (type === 'weather') {
+    div.style.background = el.bgColor || 'rgba(10,15,35,0.9)';
+    div.style.borderRadius = ((el.borderRadius || 8) * p.sx) + 'px';
+    const wrap = document.createElement('div'); wrap.className = 'weather-wrap';
+
+    const lat  = el.weatherLat  || 31.9454; // default: Amman
+    const lon  = el.weatherLon  || 35.9284;
+    const unit = el.weatherUnit || 'C';
+    const loc  = el.weatherLocation || 'Your Location';
+
+    wrap.innerHTML = '<div class="weather-icon" style="font-size:' + (48*p.sy) + 'px">⛅</div>'
+      + '<div class="weather-temp" style="color:' + (el.color||'#fff') + ';font-size:' + (48*p.sy) + 'px">--°' + unit + '</div>'
+      + '<div class="weather-desc" style="color:' + (el.color||'rgba(255,255,255,.7)') + ';font-size:' + (16*p.sy) + 'px">Loading...</div>'
+      + '<div class="weather-loc" style="color:rgba(255,255,255,.4);font-size:' + (12*p.sy) + 'px">' + loc + '</div>';
+
+    const apiUnit = unit === 'F' ? 'imperial' : 'metric';
+    const wUrl = 'https://api.open-meteo.com/v1/forecast?latitude=' + lat + '&longitude=' + lon + '&current_weather=true&temperature_unit=' + (unit==='F'?'fahrenheit':'celsius');
+    fetch(wUrl, { signal: AbortSignal.timeout(8000) }).then(r => r.json()).then(d => {
+      const cw = d.current_weather;
+      if (!cw) return;
+      const WMO = {0:'☀️',1:'🌤',2:'⛅',3:'☁️',45:'🌫',48:'🌫',51:'🌦',53:'🌧',55:'🌧',61:'🌧',63:'🌧',65:'🌧',71:'🌨',73:'🌨',75:'🌨',80:'🌦',81:'🌧',82:'🌧',95:'⛈',96:'⛈',99:'⛈'};
+      const icon = WMO[cw.weathercode] || '🌡️';
+      const temp = Math.round(cw.temperature);
+      wrap.children[0].textContent = icon;
+      wrap.children[1].textContent = temp + '°' + unit;
+      wrap.children[2].textContent = cw.is_day ? 'Clear' : 'Night';
+    }).catch(() => {});
+
+    div.appendChild(wrap);
+  }
+
+  // ── STOCKS / FINANCIAL TICKER ─────────────────────────────────────────────
+  else if (type === 'stocks') {
+    div.style.background = el.bgColor || 'rgba(5,10,25,0.95)';
+    div.style.borderRadius = ((el.borderRadius || 4) * p.sx) + 'px';
+    const wrap = document.createElement('div'); wrap.className = 'stocks-wrap';
+
+    const symbols = el.stockSymbols || ['BTC', 'ETH', 'AAPL', 'MSFT', 'TSLA'];
+    const hdr = document.createElement('div'); hdr.className = 'stocks-header';
+    hdr.style.cssText = 'color:rgba(255,255,255,.4);font-size:' + (9*p.sy) + 'px';
+    hdr.textContent = (el.stocksLabel || 'MARKET DATA').toUpperCase();
+    wrap.appendChild(hdr);
+
+    // Use Yahoo Finance unofficial endpoint via backend proxy
+    symbols.forEach(sym => {
+      const row = document.createElement('div'); row.className = 'stock-row';
+      row.style.fontSize = ((el.fontSize || 14) * p.sy) + 'px';
+      const s = document.createElement('span'); s.className = 'stock-sym'; s.style.color = el.color || '#fff'; s.textContent = sym;
+      const price = document.createElement('span'); price.className = 'stock-price'; price.style.color = el.color || '#fff'; price.textContent = '--';
+      const chg = document.createElement('span'); chg.className = 'stock-chg up'; chg.textContent = '--';
+      row.appendChild(s); row.appendChild(price); row.appendChild(chg);
+      wrap.appendChild(row);
+
+      // Fetch via backend proxy
+      fetch(BACKEND + '/api/stocks-proxy?symbol=' + encodeURIComponent(sym), { signal: AbortSignal.timeout(6000) })
+        .then(r => r.json())
+        .then(d => {
+          if (d.price != null) { price.textContent = d.price; }
+          if (d.change != null) {
+            const up = parseFloat(d.change) >= 0;
+            chg.className = 'stock-chg ' + (up ? 'up' : 'dn');
+            chg.textContent = (up ? '+' : '') + d.change + '%';
+          }
+        }).catch(() => {});
+    });
+
+    // Refresh every 60 seconds
+    setInterval(() => location.reload(), 60 * 1000);
+    div.appendChild(wrap);
+  }
+
+  // ── UNKNOWN ───────────────────────────────────────────────────────────────
+  else {
+    div.style.background = 'rgba(255,0,0,.1)';
+    div.style.border = '1px dashed rgba(255,0,0,.3)';
+    div.innerHTML = '<div style="color:rgba(255,255,255,.3);font-size:11px;padding:8px">Unknown zone type: ' + type + '</div>';
+  }
+
+  return div;
+}
+
+// ── Main init ────────────────────────────────────────────────────────────────
+(async () => {
+  const canvas = document.getElementById('canvas');
+  const sorted = [...elements].sort((a, b) =>
+    (a.z != null ? a.z : a.zIndex || 0) - (b.z != null ? b.z : b.zIndex || 0)
+  );
+  for (const el of sorted) {
+    const zone = await renderEl(el);
+    canvas.appendChild(zone);
+  }
+})();
+
+// ── Auto-reload every 5 minutes to refresh all content ──────────────────────
+setTimeout(() => location.reload(), 5 * 60 * 1000);
+</script>
+</body></html>`;
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.setHeader("Content-Security-Policy",
+      "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; " +
+      "script-src * 'unsafe-inline' 'unsafe-eval'; " +
+      "style-src * 'unsafe-inline'; " +
+      "img-src * data: blob:; " +
+      "media-src * blob:; " +
+      "connect-src *;"
+    );
+    return res.send(html);
+  } catch (err) {
+    console.error("Template render error:", err);
+    return res.status(500).send("<h1>Template render failed</h1>");
+  }
+});
+
+// ── GET /api/stocks-proxy?symbol=AAPL ──────────────────────────────────────
+// Server-side stock price fetch — avoids CORS from device WebView.
+// Uses Yahoo Finance unofficial quote endpoint (no API key needed).
+app.get("/api/stocks-proxy", async (req: Request, res: Response) => {
+  const { symbol } = req.query;
+  if (!symbol || typeof symbol !== "string") {
+    return res.status(400).json({ error: "symbol is required" });
+  }
+  try {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`;
+    const r = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!r.ok) return res.status(502).json({ error: "upstream_failed" });
+    const d: any = await r.json();
+    const meta = d?.chart?.result?.[0]?.meta;
+    if (!meta) return res.status(502).json({ error: "no_data" });
+    const price  = meta.regularMarketPrice?.toFixed(2) ?? null;
+    const prev   = meta.chartPreviousClose ?? meta.previousClose ?? null;
+    const change = price && prev ? (((parseFloat(price) - prev) / prev) * 100).toFixed(2) : null;
+    res.json({ symbol: symbol.toUpperCase(), price, change, currency: meta.currency || "USD" });
+  } catch {
+    res.status(504).json({ error: "timeout" });
+  }
+});
 
   app.patch("/api/templates/:id", async (req, res) => {
     try {
