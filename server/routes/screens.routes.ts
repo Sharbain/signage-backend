@@ -18,6 +18,42 @@ export async function registerScreensRoutes(app: Express) {
   // POST /api/screens/register — device self-registration
   // POST /api/device/register  — legacy alias
   // ---------------------------------------------------------------------------
+
+  // Helper: find the correct group to auto-assign a newly registered device.
+  // - If a JWT user is present and is a publisher with a group → use their group
+  // - Otherwise → use the org's root group (Default Organization)
+  async function resolveAutoGroup(req: Request): Promise<number | null> {
+    try {
+      const userId = (req as any).user?.id;
+      if (userId) {
+        // Check if this user has a group assigned (publisher scoped to a group)
+        const userResult = await pool.query(
+          `SELECT group_id, role, org_id FROM users WHERE id = $1 LIMIT 1`,
+          [userId],
+        );
+        const user = userResult.rows[0];
+        if (user?.group_id) return Number(user.group_id);
+
+        // No specific group — use org root group
+        if (user?.org_id) {
+          const rootGroup = await pool.query(
+            `SELECT id FROM groups WHERE org_id = $1 AND parent_id IS NULL LIMIT 1`,
+            [user.org_id],
+          );
+          if (rootGroup.rows[0]) return Number(rootGroup.rows[0].id);
+        }
+      }
+
+      // Fallback: use the first root group in the system (Default Organization)
+      const fallback = await pool.query(
+        `SELECT id FROM groups WHERE parent_id IS NULL ORDER BY created_at ASC LIMIT 1`,
+      );
+      return fallback.rows[0] ? Number(fallback.rows[0].id) : null;
+    } catch {
+      return null;
+    }
+  }
+
   async function handleDeviceRegister(req: Request, res: Response) {
     try {
       const { deviceId, name, resolution, location } = req.body;
@@ -35,6 +71,22 @@ export async function registerScreensRoutes(app: Express) {
           lastSeen: new Date(),
           status: "online",
         });
+
+        // Auto-assign group if not already assigned
+        const currentGroup = await pool.query(
+          `SELECT new_group_id FROM screens WHERE id = $1`,
+          [existingScreen.id],
+        );
+        if (!currentGroup.rows[0]?.new_group_id) {
+          const autoGroupId = await resolveAutoGroup(req);
+          if (autoGroupId) {
+            await pool.query(
+              `UPDATE screens SET new_group_id = $1, updated_at = NOW() WHERE id = $2`,
+              [autoGroupId, existingScreen.id],
+            ).catch(() => {});
+          }
+        }
+
         return res.json({ message: "Device reconnected", screen: updated, deviceToken });
       }
 
@@ -49,6 +101,15 @@ export async function registerScreensRoutes(app: Express) {
         lastSeen: new Date(),
         password: hash,
       });
+
+      // Auto-assign to the correct group based on who is registering
+      const autoGroupId = await resolveAutoGroup(req);
+      if (autoGroupId && screen?.id) {
+        await pool.query(
+          `UPDATE screens SET new_group_id = $1, updated_at = NOW() WHERE id = $2`,
+          [autoGroupId, screen.id],
+        ).catch(() => { /* best effort — don't fail registration */ });
+      }
 
       res.status(201).json({ message: "Device registered", screen, deviceToken });
     } catch (error) {
