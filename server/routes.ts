@@ -532,6 +532,13 @@ export async function registerRoutes(
     // Template render endpoint — public, used by Android WebView (no JWT available)
     if (/^\/templates\/[^\/]+\/render$/.test(p)) return next();
 
+    // Proxy endpoints — public, called from Android WebView and template preview
+    // These fetch external data (RSS, stocks, JSON APIs) server-side to avoid CORS
+    if (p === "/rss-proxy") return next();
+    if (p === "/ticker-proxy") return next();
+    if (p === "/data-proxy") return next();
+    if (p === "/stocks-proxy") return next();
+
     // Pairing / activation must not require admin JWT
     if (
       p === "/device/claim" ||
