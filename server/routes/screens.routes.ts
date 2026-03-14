@@ -18,42 +18,6 @@ export async function registerScreensRoutes(app: Express) {
   // POST /api/screens/register — device self-registration
   // POST /api/device/register  — legacy alias
   // ---------------------------------------------------------------------------
-
-  // Helper: find the correct group to auto-assign a newly registered device.
-  // - If a JWT user is present and is a publisher with a group → use their group
-  // - Otherwise → use the org's root group (Default Organization)
-  async function resolveAutoGroup(req: Request): Promise<number | null> {
-    try {
-      const userId = (req as any).user?.id;
-      if (userId) {
-        // Check if this user has a group assigned (publisher scoped to a group)
-        const userResult = await pool.query(
-          `SELECT group_id, role, org_id FROM users WHERE id = $1 LIMIT 1`,
-          [userId],
-        );
-        const user = userResult.rows[0];
-        if (user?.group_id) return Number(user.group_id);
-
-        // No specific group — use org root group
-        if (user?.org_id) {
-          const rootGroup = await pool.query(
-            `SELECT id FROM groups WHERE org_id = $1 AND parent_id IS NULL LIMIT 1`,
-            [user.org_id],
-          );
-          if (rootGroup.rows[0]) return Number(rootGroup.rows[0].id);
-        }
-      }
-
-      // Fallback: use the first root group in the system (Default Organization)
-      const fallback = await pool.query(
-        `SELECT id FROM groups WHERE parent_id IS NULL ORDER BY created_at ASC LIMIT 1`,
-      );
-      return fallback.rows[0] ? Number(fallback.rows[0].id) : null;
-    } catch {
-      return null;
-    }
-  }
-
   async function handleDeviceRegister(req: Request, res: Response) {
     try {
       const { deviceId, name, resolution, location } = req.body;
@@ -71,22 +35,6 @@ export async function registerScreensRoutes(app: Express) {
           lastSeen: new Date(),
           status: "online",
         });
-
-        // Auto-assign group if not already assigned
-        const currentGroup = await pool.query(
-          `SELECT new_group_id FROM screens WHERE id = $1`,
-          [existingScreen.id],
-        );
-        if (!currentGroup.rows[0]?.new_group_id) {
-          const autoGroupId = await resolveAutoGroup(req);
-          if (autoGroupId) {
-            await pool.query(
-              `UPDATE screens SET new_group_id = $1, updated_at = NOW() WHERE id = $2`,
-              [autoGroupId, existingScreen.id],
-            ).catch(() => {});
-          }
-        }
-
         return res.json({ message: "Device reconnected", screen: updated, deviceToken });
       }
 
@@ -101,15 +49,6 @@ export async function registerScreensRoutes(app: Express) {
         lastSeen: new Date(),
         password: hash,
       });
-
-      // Auto-assign to the correct group based on who is registering
-      const autoGroupId = await resolveAutoGroup(req);
-      if (autoGroupId && screen?.id) {
-        await pool.query(
-          `UPDATE screens SET new_group_id = $1, updated_at = NOW() WHERE id = $2`,
-          [autoGroupId, screen.id],
-        ).catch(() => { /* best effort — don't fail registration */ });
-      }
 
       res.status(201).json({ message: "Device registered", screen, deviceToken });
     } catch (error) {
@@ -142,6 +81,16 @@ export async function registerScreensRoutes(app: Express) {
         [deviceId],
       );
 
+      // Check for template assignment
+      const templateResult = await pool.query(
+        `SELECT dta.template_id, dta.assigned_at, t.name AS template_name
+         FROM device_template_assignments dta
+         JOIN templates t ON t.id = dta.template_id
+         WHERE dta.device_id = $1
+         ORDER BY dta.assigned_at DESC LIMIT 1`,
+        [deviceId],
+      );
+
       // Resolve most recent assigned playlist
       const assignmentResult = await pool.query(
         `SELECT pa.playlist_id, pa.assigned_at,
@@ -154,14 +103,34 @@ export async function registerScreensRoutes(app: Express) {
         [deviceId],
       );
 
-      // No playlist assigned — return empty + any active publish job id
-      if (assignmentResult.rowCount === 0) {
-        const jobResult = await pool.query(
-          `SELECT id FROM publish_jobs
-           WHERE device_id = $1 AND status IN ('pending', 'downloading')
-           ORDER BY started_at DESC LIMIT 1`,
-          [deviceId],
-        );
+      const jobResult = await pool.query(
+        `SELECT id FROM publish_jobs
+         WHERE device_id = $1 AND status IN ('pending', 'downloading')
+         ORDER BY started_at DESC LIMIT 1`,
+        [deviceId],
+      );
+
+      const templateRow = templateResult.rows[0];
+      const playlistRow = assignmentResult.rows[0];
+
+      // If template was assigned more recently than playlist, return template mode
+      if (templateRow && (
+        !playlistRow ||
+        new Date(templateRow.assigned_at) >= new Date(playlistRow.assigned_at)
+      )) {
+        return res.json({
+          screen: { id: screen.id, deviceId: screen.deviceId, name: screen.name, resolution: screen.resolution },
+          playlist: [],
+          assignment: null,
+          templateId: templateRow.template_id,
+          templateName: templateRow.template_name,
+          refreshInterval: 300,
+          publishJobId: jobResult.rows[0]?.id ?? null,
+        });
+      }
+
+      // No playlist assigned — return empty
+      if (!playlistRow) {
         return res.json({
           screen: { id: screen.id, deviceId: screen.deviceId, name: screen.name, resolution: screen.resolution },
           playlist: [],
@@ -171,8 +140,7 @@ export async function registerScreensRoutes(app: Express) {
         });
       }
 
-      const assignment = assignmentResult.rows[0];
-      const playlistId = Number(assignment.playlist_id);
+      const playlistId = Number(playlistRow.playlist_id);
 
       const itemsResult = await pool.query(
         `SELECT
@@ -202,20 +170,13 @@ export async function registerScreensRoutes(app: Express) {
         }),
       );
 
-      const jobResult = await pool.query(
-        `SELECT id FROM publish_jobs
-         WHERE device_id = $1 AND status IN ('pending', 'downloading')
-         ORDER BY started_at DESC LIMIT 1`,
-        [deviceId],
-      );
-
       return res.json({
         screen: { id: screen.id, deviceId: screen.deviceId, name: screen.name, resolution: screen.resolution },
         assignment: {
           playlistId,
-          playlistName: assignment.playlist_name,
-          playlistDescription: assignment.playlist_description,
-          assignedAt: assignment.assigned_at,
+          playlistName: playlistRow.playlist_name,
+          playlistDescription: playlistRow.playlist_description,
+          assignedAt: playlistRow.assigned_at,
         },
         playlist,
         refreshInterval: 300,
