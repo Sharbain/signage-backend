@@ -538,6 +538,7 @@ export async function registerRoutes(
     if (p === "/ticker-proxy") return next();
     if (p === "/data-proxy") return next();
     if (p === "/stocks-proxy") return next();
+    if (p === "/equiti-proxy") return next();
 
     // Pairing / activation must not require admin JWT
     if (
@@ -4291,7 +4292,93 @@ async function renderEl(el) {
   // Renders the URL in a sandboxed iframe — always live, no scraping needed.
   else if (type === 'embed') {
     const embedPreset = el.embedPreset && EMBED_PRESETS[el.embedPreset];
-    const src = (embedPreset ? embedPreset.url : null) || el.embedUrl || el.url || '';
+    const rawSrc = (embedPreset ? embedPreset.url : null) || el.embedUrl || el.url || '';
+
+    // Equiti blocks iframes — use our scraper proxy instead and render natively
+    if (el.embedPreset === 'equiti_ticker' || rawSrc.includes('equiti.com/price-ticker')) {
+      const colorUp = '#4ade80';
+      const colorDown = '#f87171';
+      div.style.background = el.bgColor || 'rgba(5,10,25,0.97)';
+      div.style.overflow = 'hidden';
+
+      // Loading state
+      div.innerHTML = '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.3);font-size:' + (13*p.sx) + 'px">Loading Equiti prices…</div>';
+
+      fetch(BACKEND + '/api/equiti-proxy', { signal: AbortSignal.timeout(10000) })
+        .then(r => r.json())
+        .then(data => {
+          if (!data.prices || !data.prices.length) {
+            // Fallback: show a generic forex ticker from data-proxy
+            div.innerHTML = '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(255,165,0,.6);font-size:' + (11*p.sx) + 'px;padding:8px;text-align:center">Equiti live prices unavailable</div>';
+            return;
+          }
+          div.innerHTML = '';
+          const wrap = document.createElement('div');
+          wrap.style.cssText = 'width:100%;height:100%;display:flex;flex-direction:column;overflow:hidden';
+
+          // Header
+          const hdr = document.createElement('div');
+          hdr.style.cssText = 'padding:' + (5*p.sx) + 'px ' + (10*p.sx) + 'px;font-size:' + (9*p.sy) + 'px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:rgba(255,255,255,.35);border-bottom:1px solid rgba(255,255,255,.06);flex-shrink:0;display:flex;justify-content:space-between';
+          hdr.innerHTML = '<span>EQUITI LIVE PRICES</span><span style="color:rgba(74,222,128,.5);font-size:' + (8*p.sy) + 'px">LIVE</span>';
+          wrap.appendChild(hdr);
+
+          // Column headers
+          const colHdr = document.createElement('div');
+          colHdr.style.cssText = 'display:flex;justify-content:space-between;padding:' + (3*p.sx) + 'px ' + (10*p.sx) + 'px;font-size:' + (8*p.sy) + 'px;color:rgba(255,255,255,.2);text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid rgba(255,255,255,.04);flex-shrink:0';
+          colHdr.innerHTML = '<span>SYMBOL</span><span style="display:flex;gap:' + (16*p.sx) + 'px"><span>BID</span><span>ASK</span></span>';
+          wrap.appendChild(colHdr);
+
+          const rows = document.createElement('div');
+          rows.style.cssText = 'flex:1;overflow:hidden;display:flex;flex-direction:column';
+          data.prices.forEach((item, i) => {
+            const row = document.createElement('div');
+            row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:' + (5*p.sy) + 'px ' + (10*p.sx) + 'px;border-bottom:1px solid rgba(255,255,255,.04);flex-shrink:0;' + (i%2===0?'background:rgba(255,255,255,.015)':'');
+            const cc = item.direction === 'down' ? colorDown : colorUp;
+            const arrow = item.direction === 'down' ? '▼' : '▲';
+            row.innerHTML = '<span style="font-size:' + ((el.fontSize||13)*p.sy) + 'px;font-weight:700;color:#fff;letter-spacing:.03em">' + (item.symbol||'') + '</span>' +
+              '<span style="display:flex;gap:' + (16*p.sx) + 'px;align-items:center">' +
+              '<span style="font-size:' + ((el.fontSize||13)*p.sy) + 'px;font-variant-numeric:tabular-nums;color:#fff">' + (item.bid||'--') + '</span>' +
+              '<span style="font-size:' + ((el.fontSize||13)*p.sy) + 'px;font-variant-numeric:tabular-nums;color:rgba(255,255,255,.6)">' + (item.ask||'--') + '</span>' +
+              '<span style="font-size:' + (10*p.sy) + 'px;color:' + cc + '">' + arrow + '</span>' +
+              '</span>';
+            rows.appendChild(row);
+          });
+          wrap.appendChild(rows);
+          div.appendChild(wrap);
+        })
+        .catch(() => {
+          div.innerHTML = '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(255,100,100,.5);font-size:' + (11*p.sx) + 'px">Equiti prices unavailable</div>';
+        });
+
+      // Auto-refresh every 15 seconds
+      setInterval(() => {
+        fetch(BACKEND + '/api/equiti-proxy', { signal: AbortSignal.timeout(10000) })
+          .then(r => r.json())
+          .then(data => {
+            if (data.prices && data.prices.length) {
+              // Re-render rows
+              const rowContainer = div.querySelector('div[style*="flex:1"]') || div.querySelector('div:last-child');
+              if (rowContainer) {
+                Array.from(rowContainer.children).forEach((row, i) => {
+                  const item = data.prices[i];
+                  if (!item) return;
+                  const cc = item.direction === 'down' ? colorDown : colorUp;
+                  const arrow = item.direction === 'down' ? '▼' : '▲';
+                  row.children[1].children[0].textContent = item.bid || '--';
+                  row.children[1].children[1].textContent = item.ask || '--';
+                  row.children[1].children[2].textContent = arrow;
+                  row.children[1].children[2].style.color = cc;
+                });
+              }
+            }
+          })
+          .catch(() => {});
+      }, 15000);
+
+      return div;
+    }
+
+    const src = rawSrc;
     if (!src) {
       div.style.background = 'rgba(255,255,255,.05)';
       div.innerHTML = '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.3);font-size:' + (13*p.sx) + 'px">Set embed URL in designer</div>';
@@ -4622,6 +4709,91 @@ app.get("/api/stocks-proxy", async (req: Request, res: Response) => {
     res.json({ symbol: symbol.toUpperCase(), price, change, currency: meta.currency || "USD" });
   } catch {
     res.status(504).json({ error: "timeout" });
+  }
+});
+
+
+// ── GET /api/equiti-proxy ──────────────────────────────────────────────────
+// Scrapes Equiti price ticker page and returns forex prices as JSON.
+// Called by the render engine instead of iframing equiti.com directly
+// (which is blocked by X-Frame-Options).
+app.get("/api/equiti-proxy", async (req: Request, res: Response) => {
+  try {
+    const r = await fetch("https://www.equiti.com/price-ticker/", {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.equiti.com/",
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!r.ok) {
+      return res.status(502).json({ error: `Upstream ${r.status}` });
+    }
+
+    const html = await r.text();
+
+    // Extract price data from the HTML
+    // Equiti renders prices in elements with data attributes or JSON blobs
+    const prices: { symbol: string; bid: string; ask: string; change?: string; direction?: string }[] = [];
+
+    // Try to find JSON data blob in the page
+    const jsonMatch = html.match(/window\.__INITIAL_STATE__\s*=\s*({.+?});/s)
+      || html.match(/priceData\s*=\s*(\[.+?\]);/s)
+      || html.match(/"instruments"\s*:\s*(\[.+?\])/s);
+
+    if (jsonMatch) {
+      try {
+        const data = JSON.parse(jsonMatch[1]);
+        const instruments = Array.isArray(data) ? data : (data.instruments || data.prices || []);
+        for (const item of instruments.slice(0, 20)) {
+          prices.push({
+            symbol: item.symbol || item.name || item.pair || '',
+            bid: item.bid || item.price || item.sell || '',
+            ask: item.ask || item.buy || '',
+            change: item.change || item.dailyChange || '',
+            direction: item.direction || (parseFloat(item.change) >= 0 ? 'up' : 'down'),
+          });
+        }
+      } catch { /* fall through to regex */ }
+    }
+
+    // Fallback: regex scrape for price elements
+    if (!prices.length) {
+      const pairRegex = /<[^>]+class="[^"]*(?:pair|symbol|instrument)[^"]*"[^>]*>([A-Z]{3,6}(?:\/[A-Z]{3,6})?)<\/[^>]+>/gi;
+      const priceRegex = /<[^>]+class="[^"]*(?:bid|ask|price|rate)[^"]*"[^>]*>([\d.,]+)<\/[^>]+>/gi;
+
+      const pairs: string[] = [];
+      const priceVals: string[] = [];
+
+      let m;
+      while ((m = pairRegex.exec(html)) !== null) pairs.push(m[1]);
+      while ((m = priceRegex.exec(html)) !== null) priceVals.push(m[1]);
+
+      for (let i = 0; i < Math.min(pairs.length, 10); i++) {
+        prices.push({
+          symbol: pairs[i],
+          bid: priceVals[i * 2] || priceVals[i] || '',
+          ask: priceVals[i * 2 + 1] || '',
+        });
+      }
+    }
+
+    // If we still have nothing, return a fallback message
+    if (!prices.length) {
+      return res.json({
+        prices: [],
+        error: "Could not parse Equiti price data — their page structure may have changed",
+        html_length: html.length,
+      });
+    }
+
+    res.setHeader("Cache-Control", "public, max-age=15"); // 15s cache
+    return res.json({ prices, fetchedAt: new Date().toISOString() });
+  } catch (err: any) {
+    return res.status(504).json({ error: "Failed to fetch Equiti prices", detail: err?.message });
   }
 });
 
