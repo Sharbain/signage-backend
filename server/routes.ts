@@ -4499,20 +4499,32 @@ async function renderEl(el) {
   // ── TICKER ────────────────────────────────────────────────────────────────
   else if (type === 'ticker') {
     div.style.background = el.tickerBg || '#0f172a';
+    div.style.overflow = 'hidden';
     const outer = document.createElement('div'); outer.className = 'ticker-outer';
 
-    // Optional label badge
-    const labelText = el.tickerLabel || (el.feedPreset && FEED_PRESETS[el.feedPreset] ? FEED_PRESETS[el.feedPreset].label : null);
-    if (labelText) {
+    // Label badge or bar
+    const labelStyle = el.tickerLabelStyle || 'badge';
+    const labelText  = el.tickerLabel || (el.tickerPreset && FEED_PRESETS[el.tickerPreset] ? FEED_PRESETS[el.tickerPreset].label : null);
+    if (labelText && labelStyle !== 'none') {
       const label = document.createElement('div'); label.className = 'ticker-label';
-      label.style.cssText = 'background:' + (el.tickerColor || '#4ade80') + ';color:#000;font-size:' + (11 * p.sx) + 'px';
+      const lbg = el.tickerLabelBg || '#dc2626';
+      const ltc = el.tickerLabelColor || '#fff';
+      if (labelStyle === 'bar') {
+        label.style.cssText = 'background:' + lbg + ';color:' + ltc + ';font-size:' + (11*p.sx) + 'px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;padding:0 ' + (14*p.sx) + 'px;height:100%;display:flex;align-items:center;flex-shrink:0;white-space:nowrap';
+      } else {
+        label.style.cssText = 'background:' + lbg + ';color:' + ltc + ';font-size:' + (10*p.sx) + 'px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:' + (3*p.sy) + 'px ' + (10*p.sx) + 'px;margin:0 ' + (6*p.sx) + 'px;border-radius:' + (3*p.sx) + 'px;white-space:nowrap;align-self:center;flex-shrink:0';
+      }
       label.textContent = labelText;
       outer.appendChild(label);
     }
 
     const track = document.createElement('div'); track.className = 'ticker-track';
     const inner = document.createElement('div'); inner.className = 'ticker-inner';
-    inner.style.cssText = 'color:' + (el.tickerColor || '#fff') + ';font-size:' + ((el.fontSize || 20) * p.sx) + 'px;font-family:' + (el.fontFamily || 'Inter');
+    const fontFamily = el.tickerFontFamily || el.fontFamily || 'Inter';
+    const fontWeight = el.tickerFontWeight || '400';
+    const tickerFontSize = ((el.tickerFontSize || el.fontSize || 20) * p.sx);
+    const separator = el.tickerSeparator || '   \u00B7   ';
+    inner.style.cssText = 'color:' + (el.tickerColor || el.color || '#fff') + ';font-size:' + tickerFontSize + 'px;font-family:' + fontFamily + ';font-weight:' + fontWeight;
     track.appendChild(inner); outer.appendChild(track); div.appendChild(outer);
 
     async function startTicker() {
@@ -4520,17 +4532,14 @@ async function renderEl(el) {
       const feedUrl = resolveFeedUrl(el, 'tickerRssUrl');
       if (feedUrl) {
         const items = await fetchRss(feedUrl, el.tickerItems || 20);
-        if (items.length) text = items.join('   \u00B7   ');
+        if (items.length) text = items.join(separator);
       }
-      if (!text) text = 'No ticker content — configure RSS URL or text in template designer';
+      if (!text) text = 'Configure ticker content in template designer';
       inner.textContent = text;
-
-      // Calculate animation duration based on text length and speed
-      const speed = (el.tickerSpeed || 80) * p.sx; // px/sec
+      const speed = (el.tickerSpeed || 80) * p.sx;
       const trackW = track.offsetWidth || p.w;
-      const textW  = inner.scrollWidth || text.length * ((el.fontSize || 20) * p.sx * 0.6);
-      const totalDist = trackW + textW;
-      const dur = totalDist / speed;
+      const textW  = inner.scrollWidth || text.length * tickerFontSize * 0.6;
+      const dur = (trackW + textW) / speed;
       const dir = el.tickerDirection === 'right' ? 'tickerR' : 'tickerL';
       inner.style.animationName = dir;
       inner.style.animationDuration = dur + 's';
@@ -4539,10 +4548,8 @@ async function renderEl(el) {
     }
 
     startTicker();
-    // Refresh ticker content every 10 minutes
     setInterval(startTicker, 10 * 60 * 1000);
   }
-
   // ── PLAYLIST ZONE ─────────────────────────────────────────────────────────
   else if (type === 'playlist') {
     div.style.background = '#000';
