@@ -3847,9 +3847,21 @@ const FEED_PRESETS = {
   'ft':           { label:'Financial Times',  url:'https://www.ft.com/rss/home/uk' },
   'cnbc_top':     { label:'CNBC Top News',    url:'https://www.cnbc.com/id/100003114/device/rss/rss.html' },
   'bloomberg':    { label:'Bloomberg Markets', url:'https://feeds.bloomberg.com/markets/news.rss' },
+  // MENA / Arabic
+  'mamlaka':      { label:'Mamlaka TV',         url:'https://www.almamlakatv.com/feed.xml' },
+  'aljazeera_ar': { label:'Al Jazeera Arabic',  url:'https://www.aljazeera.net/xml/rss/all.xml' },
+  'bbc_arabic':   { label:'BBC Arabic',         url:'https://feeds.bbci.co.uk/arabic/rss.xml' },
+  'france24_ar':  { label:'France 24 Arabic',   url:'https://www.france24.com/ar/rss' },
   // Sports
   'bbc_sport':    { label:'BBC Sport',        url:'https://feeds.bbci.co.uk/sport/rss.xml' },
   'espn':         { label:'ESPN Headlines',   url:'https://www.espn.com/espn/rss/news' },
+};
+
+// ── Embed widget presets (third-party iframes) ──────────────────────────────
+const EMBED_PRESETS = {
+  'arabiaweather_amman': { label:'Arabia Weather — Amman',  url:'http://widgets.media.devops.arabiaweather.com/widget/DAN' },
+  'arabiaweather_doha':  { label:'Arabia Weather — Doha',   url:'https://widgets.media.devops.arabiaweather.com/widget/DAN-DOHA' },
+  'equiti_ticker':       { label:'Equiti Price Ticker',      url:'https://www.equiti.com/price-ticker/' },
 };
 
 // ── Scale helper ────────────────────────────────────────────────────────────
@@ -4219,6 +4231,35 @@ async function renderEl(el) {
     // Refresh every 60 seconds
     setInterval(() => location.reload(), 60 * 1000);
     div.appendChild(wrap);
+  }
+
+  // ── EMBED (iframe) ───────────────────────────────────────────────────────
+  // For third-party widgets: Arabia Weather, Equiti price ticker, etc.
+  // Renders the URL in a sandboxed iframe — always live, no scraping needed.
+  else if (type === 'embed') {
+    const embedPreset = el.embedPreset && EMBED_PRESETS[el.embedPreset];
+    const src = (embedPreset ? embedPreset.url : null) || el.embedUrl || el.url || '';
+    if (!src) {
+      div.style.background = 'rgba(255,255,255,.05)';
+      div.innerHTML = '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.3);font-size:' + (13*p.sx) + 'px">Set embed URL in designer</div>';
+    } else {
+      const frame = document.createElement('iframe');
+      frame.src = src;
+      frame.style.cssText = 'width:100%;height:100%;border:none;display:block;';
+      // Scale the iframe content if the zone is smaller than the widget's native size
+      if (el.embedScale && el.embedScale !== 1) {
+        frame.style.transformOrigin = 'top left';
+        frame.style.transform = 'scale(' + el.embedScale + ')';
+        frame.style.width = (100 / el.embedScale) + '%';
+        frame.style.height = (100 / el.embedScale) + '%';
+      }
+      frame.setAttribute('scrolling', el.embedScroll ? 'yes' : 'no');
+      frame.setAttribute('frameborder', '0');
+      frame.setAttribute('allowtransparency', 'true');
+      // Allow all features needed by weather/finance widgets
+      frame.setAttribute('allow', 'geolocation; autoplay; fullscreen');
+      div.appendChild(frame);
+    }
   }
 
   // ── UNKNOWN ───────────────────────────────────────────────────────────────
