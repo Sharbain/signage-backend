@@ -184,10 +184,14 @@ export async function registerPublishJobRoutes(app: Express) {
         }
 
         const normalizedContentType = String(contentType || "media").trim().toLowerCase();
+        // For template publishes, contentId is a UUID string (not numeric)
+        // Use templateId as contentId for template publishes to satisfy NOT NULL constraint
         const numericContentId =
-          contentId == null || contentId === "" || !Number.isFinite(Number(contentId))
-            ? null
-            : Number(contentId);
+          isTemplatePublish
+            ? (publishTemplateId ? String(publishTemplateId) : null)
+            : contentId == null || contentId === "" || !Number.isFinite(Number(contentId))
+              ? null
+              : Number(contentId);
 
         const screenResult = await client.query(
           `SELECT name FROM screens WHERE device_id = $1 LIMIT 1`,
