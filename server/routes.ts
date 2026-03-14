@@ -4186,14 +4186,14 @@ async function renderEl(el) {
       dot.style.cssText = 'width:' + (6*p.sx) + 'px;height:' + (6*p.sx) + 'px;border-radius:50%;background:' + accent + ';flex-shrink:0;animation:pulse 2s infinite';
       const lbl = document.createElement('span');
       lbl.style.cssText = 'font-size:' + (9*p.sy) + 'px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:' + accent;
-      const presetLabel = (el.feedPreset && (window as any).FEED_PRESETS_LABEL?.[el.feedPreset]) || el.rssLabel || 'Live Feed';
+      const presetLabel = (el.feedPreset && window.FEED_PRESETS_LABEL?.[el.feedPreset]) || el.rssLabel || 'Live Feed';
       lbl.textContent = presetLabel;
       hdr.appendChild(dot); hdr.appendChild(lbl);
       return hdr;
     }
 
     // ── Format date ──────────────────────────────────────────────────────
-    function formatDate(pubDate: string) {
+    function formatDate(pubDate) {
       if (!pubDate) return '';
       try {
         const d = new Date(pubDate);
@@ -4207,7 +4207,7 @@ async function renderEl(el) {
     }
 
     // ── LIST LAYOUT ──────────────────────────────────────────────────────
-    function renderList(items: any[]) {
+    function renderList(items) {
       div.innerHTML = '';
       const wrap = document.createElement('div');
       wrap.style.cssText = 'width:100%;height:100%;display:flex;flex-direction:column;overflow:hidden';
@@ -4242,7 +4242,7 @@ async function renderEl(el) {
     }
 
     // ── CARDS LAYOUT ─────────────────────────────────────────────────────
-    function renderCards(items: any[]) {
+    function renderCards(items) {
       div.innerHTML = '';
       const wrap = document.createElement('div');
       wrap.style.cssText = 'width:100%;height:100%;display:flex;flex-direction:column;overflow:hidden';
@@ -4301,14 +4301,14 @@ async function renderEl(el) {
 
     // ── SLIDESHOW / FEATURE LAYOUT ────────────────────────────────────────
     // One story at a time, auto-advances. Feature = big image bg + overlay text.
-    function renderSlideshow(items: any[], isFeature: boolean) {
+    function renderSlideshow(items, isFeature) {
       div.innerHTML = '';
       div.style.background = '#000';
       if (!items.length) return;
       let idx = 0;
-      let timer: any = null;
+      let timer = null;
 
-      function showSlide(i: number) {
+      function showSlide(i) {
         div.innerHTML = '';
         const entry = items[i];
         const title = typeof entry === 'string' ? entry : entry.title;
@@ -4414,7 +4414,7 @@ async function renderEl(el) {
 
     // ── LOWER THIRD LAYOUT ────────────────────────────────────────────────
     // Breaking news bar — cycles through headlines with a ticker-style reveal
-    function renderLowerThird(items: any[]) {
+    function renderLowerThird(items) {
       div.innerHTML = '';
       div.style.background = 'transparent';
       div.style.overflow = 'hidden';
@@ -4449,7 +4449,7 @@ async function renderEl(el) {
       bar.appendChild(counter);
       div.appendChild(bar);
 
-      function showItem(i: number) {
+      function showItem(i) {
         const entry = items[i];
         textEl.style.opacity = '0';
         textEl.style.transition = 'opacity .3s';
@@ -4476,7 +4476,7 @@ async function renderEl(el) {
       const useEnrich = showImages && (layout !== 'list');
       const items = useEnrich
         ? await fetchRssWithImages(feedUrl, maxItems)
-        : (await fetchRss(feedUrl, maxItems)).map((t: string) => ({ title: t }));
+        : (await fetchRss(feedUrl, maxItems)).map((t) => ({ title: t }));
 
       if (!items.length) {
         div.innerHTML = '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.3);font-size:' + (12*p.sx) + 'px">No headlines available</div>';
