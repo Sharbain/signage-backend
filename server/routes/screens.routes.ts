@@ -83,7 +83,7 @@ export async function registerScreensRoutes(app: Express) {
 
       // Check for template assignment
       const templateResult = await pool.query(
-        `SELECT dta.template_id, dta.assigned_at, t.name AS template_name
+        `SELECT dta.template_id, dta.assigned_at AT TIME ZONE 'UTC' AS assigned_at, t.name AS template_name
          FROM device_template_assignments dta
          JOIN templates t ON t.id = dta.template_id::text
          WHERE dta.device_id = $1
@@ -93,7 +93,7 @@ export async function registerScreensRoutes(app: Express) {
 
       // Resolve most recent assigned playlist
       const assignmentResult = await pool.query(
-        `SELECT pa.playlist_id, pa.assigned_at,
+        `SELECT pa.playlist_id, pa.assigned_at AT TIME ZONE 'UTC' AS assigned_at,
                 cp.name AS playlist_name, cp.description AS playlist_description
          FROM playlist_assignments pa
          JOIN content_playlists cp ON cp.id = pa.playlist_id
@@ -116,7 +116,7 @@ export async function registerScreensRoutes(app: Express) {
       // If template was assigned more recently than playlist, return template mode
       if (templateRow && (
         !playlistRow ||
-        new Date(templateRow.assigned_at) >= new Date(playlistRow.assigned_at)
+        new Date(templateRow.assigned_at).getTime() >= new Date(playlistRow.assigned_at).getTime()
       )) {
         return res.json({
           screen: { id: screen.id, deviceId: screen.deviceId, name: screen.name, resolution: screen.resolution },
