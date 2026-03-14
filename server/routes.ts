@@ -38,6 +38,7 @@ import { registerPublishJobRoutes } from "./routes/publish-jobs.routes";
 import { registerScreensRoutes } from "./routes/screens.routes";
 import { registerClientRoutes } from "./routes/clients.routes";
 import { registerScheduleRoutes } from "./routes/schedule.routes";
+import { registerGroupRoutes } from "./routes/groups.routes";
 import { broadcastPublishJobUpdate } from "./ws";
 import { createClient } from "@supabase/supabase-js";
 
@@ -465,6 +466,7 @@ export async function registerRoutes(
   await registerScreensRoutes(app);
   registerClientRoutes(app);
   registerScheduleRoutes(app);
+  registerGroupRoutes(app);
 
   // --------------------------------------------------
   // PUBLIC MEDIA DELIVERY
