@@ -40,6 +40,7 @@ import { registerClientRoutes } from "./routes/clients.routes";
 import { registerScheduleRoutes } from "./routes/schedule.routes";
 import { registerGroupRoutes } from "./routes/groups.routes";
 import { broadcastPublishJobUpdate } from "./ws";
+import WebSocketClient from "ws";
 import { createClient } from "@supabase/supabase-js";
 
 // Supabase Storage client (server-side, uses service role key)
@@ -4738,8 +4739,7 @@ let equitiLastUpdate = 0;
 
 function connectEquitiWs() {
   try {
-    const WebSocket = require("ws");
-    equitiWs = new WebSocket(EQUITI_WS_URL, {
+    equitiWs = new WebSocketClient(EQUITI_WS_URL, {
       headers: {
         "Origin": EQUITI_ORIGIN,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -4753,7 +4753,7 @@ function connectEquitiWs() {
 
       // Send GETQUOTES: keepalive every 330ms (matches browser behavior)
       equitiPingInterval = setInterval(() => {
-        if (equitiWs?.readyState === 1) {
+        if (equitiWs?.readyState === WebSocketClient.OPEN) {
           equitiWs.send("GETQUOTES:");
         }
       }, 330);
