@@ -313,7 +313,7 @@ export async function registerPublishJobRoutes(app: Express) {
             : isPlaylistPublish
             ? "refresh_playlist"
             : "play_content",
-          contentId: numericContentId,
+          contentId: isTemplatePublish ? String(publishTemplateId) : numericContentId,
           contentName,
           contentUrl: isMediaPublish ? normalizedContentUrl : null,
           contentType: normalizedContentType,
@@ -322,7 +322,7 @@ export async function registerPublishJobRoutes(app: Express) {
           playlistId: isPlaylistPublish
             ? Number(publishPlaylistId)
             : (instantPlaylist?.playlistId ?? null),
-          templateId: isTemplatePublish ? Number(publishTemplateId) : null,
+          templateId: isTemplatePublish ? String(publishTemplateId) : null,
         };
 
         const command = await client.query(
