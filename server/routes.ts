@@ -3808,6 +3808,7 @@ setTimeout(()=>location.reload(),5*60*1000);
 
       res.setHeader("Content-Type", "text/html; charset=utf-8");
       res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Content-Security-Policy", "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src * 'unsafe-inline' 'unsafe-eval'; style-src * 'unsafe-inline'; img-src * data: blob:; media-src * blob:; connect-src *;");
       return res.send(html);
     } catch (err) {
       console.error("Template render error:", err);
