@@ -290,17 +290,16 @@ export async function registerPublishJobRoutes(app: Express) {
         }
 
         if (isTemplatePublish && publishTemplateId != null) {
-          // Write the template assignment
+          // Write the template assignment — store UUID string directly
           await client.query(
             `INSERT INTO device_template_assignments (device_id, template_id, assigned_at)
              VALUES ($1, $2, NOW())
              ON CONFLICT (device_id) DO UPDATE SET template_id = $2, assigned_at = NOW()`,
-            [deviceId, Number(publishTemplateId)],
+            [deviceId, String(publishTemplateId)],
           ).catch(() => { /* table may not exist yet */ });
 
           // CRITICAL: Clear all playlist assignments for this device so the
-          // template always wins. Without this, an older playlist_assignment row
-          // can have a newer timestamp and override the template in the playlist endpoint.
+          // template always wins.
           await client.query(
             `DELETE FROM playlist_assignments WHERE device_id = $1`,
             [deviceId],
