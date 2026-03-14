@@ -3864,6 +3864,52 @@ const EMBED_PRESETS = {
   'equiti_ticker':       { label:'Equiti Price Ticker',      url:'https://www.equiti.com/price-ticker/' },
 };
 
+// ── Built-in data connector presets ────────────────────────────────────────
+// These are pre-configured API endpoints with field mappings.
+// Users can use these out-of-the-box or customize everything.
+const DATA_PRESETS = {
+  // Crypto prices — CoinGecko (free, no API key)
+  crypto_top: {
+    label: 'Top Crypto Prices',
+    url: 'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=20&page=1',
+    path: '',
+    fields: { label: 'symbol', value: 'current_price', change: 'price_change_percentage_24h' },
+    display: 'table',
+    refresh: 60,
+    title: 'CRYPTO',
+  },
+  // Forex rates — exchangerate.host (free)
+  forex_usd: {
+    label: 'Forex Rates (USD base)',
+    url: 'https://open.er-api.com/v6/latest/USD',
+    path: '',  // special: rates is an object, we convert it
+    fields: { label: '__key__', value: '__val__', change: '' },
+    display: 'table',
+    refresh: 3600,
+    title: 'FOREX',
+  },
+  // Gold & Silver — metals-api alternative
+  commodities: {
+    label: 'Commodities',
+    url: 'https://api.metals.live/v1/spot',
+    path: '',
+    fields: { label: 'metal', value: 'price', change: '' },
+    display: 'table',
+    refresh: 300,
+    title: 'COMMODITIES',
+  },
+  // Custom — user configures everything
+  custom: {
+    label: 'Custom API',
+    url: '',
+    path: '',
+    fields: { label: 'name', value: 'value', change: 'change' },
+    display: 'table',
+    refresh: 60,
+    title: '',
+  },
+};
+
 // ── Scale helper ────────────────────────────────────────────────────────────
 function sp(el) {
   const sx = window.innerWidth  / CANVAS_W;
@@ -4262,6 +4308,245 @@ async function renderEl(el) {
     }
   }
 
+// ── DATA CONNECTOR ZONE (type: "datazone") ────────────────────────────────
+// Fetches any JSON API server-side and renders live data in configurable styles.
+// Supports: table, ticker/marquee, cards, single KPI value.
+//
+// Element fields:
+//   dataUrl       — API endpoint URL
+//   dataPath      — dot-notation path to items array in response
+//   dataFields    — { label, value, change, secondary } field name mapping
+//   dataDisplay   — "table" | "ticker" | "cards" | "single" | "marquee"
+//   dataRefresh   — seconds between auto-refresh (default 60)
+//   dataHeaders   — JSON string of custom request headers
+//   dataMaxItems  — max rows/items to show
+//   dataTitle     — header label text
+//   dataColorUp   — color for positive change values (default #4ade80)
+//   dataColorDown — color for negative change values (default #f87171)
+//   dataPreset    — preset key from DATA_PRESETS
+
+  else if (type === 'datazone') {
+    div.style.background = el.bgColor || 'rgba(5,10,25,0.95)';
+    div.style.borderRadius = ((el.borderRadius || 6) * p.sx) + 'px';
+    div.style.border = '1px solid rgba(255,255,255,0.06)';
+    div.style.overflow = 'hidden';
+
+    const colorUp   = el.dataColorUp   || '#4ade80';
+    const colorDown = el.dataColorDown || '#f87171';
+    const display   = el.dataDisplay   || 'table';
+    const maxItems  = el.dataMaxItems  || 20;
+    const title     = el.dataTitle     || '';
+    const fLabel    = el.dataFields?.label    || 'name';
+    const fValue    = el.dataFields?.value    || 'price';
+    const fChange   = el.dataFields?.change   || 'change';
+    const fSecond   = el.dataFields?.secondary || '';
+
+    // Resolve preset URL
+    const presetUrl = el.dataPreset && DATA_PRESETS[el.dataPreset]
+      ? DATA_PRESETS[el.dataPreset].url : null;
+    const dataUrl = presetUrl || el.dataUrl || '';
+
+    if (!dataUrl) {
+      div.innerHTML = '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.25);font-size:' + (13*p.sx) + 'px;padding:16px;text-align:center">Configure data source URL in template designer</div>';
+      return div;
+    }
+
+    // Build proxy URL
+    function buildProxyUrl(url, path, hdrs) {
+      let u = BACKEND + '/api/data-proxy?url=' + encodeURIComponent(url);
+      if (path) u += '&path=' + encodeURIComponent(path);
+      if (hdrs) u += '&headers=' + btoa(hdrs);
+      u += '&max=' + maxItems;
+      return u;
+    }
+
+    // Format a value nicely
+    function fmt(val, isChange) {
+      if (val == null || val === '') return '--';
+      const n = parseFloat(String(val).replace(/[^0-9.-]/g, ''));
+      if (isNaN(n)) return String(val).substring(0, 20);
+      if (isChange) return (n >= 0 ? '+' : '') + n.toFixed(2) + '%';
+      if (Math.abs(n) >= 1e9) return (n/1e9).toFixed(2) + 'B';
+      if (Math.abs(n) >= 1e6) return (n/1e6).toFixed(2) + 'M';
+      if (Math.abs(n) >= 1e3) return n.toLocaleString(undefined, {maximumFractionDigits:2});
+      return n.toFixed(n % 1 === 0 ? 0 : 4);
+    }
+
+    function changeColor(val) {
+      const n = parseFloat(String(val).replace(/[^0-9.-]/g, ''));
+      if (isNaN(n)) return 'rgba(255,255,255,.5)';
+      return n >= 0 ? colorUp : colorDown;
+    }
+
+    // ── Render table display ────────────────────────────────────────────────
+    function renderTable(items) {
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'width:100%;height:100%;display:flex;flex-direction:column;overflow:hidden';
+
+      // Header
+      if (title) {
+        const hdr = document.createElement('div');
+        hdr.style.cssText = 'padding:' + (6*p.sx) + 'px ' + (10*p.sx) + 'px;font-size:' + (9*p.sy) + 'px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.35);border-bottom:1px solid rgba(255,255,255,.06);flex-shrink:0';
+        hdr.textContent = title;
+        wrap.appendChild(hdr);
+      }
+
+      // Column headers
+      const colHdr = document.createElement('div');
+      colHdr.style.cssText = 'display:flex;justify-content:space-between;padding:' + (4*p.sx) + 'px ' + (10*p.sx) + 'px;font-size:' + (9*p.sy) + 'px;color:rgba(255,255,255,.25);text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid rgba(255,255,255,.04);flex-shrink:0';
+      colHdr.innerHTML = '<span>' + fLabel.toUpperCase() + '</span><span style="display:flex;gap:' + (16*p.sx) + 'px"><span>' + fValue.toUpperCase() + '</span>' + (fChange ? '<span>' + fChange.toUpperCase() + '</span>' : '') + '</span>';
+      wrap.appendChild(colHdr);
+
+      // Rows
+      const rows = document.createElement('div');
+      rows.style.cssText = 'flex:1;overflow:hidden;display:flex;flex-direction:column';
+      items.forEach((item, i) => {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:' + (5*p.sy) + 'px ' + (10*p.sx) + 'px;border-bottom:1px solid rgba(255,255,255,.04);flex-shrink:0;' + (i%2===0?'background:rgba(255,255,255,.015)':'');
+        const labelEl = document.createElement('span');
+        labelEl.style.cssText = 'font-size:' + ((el.fontSize||13)*p.sy) + 'px;font-weight:600;color:' + (el.color||'#fff') + ';letter-spacing:.02em';
+        labelEl.textContent = String(item[fLabel] || '--').substring(0,20);
+        const vals = document.createElement('span');
+        vals.style.cssText = 'display:flex;gap:' + (14*p.sx) + 'px;align-items:center';
+        const valEl = document.createElement('span');
+        valEl.style.cssText = 'font-size:' + ((el.fontSize||13)*p.sy) + 'px;font-variant-numeric:tabular-nums;color:' + (el.color||'#fff');
+        valEl.textContent = fmt(item[fValue], false);
+        vals.appendChild(valEl);
+        if (fChange && item[fChange] != null) {
+          const chgEl = document.createElement('span');
+          const chgColor = changeColor(item[fChange]);
+          chgEl.style.cssText = 'font-size:' + ((el.fontSize||11)*p.sy) + 'px;font-variant-numeric:tabular-nums;padding:' + (1*p.sy) + 'px ' + (5*p.sx) + 'px;border-radius:3px;background:' + chgColor + '22;color:' + chgColor;
+          chgEl.textContent = fmt(item[fChange], true);
+          vals.appendChild(chgEl);
+        }
+        row.appendChild(labelEl); row.appendChild(vals);
+        rows.appendChild(row);
+      });
+      wrap.appendChild(rows);
+      return wrap;
+    }
+
+    // ── Render cards display ────────────────────────────────────────────────
+    function renderCards(items) {
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'width:100%;height:100%;display:flex;flex-wrap:wrap;gap:' + (6*p.sx) + 'px;padding:' + (8*p.sx) + 'px;align-content:flex-start;overflow:hidden';
+      items.forEach(item => {
+        const card = document.createElement('div');
+        const cardW = items.length <= 4 ? 'calc(50% - ' + (3*p.sx) + 'px)' : 'calc(33% - ' + (4*p.sx) + 'px)';
+        card.style.cssText = 'width:' + cardW + ';background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07);border-radius:' + (6*p.sx) + 'px;padding:' + (8*p.sy) + 'px ' + (10*p.sx) + 'px;display:flex;flex-direction:column;gap:' + (4*p.sy) + 'px';
+        const lbl = document.createElement('div');
+        lbl.style.cssText = 'font-size:' + (10*p.sy) + 'px;color:rgba(255,255,255,.4);font-weight:600;letter-spacing:.04em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+        lbl.textContent = String(item[fLabel]||'').substring(0,16);
+        const val = document.createElement('div');
+        val.style.cssText = 'font-size:' + ((el.fontSize||18)*p.sy) + 'px;font-weight:700;color:' + (el.color||'#fff') + ';font-variant-numeric:tabular-nums';
+        val.textContent = fmt(item[fValue], false);
+        card.appendChild(lbl); card.appendChild(val);
+        if (fChange && item[fChange] != null) {
+          const chg = document.createElement('div');
+          const cc = changeColor(item[fChange]);
+          chg.style.cssText = 'font-size:' + (11*p.sy) + 'px;color:' + cc + ';font-variant-numeric:tabular-nums';
+          chg.textContent = fmt(item[fChange], true);
+          card.appendChild(chg);
+        }
+        wrap.appendChild(card);
+      });
+      return wrap;
+    }
+
+    // ── Render single KPI display ───────────────────────────────────────────
+    function renderSingle(items) {
+      const item = items[0] || {};
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:' + (6*p.sy) + 'px;padding:' + (12*p.sx) + 'px';
+      const lbl = document.createElement('div');
+      lbl.style.cssText = 'font-size:' + (11*p.sy) + 'px;color:rgba(255,255,255,.4);font-weight:700;letter-spacing:.08em;text-transform:uppercase';
+      lbl.textContent = title || String(item[fLabel]||'').substring(0,20);
+      const val = document.createElement('div');
+      val.style.cssText = 'font-size:' + ((el.fontSize||52)*p.sy) + 'px;font-weight:800;color:' + (el.color||'#fff') + ';font-variant-numeric:tabular-nums;line-height:1';
+      val.textContent = fmt(item[fValue], false);
+      wrap.appendChild(lbl); wrap.appendChild(val);
+      if (fChange && item[fChange] != null) {
+        const chg = document.createElement('div');
+        const cc = changeColor(item[fChange]);
+        chg.style.cssText = 'font-size:' + (16*p.sy) + 'px;color:' + cc + ';font-variant-numeric:tabular-nums';
+        chg.textContent = fmt(item[fChange], true);
+        wrap.appendChild(chg);
+      }
+      return wrap;
+    }
+
+    // ── Render marquee/ticker display ───────────────────────────────────────
+    function renderMarquee(items) {
+      const outer = document.createElement('div');
+      outer.style.cssText = 'width:100%;height:100%;display:flex;align-items:center;overflow:hidden;position:relative;background:' + (el.tickerBg||el.bgColor||'rgba(5,10,25,.95)');
+      if (title) {
+        const lbl = document.createElement('div');
+        lbl.style.cssText = 'flex-shrink:0;font-weight:700;padding:0 ' + (12*p.sx) + 'px;height:100%;display:flex;align-items:center;font-size:' + (11*p.sy) + 'px;letter-spacing:.05em;text-transform:uppercase;background:' + colorUp + ';color:#000';
+        lbl.textContent = title;
+        outer.appendChild(lbl);
+      }
+      const track = document.createElement('div');
+      track.style.cssText = 'flex:1;overflow:hidden;position:relative;height:100%';
+      const inner = document.createElement('div');
+      const text = items.map(item => {
+        const l = String(item[fLabel]||'');
+        const v = fmt(item[fValue], false);
+        const c = fChange && item[fChange] != null ? ' ' + fmt(item[fChange], true) : '';
+        return l + ': ' + v + c;
+      }).join('   \u00B7   ');
+      inner.style.cssText = 'white-space:nowrap;position:absolute;top:50%;transform:translateY(-50%);will-change:transform;color:' + (el.color||'#fff') + ';font-size:' + ((el.fontSize||16)*p.sy) + 'px;font-variant-numeric:tabular-nums;font-weight:600';
+      inner.textContent = text;
+      track.appendChild(inner);
+      outer.appendChild(track);
+
+      // Start animation after render
+      setTimeout(() => {
+        const trackW = track.offsetWidth || p.w;
+        const textW  = inner.scrollWidth || text.length * (el.fontSize||16) * p.sy * 0.6;
+        const speed  = (el.tickerSpeed||80) * p.sx;
+        const dur    = (trackW + textW) / speed;
+        inner.style.animationName = 'tickerL';
+        inner.style.animationDuration = dur + 's';
+        inner.style.animationTimingFunction = 'linear';
+        inner.style.animationIterationCount = 'infinite';
+      }, 100);
+
+      return outer;
+    }
+
+    // ── Main fetch & render ─────────────────────────────────────────────────
+    const proxyUrl = buildProxyUrl(dataUrl, el.dataPath, el.dataHeaders);
+    const refreshMs = Math.max((el.dataRefresh || 60), 10) * 1000;
+
+    async function loadData() {
+      try {
+        const r = await fetch(proxyUrl, { signal: AbortSignal.timeout(10000) });
+        if (!r.ok) return;
+        const d = await r.json();
+        const items = (d.items || []).slice(0, maxItems);
+        if (!items.length) return;
+
+        div.innerHTML = '';
+        let rendered;
+        if (display === 'cards')   rendered = renderCards(items);
+        else if (display === 'single')  rendered = renderSingle(items);
+        else if (display === 'marquee' || display === 'ticker') rendered = renderMarquee(items);
+        else rendered = renderTable(items); // default: table
+
+        rendered.className = 'fade-in';
+        div.appendChild(rendered);
+      } catch (e) {
+        console.warn('datazone fetch error:', e);
+      }
+    }
+
+    // Placeholder while loading
+    div.innerHTML = '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.2);font-size:' + (12*p.sx) + 'px">Loading data…</div>';
+    loadData();
+    setInterval(loadData, refreshMs);
+  }
+
+
   // ── UNKNOWN ───────────────────────────────────────────────────────────────
   else {
     div.style.background = 'rgba(255,0,0,.1)';
@@ -4332,6 +4617,145 @@ app.get("/api/stocks-proxy", async (req: Request, res: Response) => {
     res.status(504).json({ error: "timeout" });
   }
 });
+
+// ── GET /api/data-proxy ────────────────────────────────────────────────────
+// Server-side JSON data fetcher for the REST API connector zone.
+// Fetches any JSON endpoint, extracts an array at a dot-notation path,
+// and returns normalized items. Used by the datazone render engine.
+//
+// Query params:
+//   url      — the endpoint to fetch (required)
+//   path     — dot-notation path to array in response e.g. "data.items" (optional)
+//   headers  — base64-encoded JSON of custom request headers (optional)
+//   max      — max items to return (default 50)
+
+app.get("/api/data-proxy", async (req: Request, res: Response) => {
+  const { url, path: dataPath, headers: headersB64, max } = req.query;
+
+  if (!url || typeof url !== "string") {
+    return res.status(400).json({ error: "url is required" });
+  }
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    return res.status(400).json({ error: "url must start with http:// or https://" });
+  }
+
+  // Parse optional custom headers
+  let customHeaders: Record<string, string> = {};
+  if (headersB64 && typeof headersB64 === "string") {
+    try {
+      customHeaders = JSON.parse(Buffer.from(headersB64, "base64").toString("utf8"));
+    } catch { /* ignore malformed headers */ }
+  }
+
+  try {
+    const r = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; LuminaSignage/1.0)",
+        "Accept": "application/json, text/json, */*",
+        ...customHeaders,
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!r.ok) {
+      return res.status(502).json({ error: `Upstream returned ${r.status}`, status: r.status });
+    }
+
+    const raw = await r.json();
+
+    // Extract array at dot-notation path (e.g. "data.prices" → raw.data.prices)
+    let items: any[] = [];
+    if (dataPath && typeof dataPath === "string" && dataPath.trim()) {
+      const parts = dataPath.trim().split(".");
+      let cursor: any = raw;
+      for (const part of parts) {
+        if (cursor == null) break;
+        // Support array index notation: items[0]
+        const arrMatch = part.match(/^(.+)\[(\d+)\]$/);
+        if (arrMatch) {
+          cursor = cursor[arrMatch[1]]?.[parseInt(arrMatch[2])];
+        } else {
+          cursor = cursor[part];
+        }
+      }
+      items = Array.isArray(cursor) ? cursor : (cursor != null ? [cursor] : []);
+    } else if (Array.isArray(raw)) {
+      items = raw;
+    } else {
+      // Auto-detect: find the first array value in the response
+      for (const key of Object.keys(raw)) {
+        if (Array.isArray(raw[key]) && raw[key].length > 0) {
+          items = raw[key];
+          break;
+        }
+      }
+      // If still no array found, wrap the whole response as a single item
+      if (!items.length && typeof raw === "object") {
+        items = [raw];
+      }
+    }
+
+    const maxItems = Math.min(parseInt(max as string || "50") || 50, 200);
+    items = items.slice(0, maxItems);
+
+    // Return normalized response with metadata
+    res.setHeader("Cache-Control", "public, max-age=30"); // 30s cache
+    return res.json({
+      items,
+      count: items.length,
+      total: Array.isArray(raw) ? raw.length : items.length,
+      fetchedAt: new Date().toISOString(),
+      keys: items.length > 0 ? Object.keys(items[0]).slice(0, 20) : [], // field discovery
+    });
+  } catch (err: any) {
+    console.error("data-proxy error:", err?.message);
+    return res.status(504).json({ error: "Failed to fetch data source", detail: err?.message });
+  }
+});
+
+// ── POST /api/data-proxy/test ──────────────────────────────────────────────
+// Test a data source config and return discovered fields.
+// Used by the template designer inspector to help users map fields.
+app.post("/api/data-proxy/test", authenticateJWT, async (req: Request, res: Response) => {
+  const { url, path: dataPath, headers: customHeaders } = req.body;
+
+  if (!url) return res.status(400).json({ error: "url is required" });
+
+  try {
+    const headersB64 = customHeaders
+      ? Buffer.from(JSON.stringify(customHeaders)).toString("base64")
+      : undefined;
+
+    const proxyUrl = `/api/data-proxy?url=${encodeURIComponent(url)}${dataPath ? `&path=${encodeURIComponent(dataPath)}` : ""}${headersB64 ? `&headers=${headersB64}` : ""}&max=3`;
+
+    // Call our own proxy internally
+    const r = await fetch(`http://localhost:${process.env.PORT || 5000}${proxyUrl}`, {
+      signal: AbortSignal.timeout(10000),
+    });
+    const data = await r.json();
+
+    if (!r.ok) return res.status(502).json(data);
+
+    // Return sample + discovered fields with types
+    const sample = data.items?.[0];
+    const fields = sample ? Object.entries(sample).map(([key, val]) => ({
+      key,
+      type: Array.isArray(val) ? "array" : typeof val,
+      sample: String(val).substring(0, 60),
+    })) : [];
+
+    return res.json({
+      ok: true,
+      count: data.count,
+      fields,
+      sample: data.items?.slice(0, 2),
+      keys: data.keys,
+    });
+  } catch (err: any) {
+    return res.status(504).json({ error: err?.message || "Test failed" });
+  }
+});
+
 
   app.patch("/api/templates/:id", async (req, res) => {
     try {
