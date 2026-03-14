@@ -540,6 +540,7 @@ export async function registerRoutes(
     if (p === "/data-proxy") return next();
     if (p === "/stocks-proxy") return next();
     if (p === "/equiti-proxy") return next();
+    if (p === "/rss-enrich") return next();
 
     // Pairing / activation must not require admin JWT
     if (
@@ -2679,6 +2680,97 @@ app.post("/api/device/:deviceId/playlist", authenticateDevice, (req, res) => {
     }
   });
 
+  
+// ── GET /api/rss-enrich ────────────────────────────────────────────────────
+// Enriches RSS feed items with og:image by fetching each article page.
+// Used for feeds like Mamlaka TV that don't include images in their RSS.
+// Returns up to 8 items with imageUrl populated from og:image meta tags.
+// Results are cached for 5 minutes to avoid hammering article pages.
+const rssEnrichCache = new Map<string, { items: any[]; ts: number }>();
+
+app.get("/api/rss-enrich", async (req: Request, res: Response) => {
+  const { url } = req.query;
+  if (!url || typeof url !== "string") return res.status(400).json({ error: "url required" });
+
+  // Check cache
+  const cached = rssEnrichCache.get(url);
+  if (cached && Date.now() - cached.ts < 5 * 60 * 1000) {
+    res.setHeader("Cache-Control", "public, max-age=300");
+    return res.json({ items: cached.items, cached: true });
+  }
+
+  try {
+    // Step 1: fetch the RSS feed
+    const feedRes = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; LuminaSignage/1.0)" },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!feedRes.ok) return res.status(502).json({ error: `Feed returned ${feedRes.status}` });
+    const text = await feedRes.text();
+
+    // Parse items
+    let matches = text.match(/<item[\s>][\s\S]*?<\/item>/g) || [];
+    if (!matches.length) matches = text.match(/<entry[\s>][\s\S]*?<\/entry>/g) || [];
+
+    const rawItems = matches.slice(0, 8).map(item => {
+      const title = item.match(/<title[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/)?.[1]?.trim().replace(/<[^>]+>/g, '') || '';
+      const link = item.match(/<link[^>]*href="([^"]+)"/)?.[1] || item.match(/<link>([\s\S]*?)<\/link>/)?.[1]?.trim() || '';
+      const pubDate = item.match(/<(?:pubDate|published|updated)>([\s\S]*?)<\/(?:pubDate|published|updated)>/)?.[1]?.trim() || '';
+      const description = item.match(/<(?:description|summary)[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/(?:description|summary)>/)?.[1]?.trim().replace(/<[^>]+>/g, '').substring(0, 200) || '';
+      // Try to get image from feed first
+      const feedImage =
+        item.match(/<media:content[^>]*url="([^"]+)"/)?.[1] ||
+        item.match(/<media:thumbnail[^>]*url="([^"]+)"/)?.[1] ||
+        item.match(/<enclosure[^>]*url="([^"]+)"[^>]*type="image/)?.[1] ||
+        item.match(/<img[^>]*src=["']([^"']+)["']/)?.[1] ||
+        null;
+      return { title, link, pubDate, description, image: feedImage };
+    }).filter(i => i.title);
+
+    // Step 2: for items without feed images, fetch og:image from article page
+    const enriched = await Promise.all(rawItems.map(async item => {
+      if (item.image || !item.link) return item;
+      try {
+        const pageRes = await fetch(item.link, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (compatible; LuminaSignage/1.0)",
+            "Accept": "text/html",
+          },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!pageRes.ok) return item;
+        // Only read the <head> — stop after first 10KB to avoid loading full page
+        const reader = pageRes.body?.getReader();
+        let html = '';
+        if (reader) {
+          let done = false;
+          while (!done && html.length < 10000) {
+            const { value, done: d } = await reader.read();
+            done = d;
+            if (value) html += new TextDecoder().decode(value);
+            if (html.includes('</head>')) { done = true; try { reader.cancel(); } catch {} }
+          }
+        }
+        // Extract og:image
+        const ogImage =
+          html.match(/<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/i)?.[1] ||
+          html.match(/<meta[^>]*content=["']([^"']+)["'][^>]*property=["']og:image["']/i)?.[1] ||
+          html.match(/<meta[^>]*name=["']twitter:image["'][^>]*content=["']([^"']+)["']/i)?.[1] ||
+          null;
+        return { ...item, image: ogImage };
+      } catch {
+        return item;
+      }
+    }));
+
+    rssEnrichCache.set(url, { items: enriched, ts: Date.now() });
+    res.setHeader("Cache-Control", "public, max-age=300");
+    return res.json({ items: enriched, count: enriched.length });
+  } catch (err: any) {
+    return res.status(500).json({ error: "Failed to enrich RSS feed", detail: err?.message });
+  }
+});
+
   // Webpage ticker proxy - extracts text content from webpages
   app.get("/api/ticker-proxy", async (req, res) => {
     const { url } = req.query;
@@ -3938,6 +4030,18 @@ async function fetchRss(url, max) {
   } catch { return []; }
 }
 
+// ── RSS fetch with images (og:image enrichment) ───────────────────────────
+async function fetchRssWithImages(url, max) {
+  if (!url) return [];
+  try {
+    const r = await fetch(BACKEND + '/api/rss-enrich?url=' + encodeURIComponent(url),
+      { signal: AbortSignal.timeout(15000) });
+    if (!r.ok) return [];
+    const j = await r.json();
+    return (j.items || []).slice(0, max || 6);
+  } catch { return []; }
+}
+
 // ── Resolve feed URL from preset or custom ──────────────────────────────────
 function resolveFeedUrl(el, urlField) {
   const preset = el.feedPreset || el.rssPreset || el.tickerPreset;
@@ -4074,27 +4178,51 @@ async function renderEl(el) {
     wrap.appendChild(listEl);
     div.appendChild(wrap);
 
-    // Async fill
-    if (feedUrl) {
-      fetchRss(feedUrl, el.rssMaxItems || 6).then(headlines => {
-        listEl.innerHTML = '';
-        if (!headlines.length) {
-          listEl.innerHTML = '<div style="opacity:.4;font-size:' + (12*p.sx) + 'px;padding:8px 0">No headlines available</div>';
-          return;
-        }
-        headlines.forEach(h => {
-          const item = document.createElement('div'); item.className = 'rss-item fade-in';
-          item.style.fontSize = ((el.fontSize || 13) * p.sx) + 'px';
-          item.style.color = el.color || 'rgba(255,255,255,0.88)';
+    // Async fill — supports image mode via og:image enrichment
+    const showImages = el.rssShowImages === true;
+
+    function renderRssItems(data) {
+      listEl.innerHTML = '';
+      if (!data.length) {
+        listEl.innerHTML = '<div style="opacity:.4;font-size:' + (12*p.sx) + 'px;padding:8px 0">No headlines available</div>';
+        return;
+      }
+      data.forEach(entry => {
+        const title = typeof entry === 'string' ? entry : entry.title;
+        const imgUrl = typeof entry === 'object' ? entry.image : null;
+        const item = document.createElement('div'); item.className = 'rss-item fade-in';
+        item.style.fontSize = ((el.fontSize || 13) * p.sx) + 'px';
+        item.style.color = el.color || 'rgba(255,255,255,0.88)';
+
+        if (showImages && imgUrl) {
+          // Image + headline layout
+          item.style.cssText += ';display:flex;align-items:center;gap:' + (8*p.sx) + 'px;border-bottom:1px solid rgba(255,255,255,0.07);padding:' + (4*p.sy) + 'px 0';
+          const img = document.createElement('img');
+          img.src = imgUrl;
+          img.style.cssText = 'width:' + (72*p.sx) + 'px;height:' + (48*p.sy) + 'px;object-fit:cover;border-radius:' + (3*p.sx) + 'px;flex-shrink:0;background:rgba(255,255,255,.05)';
+          img.onerror = () => { img.style.display = 'none'; };
+          const text = document.createElement('span');
+          text.style.cssText = 'flex:1;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.35';
+          text.textContent = title;
+          item.appendChild(img); item.appendChild(text);
+        } else {
+          // Text-only layout
           const bullet = document.createElement('span'); bullet.className = 'rss-item-bullet';
-          bullet.style.color = el.headerColor || '#4ade80';
-          bullet.textContent = '›';
+          bullet.style.color = el.headerColor || '#4ade80'; bullet.textContent = '›';
           const text = document.createElement('span'); text.className = 'rss-item-text';
-          text.textContent = h;
+          text.textContent = title;
           item.appendChild(bullet); item.appendChild(text);
-          listEl.appendChild(item);
-        });
+        }
+        listEl.appendChild(item);
       });
+    }
+
+    if (feedUrl) {
+      if (showImages) {
+        fetchRssWithImages(feedUrl, el.rssMaxItems || 5).then(renderRssItems);
+      } else {
+        fetchRss(feedUrl, el.rssMaxItems || 6).then(headlines => renderRssItems(headlines));
+      }
     } else {
       listEl.innerHTML = '<div style="opacity:.35;font-size:' + (12*p.sx) + 'px;padding:8px 0">Configure RSS URL in template designer</div>';
     }
@@ -4102,19 +4230,11 @@ async function renderEl(el) {
     // Auto-refresh every 5 minutes
     setInterval(() => {
       if (!feedUrl) return;
-      fetchRss(feedUrl, el.rssMaxItems || 6).then(headlines => {
-        if (!headlines.length) return;
-        listEl.innerHTML = '';
-        headlines.forEach(h => {
-          const item = document.createElement('div'); item.className = 'rss-item fade-in';
-          item.style.fontSize = ((el.fontSize || 13) * p.sx) + 'px';
-          item.style.color = el.color || 'rgba(255,255,255,0.88)';
-          const bullet = document.createElement('span'); bullet.className = 'rss-item-bullet';
-          bullet.style.color = el.headerColor || '#4ade80'; bullet.textContent = '›';
-          const text = document.createElement('span'); text.className = 'rss-item-text'; text.textContent = h;
-          item.appendChild(bullet); item.appendChild(text); listEl.appendChild(item);
-        });
-      });
+      if (showImages) {
+        fetchRssWithImages(feedUrl, el.rssMaxItems || 5).then(renderRssItems);
+      } else {
+        fetchRss(feedUrl, el.rssMaxItems || 6).then(headlines => renderRssItems(headlines));
+      }
     }, 5 * 60 * 1000);
   }
 
