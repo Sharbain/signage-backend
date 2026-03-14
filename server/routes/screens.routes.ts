@@ -120,6 +120,25 @@ export async function registerScreensRoutes(app: Express) {
         }
       }
 
+      // Resolve most recent assigned playlist
+      const assignmentResult = await pool.query(
+        `SELECT pa.playlist_id, pa.assigned_at AT TIME ZONE 'UTC' AS assigned_at,
+                cp.name AS playlist_name, cp.description AS playlist_description
+         FROM playlist_assignments pa
+         JOIN content_playlists cp ON cp.id = pa.playlist_id
+         WHERE pa.device_id = $1
+         ORDER BY pa.assigned_at DESC, pa.id DESC
+         LIMIT 1`,
+        [deviceId],
+      );
+
+      const jobResult = await pool.query(
+        `SELECT id FROM publish_jobs
+         WHERE device_id = $1 AND status IN ('pending', 'downloading')
+         ORDER BY started_at DESC LIMIT 1`,
+        [deviceId],
+      );
+
       const templateRow_resolved = templateRow;
       const playlistRow = assignmentResult.rows[0];
 
