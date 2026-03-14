@@ -81,38 +81,21 @@ export async function registerScreensRoutes(app: Express) {
         [deviceId],
       );
 
-      // Check for template assignment.
-      // FIX: device_template_assignments.template_id is INTEGER but templates.id
-      // is VARCHAR UUID. Two-step lookup: get integer assignment, then resolve UUID.
+      // Check for template assignment — template_id is stored as UUID string
       const templateAssignResult = await pool.query(
-        `SELECT template_id AS int_id, assigned_at AT TIME ZONE 'UTC' AS assigned_at
-         FROM device_template_assignments
-         WHERE device_id = $1
-         ORDER BY assigned_at DESC LIMIT 1`,
+        `SELECT dta.template_id AS template_uuid,
+                dta.assigned_at AT TIME ZONE 'UTC' AS assigned_at,
+                t.name AS template_name
+         FROM device_template_assignments dta
+         LEFT JOIN templates t ON t.id = dta.template_id
+         WHERE dta.device_id = $1
+         ORDER BY dta.assigned_at DESC LIMIT 1`,
         [deviceId],
-      );
+      ).catch(() => ({ rows: [] as any[] }));
 
       let templateRow: { template_uuid: string; template_name: string; assigned_at: string } | null = null;
-      if (templateAssignResult.rows.length > 0) {
-        const intId = templateAssignResult.rows[0].int_id;
-        const assignedAt = templateAssignResult.rows[0].assigned_at;
-        const tRes = await pool.query(
-          `SELECT id AS template_uuid, name AS template_name FROM templates
-           WHERE numeric_id = $1 LIMIT 1`,
-          [intId],
-        ).catch(() => ({ rows: [] as any[] }));
-        if (tRes.rows.length > 0) {
-          templateRow = { ...tRes.rows[0], assigned_at: assignedAt };
-        } else {
-          const tFallback = await pool.query(
-            `SELECT id AS template_uuid, name AS template_name FROM templates
-             ORDER BY created_at ASC LIMIT 1 OFFSET ($1::int - 1)`,
-            [intId],
-          ).catch(() => ({ rows: [] as any[] }));
-          if (tFallback.rows.length > 0) {
-            templateRow = { ...tFallback.rows[0], assigned_at: assignedAt };
-          }
-        }
+      if (templateAssignResult.rows.length > 0 && templateAssignResult.rows[0].template_uuid) {
+        templateRow = templateAssignResult.rows[0];
       }
 
       // Resolve most recent assigned playlist
