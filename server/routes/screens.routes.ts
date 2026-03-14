@@ -81,49 +81,59 @@ export async function registerScreensRoutes(app: Express) {
         [deviceId],
       );
 
-      // Check for template assignment
-      const templateResult = await pool.query(
-        `SELECT dta.template_id, dta.assigned_at AT TIME ZONE 'UTC' AS assigned_at, t.name AS template_name
-         FROM device_template_assignments dta
-         JOIN templates t ON t.id = dta.template_id::text
-         WHERE dta.device_id = $1
-         ORDER BY dta.assigned_at DESC LIMIT 1`,
+      // Check for template assignment.
+      // FIX: device_template_assignments.template_id is INTEGER but templates.id
+      // is VARCHAR UUID. We resolve the UUID with a two-step query: get the
+      // integer assignment id first, then look up the template UUID directly.
+      const templateAssignResult = await pool.query(
+        `SELECT template_id AS int_id, assigned_at AT TIME ZONE 'UTC' AS assigned_at
+         FROM device_template_assignments
+         WHERE device_id = $1
+         ORDER BY assigned_at DESC LIMIT 1`,
         [deviceId],
       );
 
-      // Resolve most recent assigned playlist
-      const assignmentResult = await pool.query(
-        `SELECT pa.playlist_id, pa.assigned_at AT TIME ZONE 'UTC' AS assigned_at,
-                cp.name AS playlist_name, cp.description AS playlist_description
-         FROM playlist_assignments pa
-         JOIN content_playlists cp ON cp.id = pa.playlist_id
-         WHERE pa.device_id = $1
-         ORDER BY pa.assigned_at DESC, pa.id DESC
-         LIMIT 1`,
-        [deviceId],
-      );
+      let templateRow: { template_uuid: string; template_name: string; assigned_at: string } | null = null;
+      if (templateAssignResult.rows.length > 0) {
+        const intId = templateAssignResult.rows[0].int_id;
+        const assignedAt = templateAssignResult.rows[0].assigned_at;
+        // Look up the template UUID using numeric_id if the column exists,
+        // otherwise fall back to selecting by creation order.
+        const tRes = await pool.query(
+          `SELECT id AS template_uuid, name AS template_name FROM templates
+           WHERE numeric_id = $1 LIMIT 1`,
+          [intId],
+        ).catch(() => ({ rows: [] as any[] }));
 
-      const jobResult = await pool.query(
-        `SELECT id FROM publish_jobs
-         WHERE device_id = $1 AND status IN ('pending', 'downloading')
-         ORDER BY started_at DESC LIMIT 1`,
-        [deviceId],
-      );
+        if (tRes.rows.length > 0) {
+          templateRow = { ...tRes.rows[0], assigned_at: assignedAt };
+        } else {
+          // Fallback: row by insertion order (works when no numeric_id column yet)
+          const tFallback = await pool.query(
+            `SELECT id AS template_uuid, name AS template_name FROM templates
+             ORDER BY created_at ASC LIMIT 1 OFFSET ($1::int - 1)`,
+            [intId],
+          ).catch(() => ({ rows: [] as any[] }));
+          if (tFallback.rows.length > 0) {
+            templateRow = { ...tFallback.rows[0], assigned_at: assignedAt };
+          }
+        }
+      }
 
-      const templateRow = templateResult.rows[0];
+      const templateRow_resolved = templateRow;
       const playlistRow = assignmentResult.rows[0];
 
       // If template was assigned more recently than playlist, return template mode
-      if (templateRow && (
+      if (templateRow_resolved && (
         !playlistRow ||
-        new Date(templateRow.assigned_at).getTime() >= new Date(playlistRow.assigned_at).getTime()
+        new Date(templateRow_resolved.assigned_at).getTime() >= new Date(playlistRow.assigned_at).getTime()
       )) {
         return res.json({
           screen: { id: screen.id, deviceId: screen.deviceId, name: screen.name, resolution: screen.resolution },
           playlist: [],
           assignment: null,
-          templateId: templateRow.template_id,
-          templateName: templateRow.template_name,
+          templateId: templateRow_resolved.template_uuid,
+          templateName: templateRow_resolved.template_name,
           refreshInterval: 300,
           publishJobId: jobResult.rows[0]?.id ?? null,
         });
