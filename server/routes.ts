@@ -4751,7 +4751,10 @@ function connectEquitiWs() {
       equitiConnected = true;
       console.log("[equiti-ws] Connected to Equiti price stream");
 
-      // Send GETQUOTES: keepalive every 330ms (matches browser behavior)
+      // Send GETQUOTES: immediately to trigger first price push
+      equitiWs.send("GETQUOTES:");
+
+      // Then keep sending every 330ms (matches browser behavior)
       equitiPingInterval = setInterval(() => {
         if (equitiWs?.readyState === WebSocketClient.OPEN) {
           equitiWs.send("GETQUOTES:");
