@@ -4295,8 +4295,19 @@ async function renderEl(el) {
     const embedPreset = el.embedPreset && EMBED_PRESETS[el.embedPreset];
     const rawSrc = (embedPreset ? embedPreset.url : null) || el.embedUrl || el.url || '';
 
-    // Equiti blocks iframes — use our scraper proxy instead and render natively
+    // Equiti blocks direct iframes — load via our proxy which strips X-Frame-Options
     if (el.embedPreset === 'equiti_ticker' || rawSrc.includes('equiti.com/price-ticker')) {
+      const proxyUrl = BACKEND + '/api/equiti-proxy';
+      const iframe = document.createElement('iframe');
+      iframe.src = proxyUrl;
+      iframe.style.cssText = 'width:100%;height:100%;border:none;background:#000';
+      iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+      div.appendChild(iframe);
+      return div;
+    }
+
+    // (dead code kept for reference — old native renderer removed)
+    if (false && (el.embedPreset === 'equiti_ticker_old')) {
       const colorUp = '#4ade80';
       const colorDown = '#f87171';
       div.style.background = el.bgColor || 'rgba(5,10,25,0.97)';
@@ -4714,121 +4725,44 @@ app.get("/api/stocks-proxy", async (req: Request, res: Response) => {
 });
 
 
-// ── Equiti WebSocket Price Proxy ─────────────────────────────────────────────
-// Connects to Equiti's live price streaming WebSocket and caches the latest
-// prices server-side. All devices poll /api/equiti-proxy to get live data
-// without each device needing its own WebSocket connection.
-//
-// Protocol:
-//   Server pushes: QUOTES:{"GBPUSD.p":{"Direction":"down","Bid":"1.32217","Ask":"1.32233",...},...}
-//   Client sends:  GETQUOTES:  (keepalive every 330ms)
-
-const EQUITI_WS_URL = "wss://eqpricestream01z-prod.azurewebsites.net/PriceStreaming.axd";
-const EQUITI_ORIGIN = "https://www.equiti.com";
-
-// Cache of latest prices indexed by symbol
-let equitiPrices: Record<string, {
-  symbol: string; bid: string; ask: string;
-  direction: string; timestamp: string;
-}> = {};
-let equitiWs: any = null;
-let equitiPingInterval: any = null;
-let equitiReconnectTimeout: any = null;
-let equitiConnected = false;
-let equitiLastUpdate = 0;
-
-function connectEquitiWs() {
+// ── Equiti Price Proxy ───────────────────────────────────────────────────────
+// Fetches the Equiti price ticker page server-side and strips X-Frame-Options
+// so the device WebView can load it in an iframe without being blocked.
+// The page's own JavaScript connects to Equiti's WebSocket and updates prices.
+app.get("/api/equiti-proxy", async (req: Request, res: Response) => {
   try {
-    equitiWs = new WebSocketClient(EQUITI_WS_URL, {
+    const r = await fetch("https://www.equiti.com/price-ticker/", {
       headers: {
-        "Origin": EQUITI_ORIGIN,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
       },
-      perMessageDeflate: { clientMaxWindowBits: true },
+      signal: AbortSignal.timeout(10000),
     });
 
-    equitiWs.on("open", () => {
-      equitiConnected = true;
-      console.log("[equiti-ws] Connected to Equiti price stream");
+    if (!r.ok) {
+      return res.status(502).json({ error: `Upstream ${r.status}` });
+    }
 
-      // Send GETQUOTES: immediately to trigger first price push
-      equitiWs.send("GETQUOTES:");
+    let html = await r.text();
 
-      // Then keep sending every 330ms (matches browser behavior)
-      equitiPingInterval = setInterval(() => {
-        if (equitiWs?.readyState === WebSocketClient.OPEN) {
-          equitiWs.send("GETQUOTES:");
-        }
-      }, 330);
-    });
+    // Fix relative URLs so assets load correctly from equiti.com
+    html = html
+      .replace(/src="\//g, 'src="https://www.equiti.com/')
+      .replace(/href="\//g, 'href="https://www.equiti.com/')
+      .replace(/src='\//g, "src='https://www.equiti.com/")
+      .replace(/href='\//g, "href='https://www.equiti.com/");
 
-    equitiWs.on("message", (data: any) => {
-      const msg = data.toString();
-      if (!msg.startsWith("QUOTES:")) return;
-
-      try {
-        const json = JSON.parse(msg.slice(7)); // strip "QUOTES:"
-        equitiLastUpdate = Date.now();
-
-        for (const [key, val] of Object.entries(json) as [string, any][]) {
-          // key is like "GBPUSD.p" — strip the ".p" suffix
-          const symbol = key.replace(/\.p$/, "");
-          equitiPrices[symbol] = {
-            symbol,
-            bid: val.Bid || "",
-            ask: val.Ask || "",
-            direction: (val.Direction || "up").toLowerCase(),
-            timestamp: val.TimeStamp || new Date().toISOString(),
-          };
-        }
-      } catch (e) {
-        // ignore parse errors
-      }
-    });
-
-    equitiWs.on("close", (code: number, reason: string) => {
-      equitiConnected = false;
-      if (equitiPingInterval) clearInterval(equitiPingInterval);
-      console.log(`[equiti-ws] Disconnected (${code}), reconnecting in 3s...`);
-      equitiReconnectTimeout = setTimeout(connectEquitiWs, 3000);
-    });
-
-    equitiWs.on("error", (err: any) => {
-      console.error("[equiti-ws] Error:", err?.message);
-      equitiConnected = false;
-      try { equitiWs?.terminate(); } catch {}
-    });
-
+    // Forward the page without X-Frame-Options / CSP frame restrictions
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("X-Frame-Options", "ALLOWALL");
+    res.setHeader("Content-Security-Policy", "");
+    res.setHeader("Cache-Control", "public, max-age=60");
+    return res.send(html);
   } catch (err: any) {
-    console.error("[equiti-ws] Failed to connect:", err?.message);
-    equitiReconnectTimeout = setTimeout(connectEquitiWs, 5000);
+    return res.status(504).json({ error: "Failed to fetch Equiti page", detail: err?.message });
   }
-}
-
-// Start the WebSocket connection when the server boots
-connectEquitiWs();
-
-// ── GET /api/equiti-proxy ──────────────────────────────────────────────────
-// Returns cached live prices from the Equiti WebSocket feed.
-app.get("/api/equiti-proxy", (req: Request, res: Response) => {
-  const prices = Object.values(equitiPrices);
-  const staleMs = Date.now() - equitiLastUpdate;
-
-  if (!prices.length) {
-    return res.status(503).json({
-      prices: [],
-      connected: equitiConnected,
-      error: equitiConnected ? "Waiting for first price update..." : "Connecting to Equiti stream...",
-    });
-  }
-
-  res.setHeader("Cache-Control", "no-cache"); // always fresh
-  return res.json({
-    prices,
-    connected: equitiConnected,
-    staleMs,
-    fetchedAt: new Date().toISOString(),
-  });
 });
 
 
