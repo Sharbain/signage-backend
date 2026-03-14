@@ -85,7 +85,7 @@ export async function registerScreensRoutes(app: Express) {
       const templateResult = await pool.query(
         `SELECT dta.template_id, dta.assigned_at, t.name AS template_name
          FROM device_template_assignments dta
-         JOIN templates t ON t.id = dta.template_id
+         JOIN templates t ON t.id::integer = dta.template_id
          WHERE dta.device_id = $1
          ORDER BY dta.assigned_at DESC LIMIT 1`,
         [deviceId],
