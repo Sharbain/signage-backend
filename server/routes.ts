@@ -4796,7 +4796,16 @@ async function renderEl(el) {
       // Allow all features needed by weather/finance widgets
       frame.setAttribute('allow', 'geolocation; autoplay; fullscreen');
       div.appendChild(frame);
+
+      // Auto-reload if embedRefresh is set
+      if (el.embedRefresh && el.embedRefresh > 0) {
+        setInterval(() => { frame.src = src; }, el.embedRefresh * 1000);
+      }
     }
+
+    // Apply container styling
+    if (el.embedBg) div.style.background = el.embedBg;
+    if (el.embedBorderRadius) div.style.borderRadius = (el.embedBorderRadius * p.sx) + 'px';
   }
 
 // ── DATA CONNECTOR ZONE (type: "datazone") ────────────────────────────────
