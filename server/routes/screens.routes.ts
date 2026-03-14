@@ -142,11 +142,9 @@ export async function registerScreensRoutes(app: Express) {
       const templateRow_resolved = templateRow;
       const playlistRow = assignmentResult.rows[0];
 
-      // If template was assigned more recently than playlist, return template mode
-      if (templateRow_resolved && (
-        !playlistRow ||
-        new Date(templateRow_resolved.assigned_at).getTime() >= new Date(playlistRow.assigned_at).getTime()
-      )) {
+      // Template always wins if assigned — playlist assignments are cleared on template publish.
+      // We keep the timestamp check as a secondary guard but template takes priority.
+      if (templateRow_resolved) {
         return res.json({
           screen: { id: screen.id, deviceId: screen.deviceId, name: screen.name, resolution: screen.resolution },
           playlist: [],
