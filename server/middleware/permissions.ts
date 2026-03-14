@@ -6,6 +6,9 @@ export function requireRole(...allowed: string[]) {
     const role = (req as any).user?.role;
     if (!role) return res.status(401).json({ error: "not_authenticated" });
 
+    // owner is the super-admin — always passes every role check
+    if (role === "owner") return next();
+
     if (allowed.includes(role) || allowed.includes("any")) return next();
     return res.status(403).json({ error: "forbidden" });
   };
