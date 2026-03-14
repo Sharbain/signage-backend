@@ -184,11 +184,11 @@ export async function registerPublishJobRoutes(app: Express) {
         }
 
         const normalizedContentType = String(contentType || "media").trim().toLowerCase();
-        // For template publishes, contentId is a UUID string (not numeric)
-        // Use templateId as contentId for template publishes to satisfy NOT NULL constraint
+        // For template publishes, contentId is a UUID — we store it separately
+        // in device_template_assignments, so publish_jobs.content_id can be null
         const numericContentId =
           isTemplatePublish
-            ? (publishTemplateId ? String(publishTemplateId) : null)
+            ? null
             : contentId == null || contentId === "" || !Number.isFinite(Number(contentId))
               ? null
               : Number(contentId);
