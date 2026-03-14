@@ -3921,6 +3921,8 @@ html,body{width:100vw;height:100vh;background:${bg};overflow:hidden;font-family:
 .weather-loc{font-size:.75em;opacity:.5;margin-top:2px}
 /* Fade-in animation for content */
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 .fade-in{animation:fadeIn .4s ease}
 </style>
 </head><body>
@@ -4154,88 +4156,344 @@ async function renderEl(el) {
     c.appendChild(s); div.appendChild(c);
   }
 
-  // ── RSS CARD LIST ─────────────────────────────────────────────────────────
+  // ── RSS ZONE ──────────────────────────────────────────────────────────────
+  // Supports 5 layout modes: list, cards, slideshow, feature, lowerthird
   else if (type === 'rss') {
     div.style.background = el.bgColor || 'rgba(10,15,30,0.92)';
-    div.style.border      = '1px solid rgba(74,222,128,0.12)';
     div.style.borderRadius = ((el.borderRadius || 6) * p.sx) + 'px';
-    const wrap = document.createElement('div'); wrap.className = 'rss-wrap';
+    div.style.overflow = 'hidden';
 
-    // Header row
-    const hdr = document.createElement('div'); hdr.className = 'rss-header';
-    hdr.style.color = el.headerColor || '#4ade80';
-    hdr.style.fontSize = (10 * p.sx) + 'px';
-    const dot = document.createElement('span'); dot.className = 'rss-header-dot';
-    dot.style.background = el.headerColor || '#4ade80';
-    hdr.appendChild(dot);
-    const feedUrl = resolveFeedUrl(el, 'rssUrl');
-    const presetLabel = (el.feedPreset && FEED_PRESETS[el.feedPreset]) ? FEED_PRESETS[el.feedPreset].label : (el.rssLabel || 'Live Feed');
-    hdr.appendChild(document.createTextNode(' ' + presetLabel.toUpperCase()));
-    wrap.appendChild(hdr);
+    const layout      = el.rssLayout || 'list';
+    const accent      = el.rssAccentColor || el.headerColor || '#4ade80';
+    const textColor   = el.color || '#fff';
+    const showImages  = el.rssShowImages ?? (layout !== 'list');
+    const showDate    = el.rssShowDate || false;
+    const showSource  = el.rssShowSource || false;
+    const imgPos      = el.rssImagePosition || 'left';
+    const imgSize     = (el.rssImageSize || 35) / 100;
+    const overlay     = el.rssOverlay || false;
+    const overlayOpacity = (el.rssOverlayOpacity || 50) / 100;
+    const advanceSecs = (el.rssAdvanceSeconds || 8) * 1000;
+    const maxItems    = el.rssStoriesPerScreen || el.rssMaxItems || (layout === 'list' ? 6 : layout === 'cards' ? 4 : 1);
+    const fontSize    = el.fontSize || 14;
+    const feedUrl     = resolveFeedUrl(el, 'rssUrl');
 
-    // Items container
-    const listEl = document.createElement('div'); listEl.className = 'rss-items';
-    wrap.appendChild(listEl);
-    div.appendChild(wrap);
+    // ── Source label (top header) ────────────────────────────────────────
+    function makeHeader() {
+      const hdr = document.createElement('div');
+      hdr.style.cssText = 'display:flex;align-items:center;gap:' + (6*p.sx) + 'px;padding:' + (5*p.sy) + 'px ' + (10*p.sx) + 'px;border-bottom:1px solid rgba(255,255,255,0.07);flex-shrink:0';
+      const dot = document.createElement('span');
+      dot.style.cssText = 'width:' + (6*p.sx) + 'px;height:' + (6*p.sx) + 'px;border-radius:50%;background:' + accent + ';flex-shrink:0;animation:pulse 2s infinite';
+      const lbl = document.createElement('span');
+      lbl.style.cssText = 'font-size:' + (9*p.sy) + 'px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:' + accent;
+      const presetLabel = (el.feedPreset && (window as any).FEED_PRESETS_LABEL?.[el.feedPreset]) || el.rssLabel || 'Live Feed';
+      lbl.textContent = presetLabel;
+      hdr.appendChild(dot); hdr.appendChild(lbl);
+      return hdr;
+    }
 
-    // Async fill — supports image mode via og:image enrichment
-    const showImages = el.rssShowImages === true;
+    // ── Format date ──────────────────────────────────────────────────────
+    function formatDate(pubDate: string) {
+      if (!pubDate) return '';
+      try {
+        const d = new Date(pubDate);
+        const now = new Date();
+        const diffMs = now.getTime() - d.getTime();
+        const diffMins = Math.floor(diffMs / 60000);
+        if (diffMins < 60) return diffMins + 'm ago';
+        if (diffMins < 1440) return Math.floor(diffMins/60) + 'h ago';
+        return d.toLocaleDateString();
+      } catch { return ''; }
+    }
 
-    function renderRssItems(data) {
-      listEl.innerHTML = '';
-      if (!data.length) {
-        listEl.innerHTML = '<div style="opacity:.4;font-size:' + (12*p.sx) + 'px;padding:8px 0">No headlines available</div>';
-        return;
-      }
-      data.forEach(entry => {
+    // ── LIST LAYOUT ──────────────────────────────────────────────────────
+    function renderList(items: any[]) {
+      div.innerHTML = '';
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'width:100%;height:100%;display:flex;flex-direction:column;overflow:hidden';
+      wrap.appendChild(makeHeader());
+      const list = document.createElement('div');
+      list.style.cssText = 'flex:1;overflow:hidden;display:flex;flex-direction:column;padding:' + (4*p.sy) + 'px 0';
+      items.forEach(entry => {
+        const title = typeof entry === 'string' ? entry : entry.title;
+        const pubDate = typeof entry === 'object' ? entry.pubDate : '';
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;align-items:flex-start;gap:' + (8*p.sx) + 'px;padding:' + (5*p.sy) + 'px ' + (10*p.sx) + 'px;border-bottom:1px solid rgba(255,255,255,.05);flex-shrink:0';
+        const bullet = document.createElement('span');
+        bullet.style.cssText = 'color:' + accent + ';flex-shrink:0;margin-top:' + (2*p.sy) + 'px;font-size:' + (fontSize*p.sy) + 'px';
+        bullet.textContent = '›';
+        const right = document.createElement('div');
+        right.style.cssText = 'flex:1;overflow:hidden';
+        const titleEl = document.createElement('div');
+        titleEl.style.cssText = 'font-size:' + (fontSize*p.sy) + 'px;color:' + textColor + ';overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.35';
+        titleEl.textContent = title;
+        right.appendChild(titleEl);
+        if (showDate && pubDate) {
+          const dateEl = document.createElement('div');
+          dateEl.style.cssText = 'font-size:' + (9*p.sy) + 'px;color:rgba(255,255,255,.3);margin-top:' + (2*p.sy) + 'px';
+          dateEl.textContent = formatDate(pubDate);
+          right.appendChild(dateEl);
+        }
+        row.appendChild(bullet); row.appendChild(right);
+        list.appendChild(row);
+      });
+      wrap.appendChild(list);
+      div.appendChild(wrap);
+    }
+
+    // ── CARDS LAYOUT ─────────────────────────────────────────────────────
+    function renderCards(items: any[]) {
+      div.innerHTML = '';
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'width:100%;height:100%;display:flex;flex-direction:column;overflow:hidden';
+      wrap.appendChild(makeHeader());
+      const grid = document.createElement('div');
+      grid.style.cssText = 'flex:1;overflow:hidden;display:flex;flex-direction:column;gap:' + (1*p.sy) + 'px;padding:' + (4*p.sy) + 'px ' + (6*p.sx) + 'px';
+      const itemH = Math.floor(((p.h - 32*p.sy) / Math.max(items.length, 1)));
+      items.forEach(entry => {
         const title = typeof entry === 'string' ? entry : entry.title;
         const imgUrl = typeof entry === 'object' ? entry.image : null;
-        const item = document.createElement('div'); item.className = 'rss-item fade-in';
-        item.style.fontSize = ((el.fontSize || 13) * p.sx) + 'px';
-        item.style.color = el.color || 'rgba(255,255,255,0.88)';
-
-        if (showImages && imgUrl) {
-          // Image + headline layout
-          item.style.cssText += ';display:flex;align-items:center;gap:' + (8*p.sx) + 'px;border-bottom:1px solid rgba(255,255,255,0.07);padding:' + (4*p.sy) + 'px 0';
-          const img = document.createElement('img');
-          img.src = imgUrl;
-          img.style.cssText = 'width:' + (72*p.sx) + 'px;height:' + (48*p.sy) + 'px;object-fit:cover;border-radius:' + (3*p.sx) + 'px;flex-shrink:0;background:rgba(255,255,255,.05)';
-          img.onerror = () => { img.style.display = 'none'; };
-          const text = document.createElement('span');
-          text.style.cssText = 'flex:1;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.35';
-          text.textContent = title;
-          item.appendChild(img); item.appendChild(text);
+        const pubDate = typeof entry === 'object' ? entry.pubDate : '';
+        const card = document.createElement('div');
+        card.style.cssText = 'display:flex;height:' + itemH + 'px;background:rgba(255,255,255,.04);border-radius:' + (4*p.sx) + 'px;overflow:hidden;border:1px solid rgba(255,255,255,.06);flex-shrink:0';
+        if (imgPos === 'top') {
+          card.style.flexDirection = 'column';
+          if (showImages && imgUrl) {
+            const imgWrap = document.createElement('div');
+            imgWrap.style.cssText = 'width:100%;height:' + Math.round(imgSize*100) + '%;flex-shrink:0;overflow:hidden;background:rgba(255,255,255,.05)';
+            const img = document.createElement('img');
+            img.src = imgUrl; img.style.cssText = 'width:100%;height:100%;object-fit:cover';
+            img.onerror = () => { imgWrap.style.display = 'none'; };
+            imgWrap.appendChild(img); card.appendChild(imgWrap);
+          }
+          const textWrap = document.createElement('div');
+          textWrap.style.cssText = 'flex:1;padding:' + (6*p.sy) + 'px ' + (8*p.sx) + 'px;display:flex;flex-direction:column;justify-content:center;overflow:hidden';
+          const t = document.createElement('div');
+          t.style.cssText = 'font-size:' + (fontSize*p.sy) + 'px;color:' + textColor + ';line-height:1.3;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical';
+          t.textContent = title;
+          textWrap.appendChild(t);
+          if (showDate && pubDate) { const d = document.createElement('div'); d.style.cssText='font-size:'+(9*p.sy)+'px;color:rgba(255,255,255,.3);margin-top:'+(3*p.sy)+'px'; d.textContent=formatDate(pubDate); textWrap.appendChild(d); }
+          card.appendChild(textWrap);
         } else {
-          // Text-only layout
-          const bullet = document.createElement('span'); bullet.className = 'rss-item-bullet';
-          bullet.style.color = el.headerColor || '#4ade80'; bullet.textContent = '›';
-          const text = document.createElement('span'); text.className = 'rss-item-text';
-          text.textContent = title;
-          item.appendChild(bullet); item.appendChild(text);
+          // Left image (default)
+          if (showImages && imgUrl) {
+            const imgWrap = document.createElement('div');
+            imgWrap.style.cssText = 'width:' + Math.round(imgSize*100) + '%;flex-shrink:0;overflow:hidden;background:rgba(255,255,255,.05)';
+            const img = document.createElement('img');
+            img.src = imgUrl; img.style.cssText = 'width:100%;height:100%;object-fit:cover';
+            img.onerror = () => { imgWrap.style.background = 'rgba(255,255,255,.03)'; img.style.display='none'; };
+            imgWrap.appendChild(img); card.appendChild(imgWrap);
+          }
+          const textWrap = document.createElement('div');
+          textWrap.style.cssText = 'flex:1;padding:' + (6*p.sy) + 'px ' + (8*p.sx) + 'px;display:flex;flex-direction:column;justify-content:center;overflow:hidden';
+          const t = document.createElement('div');
+          t.style.cssText = 'font-size:' + (fontSize*p.sy) + 'px;color:' + textColor + ';line-height:1.3;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical';
+          t.textContent = title;
+          textWrap.appendChild(t);
+          if (showDate && pubDate) { const d = document.createElement('div'); d.style.cssText='font-size:'+(9*p.sy)+'px;color:rgba(255,255,255,.3);margin-top:'+(3*p.sy)+'px'; d.textContent=formatDate(pubDate); textWrap.appendChild(d); }
+          card.appendChild(textWrap);
         }
-        listEl.appendChild(item);
+        grid.appendChild(card);
       });
+      wrap.appendChild(grid);
+      div.appendChild(wrap);
     }
 
-    if (feedUrl) {
-      if (showImages) {
-        fetchRssWithImages(feedUrl, el.rssMaxItems || 5).then(renderRssItems);
-      } else {
-        fetchRss(feedUrl, el.rssMaxItems || 6).then(headlines => renderRssItems(headlines));
+    // ── SLIDESHOW / FEATURE LAYOUT ────────────────────────────────────────
+    // One story at a time, auto-advances. Feature = big image bg + overlay text.
+    function renderSlideshow(items: any[], isFeature: boolean) {
+      div.innerHTML = '';
+      div.style.background = '#000';
+      if (!items.length) return;
+      let idx = 0;
+      let timer: any = null;
+
+      function showSlide(i: number) {
+        div.innerHTML = '';
+        const entry = items[i];
+        const title = typeof entry === 'string' ? entry : entry.title;
+        const imgUrl = typeof entry === 'object' ? entry.image : null;
+        const pubDate = typeof entry === 'object' ? entry.pubDate : '';
+        const desc = typeof entry === 'object' ? entry.description : '';
+
+        const slide = document.createElement('div');
+        slide.className = 'fade-in';
+        slide.style.cssText = 'width:100%;height:100%;position:relative;overflow:hidden';
+
+        if (isFeature || imgPos === 'background') {
+          // Full background image with gradient overlay + text
+          if (imgUrl) {
+            const bg = document.createElement('div');
+            bg.style.cssText = 'position:absolute;inset:0;background:url(' + JSON.stringify(imgUrl) + ') center/cover no-repeat';
+            slide.appendChild(bg);
+          } else {
+            slide.style.background = el.bgColor || 'rgba(10,15,30,0.95)';
+          }
+          if (overlay || isFeature) {
+            const grad = document.createElement('div');
+            grad.style.cssText = 'position:absolute;inset:0;background:linear-gradient(to top,rgba(0,0,0,' + (overlayOpacity + 0.3) + ') 0%,rgba(0,0,0,' + (overlayOpacity*0.3) + ') 60%,transparent 100%)';
+            slide.appendChild(grad);
+          }
+          // Source badge top-left
+          const badge = document.createElement('div');
+          badge.style.cssText = 'position:absolute;top:' + (10*p.sy) + 'px;left:' + (12*p.sx) + 'px;background:' + accent + ';color:#000;font-size:' + (9*p.sy) + 'px;font-weight:700;letter-spacing:.06em;padding:' + (3*p.sy) + 'px ' + (8*p.sx) + 'px;border-radius:' + (3*p.sx) + 'px;text-transform:uppercase';
+          badge.textContent = el.rssLabel || 'LIVE';
+          slide.appendChild(badge);
+          // Text bottom
+          const textBox = document.createElement('div');
+          textBox.style.cssText = 'position:absolute;bottom:0;left:0;right:0;padding:' + (16*p.sy) + 'px ' + (16*p.sx) + 'px';
+          if (showDate && pubDate) {
+            const dateEl = document.createElement('div');
+            dateEl.style.cssText = 'font-size:' + (10*p.sy) + 'px;color:rgba(255,255,255,.5);margin-bottom:' + (4*p.sy) + 'px';
+            dateEl.textContent = formatDate(pubDate);
+            textBox.appendChild(dateEl);
+          }
+          const titleEl = document.createElement('div');
+          titleEl.style.cssText = 'font-size:' + ((fontSize+4)*p.sy) + 'px;font-weight:700;color:#fff;line-height:1.25;text-shadow:0 2px 8px rgba(0,0,0,.6)';
+          titleEl.textContent = title;
+          textBox.appendChild(titleEl);
+          if (desc && isFeature) {
+            const descEl = document.createElement('div');
+            descEl.style.cssText = 'font-size:' + (fontSize*p.sy) + 'px;color:rgba(255,255,255,.7);margin-top:' + (6*p.sy) + 'px;line-height:1.4;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical';
+            descEl.textContent = desc;
+            textBox.appendChild(descEl);
+          }
+          slide.appendChild(textBox);
+        } else {
+          // Top/left image layout for slideshow
+          slide.style.cssText += ';display:flex;flex-direction:' + (imgPos==='top'?'column':'row');
+          if (imgUrl && showImages) {
+            const imgWrap = document.createElement('div');
+            imgWrap.style.cssText = imgPos==='top'
+              ? 'width:100%;height:' + Math.round(imgSize*100) + '%;flex-shrink:0;overflow:hidden'
+              : 'width:' + Math.round(imgSize*100) + '%;flex-shrink:0;overflow:hidden';
+            const img = document.createElement('img');
+            img.src = imgUrl; img.style.cssText='width:100%;height:100%;object-fit:cover';
+            imgWrap.appendChild(img); slide.appendChild(imgWrap);
+          }
+          const textWrap = document.createElement('div');
+          textWrap.style.cssText = 'flex:1;padding:' + (14*p.sy) + 'px ' + (14*p.sx) + 'px;display:flex;flex-direction:column;justify-content:center;background:' + (el.bgColor||'rgba(10,15,30,.95)');
+          const badge2 = document.createElement('div');
+          badge2.style.cssText = 'display:inline-flex;align-items:center;gap:' + (5*p.sx) + 'px;margin-bottom:' + (8*p.sy) + 'px';
+          const dot = document.createElement('span');
+          dot.style.cssText='width:'+(6*p.sx)+'px;height:'+(6*p.sx)+'px;border-radius:50%;background:'+accent;
+          const src = document.createElement('span');
+          src.style.cssText='font-size:'+(9*p.sy)+'px;font-weight:700;letter-spacing:.06em;color:'+accent+';text-transform:uppercase';
+          src.textContent = el.rssLabel || 'NEWS';
+          badge2.appendChild(dot); badge2.appendChild(src); textWrap.appendChild(badge2);
+          const titleEl = document.createElement('div');
+          titleEl.style.cssText='font-size:'+((fontSize+2)*p.sy)+'px;font-weight:700;color:'+textColor+';line-height:1.3;margin-bottom:'+(6*p.sy)+'px';
+          titleEl.textContent = title; textWrap.appendChild(titleEl);
+          if (desc) { const d=document.createElement('div'); d.style.cssText='font-size:'+(fontSize*p.sy)+'px;color:rgba(255,255,255,.6);line-height:1.4;overflow:hidden;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical'; d.textContent=desc; textWrap.appendChild(d); }
+          if (showDate && pubDate) { const d=document.createElement('div'); d.style.cssText='font-size:'+(9*p.sy)+'px;color:rgba(255,255,255,.35);margin-top:auto;padding-top:'+(8*p.sy)+'px'; d.textContent=formatDate(pubDate); textWrap.appendChild(d); }
+          slide.appendChild(textWrap);
+        }
+
+        // Progress dots
+        if (items.length > 1) {
+          const dots = document.createElement('div');
+          dots.style.cssText = 'position:absolute;bottom:' + (8*p.sy) + 'px;right:' + (10*p.sx) + 'px;display:flex;gap:' + (4*p.sx) + 'px;align-items:center';
+          items.forEach((_, di) => {
+            const dot = document.createElement('div');
+            dot.style.cssText = 'width:' + (di===i?8:4)*p.sx + 'px;height:' + (4*p.sx) + 'px;border-radius:' + (2*p.sx) + 'px;background:' + (di===i?accent:'rgba(255,255,255,.3)') + ';transition:all .3s';
+            dots.appendChild(dot);
+          });
+          slide.appendChild(dots);
+        }
+
+        div.appendChild(slide);
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => {
+          idx = (idx + 1) % items.length;
+          showSlide(idx);
+        }, advanceSecs);
       }
-    } else {
-      listEl.innerHTML = '<div style="opacity:.35;font-size:' + (12*p.sx) + 'px;padding:8px 0">Configure RSS URL in template designer</div>';
+
+      showSlide(0);
     }
+
+    // ── LOWER THIRD LAYOUT ────────────────────────────────────────────────
+    // Breaking news bar — cycles through headlines with a ticker-style reveal
+    function renderLowerThird(items: any[]) {
+      div.innerHTML = '';
+      div.style.background = 'transparent';
+      div.style.overflow = 'hidden';
+      if (!items.length) return;
+      let idx = 0;
+
+      const bar = document.createElement('div');
+      bar.style.cssText = 'width:100%;height:100%;display:flex;align-items:center;overflow:hidden;position:relative;background:' + (el.bgColor||'rgba(0,0,0,.85)');
+
+      // Accent left bar
+      const bar2 = document.createElement('div');
+      bar2.style.cssText = 'width:' + (4*p.sx) + 'px;height:100%;background:' + accent + ';flex-shrink:0';
+      bar.appendChild(bar2);
+
+      // Label badge
+      const badge = document.createElement('div');
+      badge.style.cssText = 'flex-shrink:0;background:' + accent + ';color:#000;font-size:' + (10*p.sy) + 'px;font-weight:800;padding:0 ' + (10*p.sx) + 'px;height:100%;display:flex;align-items:center;letter-spacing:.06em;text-transform:uppercase;white-space:nowrap';
+      badge.textContent = el.rssLabel || 'BREAKING';
+      bar.appendChild(badge);
+
+      // Headline text
+      const textWrap = document.createElement('div');
+      textWrap.style.cssText = 'flex:1;overflow:hidden;padding:0 ' + (14*p.sx) + 'px;position:relative';
+      const textEl = document.createElement('div');
+      textEl.style.cssText = 'font-size:' + (fontSize*p.sy) + 'px;font-weight:600;color:' + textColor + ';white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+      textWrap.appendChild(textEl);
+      bar.appendChild(textWrap);
+
+      // Counter
+      const counter = document.createElement('div');
+      counter.style.cssText = 'flex-shrink:0;font-size:' + (9*p.sy) + 'px;color:rgba(255,255,255,.3);padding:0 ' + (10*p.sx) + 'px;white-space:nowrap';
+      bar.appendChild(counter);
+      div.appendChild(bar);
+
+      function showItem(i: number) {
+        const entry = items[i];
+        textEl.style.opacity = '0';
+        textEl.style.transition = 'opacity .3s';
+        setTimeout(() => {
+          textEl.textContent = typeof entry === 'string' ? entry : entry.title;
+          counter.textContent = (i+1) + '/' + items.length;
+          textEl.style.opacity = '1';
+        }, 300);
+        setTimeout(() => showItem((i+1) % items.length), advanceSecs);
+      }
+      showItem(0);
+    }
+
+    // ── Fetch + render based on layout ────────────────────────────────────
+    async function loadAndRender() {
+      if (!feedUrl) {
+        div.innerHTML = '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.3);font-size:' + (12*p.sx) + 'px;padding:16px;text-align:center">Configure RSS feed in inspector</div>';
+        return;
+      }
+
+      // Show loading placeholder
+      div.innerHTML = '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center"><div style="width:' + (20*p.sx) + 'px;height:' + (20*p.sx) + 'px;border:2px solid rgba(255,255,255,.1);border-top:2px solid ' + accent + ';border-radius:50%;animation:spin 1s linear infinite"></div></div>';
+
+      const useEnrich = showImages && (layout !== 'list');
+      const items = useEnrich
+        ? await fetchRssWithImages(feedUrl, maxItems)
+        : (await fetchRss(feedUrl, maxItems)).map((t: string) => ({ title: t }));
+
+      if (!items.length) {
+        div.innerHTML = '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.3);font-size:' + (12*p.sx) + 'px">No headlines available</div>';
+        return;
+      }
+
+      if      (layout === 'cards')      renderCards(items);
+      else if (layout === 'slideshow')  renderSlideshow(items, false);
+      else if (layout === 'feature')    renderSlideshow(items, true);
+      else if (layout === 'lowerthird') renderLowerThird(items);
+      else                              renderList(items);
+    }
+
+    loadAndRender();
 
     // Auto-refresh every 5 minutes
-    setInterval(() => {
-      if (!feedUrl) return;
-      if (showImages) {
-        fetchRssWithImages(feedUrl, el.rssMaxItems || 5).then(renderRssItems);
-      } else {
-        fetchRss(feedUrl, el.rssMaxItems || 6).then(headlines => renderRssItems(headlines));
-      }
-    }, 5 * 60 * 1000);
+    setInterval(loadAndRender, 5 * 60 * 1000);
   }
 
   // ── TICKER ────────────────────────────────────────────────────────────────
