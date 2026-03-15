@@ -1638,32 +1638,65 @@ app.get(
       if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
 
       try {
-        // Pull last brightness and volume from device_commands history
-        const result = await pool.query(
+        // 1. Get actual reported state from screens table (updated by heartbeat)
+        const screenResult = await pool.query(
+          `SELECT brightness, volume, is_muted
+           FROM screens
+           WHERE device_id = $1
+           LIMIT 1`,
+          [deviceId]
+        );
+
+        const reported = screenResult.rows[0] || {};
+
+        // 2. Get last commanded state from device_commands history
+        const commandResult = await pool.query(
           `SELECT payload FROM device_commands
            WHERE device_id = $1
-             AND payload->>'type' IN ('brightness', 'volume')
+             AND payload->>'type' IN ('brightness', 'volume', 'mute', 'unmute')
              AND sent = true
            ORDER BY created_at DESC
            LIMIT 20`,
           [deviceId]
         );
 
-        let brightness: number | null = null;
-        let volume: number | null = null;
+        let commandedBrightness: number | null = null;
+        let commandedVolume: number | null = null;
+        let commandedMuted: boolean | null = null;
 
-        for (const row of result.rows) {
+        for (const row of commandResult.rows) {
           const p = row.payload || {};
-          if (brightness === null && p.type === 'brightness' && p.value != null) {
-            brightness = Number(p.value);
+          if (commandedBrightness === null && p.type === 'brightness' && p.value != null) {
+            commandedBrightness = Number(p.value);
           }
-          if (volume === null && p.type === 'volume' && p.value != null) {
-            volume = Number(p.value);
+          if (commandedVolume === null && p.type === 'volume' && p.value != null) {
+            commandedVolume = Number(p.value);
           }
-          if (brightness !== null && volume !== null) break;
+          if (commandedMuted === null && (p.type === 'mute' || p.type === 'unmute')) {
+            commandedMuted = p.type === 'mute';
+          }
+          if (commandedBrightness !== null && commandedVolume !== null && commandedMuted !== null) break;
         }
 
-        return res.json({ brightness, volume });
+        // Prefer reported (actual) over commanded — reported reflects reality.
+        // Fall back to commanded if device hasn't reported yet (e.g. new device).
+        return res.json({
+          // Actual values reported by device on last heartbeat
+          brightness: reported.brightness ?? commandedBrightness,
+          volume:     reported.volume     ?? commandedVolume,
+          muted:      reported.is_muted   ?? commandedMuted ?? false,
+          // Also expose both sources separately so the UI can show drift if needed
+          reported: {
+            brightness: reported.brightness  ?? null,
+            volume:     reported.volume      ?? null,
+            muted:      reported.is_muted    ?? null,
+          },
+          commanded: {
+            brightness: commandedBrightness,
+            volume:     commandedVolume,
+            muted:      commandedMuted,
+          },
+        });
       } catch (err) {
         console.error("Device state error:", err);
         return res.status(500).json({ error: "failed_to_get_state" });
@@ -4086,13 +4119,6 @@ async function renderEl(el) {
     const v = document.createElement('video');
     v.src = el.url; v.autoplay = true; v.muted = true; v.loop = true; v.playsInline = true;
     v.style.objectFit = el.fit || 'cover';
-    // Read CMS-commanded volume from native bridge on first play.
-    // Videos start muted (required for autoplay), then apply the bridge volume.
-    v.addEventListener('canplay', function() {
-      const vol = (window.LuminaPlayer ? window.LuminaPlayer.getVolume() : null)
-                  ?? window.__luminaVolume ?? 1.0;
-      if (vol > 0) { v.muted = false; try { v.volume = vol; } catch(e) {} }
-    }, { once: true });
     div.appendChild(v);
   }
 
@@ -4579,17 +4605,11 @@ async function renderEl(el) {
 
         if (mtype === 'video' || /\\.mp4|webm|ogg/i.test(url)) {
           const v = document.createElement('video');
-          v.src = url; v.autoplay = true; v.muted = true; v.playsInline = true;
+          v.src = url; v.autoplay = true; v.muted = !item.volume || item.volume === 0; v.playsInline = true;
           v.style.objectFit = el.fit || 'cover';
           v.className = 'fade-in';
           v.onended = () => advance();
           v.onerror = () => { if (timer) clearTimeout(timer); advance(); };
-          // Apply CMS-commanded volume from native bridge on first play
-          v.addEventListener('canplay', function() {
-            const vol = (window.LuminaPlayer ? window.LuminaPlayer.getVolume() : null)
-                        ?? window.__luminaVolume ?? 1.0;
-            if (vol > 0) { v.muted = false; try { v.volume = vol; } catch(e) {} }
-          }, { once: true });
           pWrap.appendChild(v);
           // Fallback timer in case video doesn't end (e.g. looping source)
           timer = setTimeout(advance, dur + 2000);
