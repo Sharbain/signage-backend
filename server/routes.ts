@@ -4086,6 +4086,13 @@ async function renderEl(el) {
     const v = document.createElement('video');
     v.src = el.url; v.autoplay = true; v.muted = true; v.loop = true; v.playsInline = true;
     v.style.objectFit = el.fit || 'cover';
+    // Respect volume previously set by native CMS command (stored as window.__luminaVolume)
+    v.addEventListener('canplay', function() {
+      if (window.__luminaVolume != null && window.__luminaVolume > 0) {
+        v.muted = false;
+        try { v.volume = window.__luminaVolume; } catch(e) {}
+      }
+    }, { once: true });
     div.appendChild(v);
   }
 
