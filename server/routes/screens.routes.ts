@@ -223,6 +223,15 @@ export async function registerScreensRoutes(app: Express) {
       const currentUrl     = (body.currentUrl ?? body.current_url ?? body?.playback?.currentUrl ?? null) as string | null;
       const lastError      = body?.playback?.lastError ?? body?.lastError ?? body?.last_error ?? null;
 
+      // PR-MDM-001: Full device state snapshot for reconciliation
+      // The device reports its actual current state on every heartbeat.
+      // We compare against the last commanded state to detect drift.
+      const reportedIsMuted    = body.isMuted    ?? null;
+      const reportedFontScale  = body.fontScale  ?? null;
+      const reportedTimezone   = body.timezone   ?? null;
+      const reportedDateFormat = body.dateFormat ?? null;
+      const reportedOrientation= body.orientation?? null;
+
       const ip =
         String(req.headers["x-forwarded-for"] || "").split(",")[0]?.trim() ||
         (req.socket as any)?.remoteAddress ||
@@ -267,6 +276,20 @@ export async function registerScreensRoutes(app: Express) {
         timestamp: Date.now(),
         payload: body,
       } as any);
+
+      // PR-MDM-001: State reconciliation
+      // Detect drift between what the CMS last commanded and what the device
+      // is actually reporting. Re-queue any drifted commands automatically.
+      // Runs async — does not block the heartbeat response.
+      reconcileDeviceState(deviceId, {
+        volume:      volume      != null ? Number(volume)      : null,
+        brightness:  brightness  != null ? Number(brightness)  : null,
+        isMuted:     reportedIsMuted,
+        fontScale:   reportedFontScale   != null ? Number(reportedFontScale)   : null,
+        timezone:    reportedTimezone,
+        dateFormat:  reportedDateFormat,
+        orientation: reportedOrientation,
+      }).catch(err => console.warn("reconcileDeviceState error:", err));
 
       return res.json({ ok: true, serverTime: new Date().toISOString() });
     } catch (err) {
@@ -383,4 +406,119 @@ export async function registerScreensRoutes(app: Express) {
       res.status(500).json({ error: "failed_to_get_play_log" });
     }
   });
+}
+
+// =============================================================================
+// PR-MDM-001: State reconciliation
+// =============================================================================
+// Called on every heartbeat. Compares the device's reported state against the
+// last command the CMS sent for each property. If they differ beyond the drift
+// threshold, the last command is re-queued so the device corrects itself on the
+// next poll cycle.
+//
+// Drift thresholds:
+//   volume / brightness: ±10 (small fluctuations from media player are normal)
+//   fontScale / timezone / dateFormat / orientation: exact match required
+//
+// This function never throws — all errors are caught and logged as warnings
+// so a reconciliation failure never breaks the heartbeat response.
+// =============================================================================
+
+interface DeviceStateSnapshot {
+  volume:      number | null;
+  brightness:  number | null;
+  isMuted:     boolean | null;
+  fontScale:   number | null;
+  timezone:    string | null;
+  dateFormat:  string | null;
+  orientation: string | null;
+}
+
+async function reconcileDeviceState(
+  deviceId: string,
+  reported: DeviceStateSnapshot,
+): Promise<void> {
+  try {
+    // Fetch the last executed command for each reconcilable property
+    const result = await pool.query(
+      `SELECT payload
+       FROM device_commands
+       WHERE device_id = $1
+         AND executed = TRUE
+         AND payload->>'type' IN (
+           'volume', 'set_volume',
+           'brightness', 'set_brightness',
+           'mute', 'unmute',
+           'set_font_scale',
+           'set_timezone',
+           'set_date_format',
+           'set_orientation'
+         )
+       ORDER BY executed_at DESC
+       LIMIT 20`,
+      [deviceId],
+    );
+
+    // Build a map of property → last commanded value
+    const lastCommanded: Record<string, any> = {};
+    for (const row of result.rows) {
+      const p = typeof row.payload === "string" ? JSON.parse(row.payload) : row.payload;
+      const type = String(p?.type ?? "").toLowerCase().replace("set_", "");
+      if (!(type in lastCommanded)) {
+        lastCommanded[type] = p?.value ?? null;
+      }
+    }
+
+    const toRequeue: { type: string; value?: any }[] = [];
+
+    // Volume drift check (±10 tolerance)
+    if (reported.volume != null && lastCommanded["volume"] != null) {
+      const diff = Math.abs(reported.volume - Number(lastCommanded["volume"]));
+      if (diff > 10) {
+        console.log(`[reconcile] ${deviceId} volume drift: reported=${reported.volume} commanded=${lastCommanded["volume"]}`);
+        toRequeue.push({ type: "volume", value: lastCommanded["volume"] });
+      }
+    }
+
+    // Brightness drift check (±10 tolerance)
+    if (reported.brightness != null && lastCommanded["brightness"] != null) {
+      const diff = Math.abs(reported.brightness - Number(lastCommanded["brightness"]));
+      if (diff > 10) {
+        console.log(`[reconcile] ${deviceId} brightness drift: reported=${reported.brightness} commanded=${lastCommanded["brightness"]}`);
+        toRequeue.push({ type: "brightness", value: lastCommanded["brightness"] });
+      }
+    }
+
+    // Font scale — exact match
+    if (reported.fontScale != null && lastCommanded["font_scale"] != null) {
+      if (Math.abs(reported.fontScale - Number(lastCommanded["font_scale"])) > 0.01) {
+        console.log(`[reconcile] ${deviceId} fontScale drift`);
+        toRequeue.push({ type: "set_font_scale", value: lastCommanded["font_scale"] });
+      }
+    }
+
+    // Timezone — exact match
+    if (reported.timezone && lastCommanded["timezone"] && reported.timezone !== lastCommanded["timezone"]) {
+      console.log(`[reconcile] ${deviceId} timezone drift: reported=${reported.timezone} commanded=${lastCommanded["timezone"]}`);
+      toRequeue.push({ type: "set_timezone", value: lastCommanded["timezone"] });
+    }
+
+    // Orientation — exact match
+    if (reported.orientation && lastCommanded["orientation"] && reported.orientation !== lastCommanded["orientation"]) {
+      console.log(`[reconcile] ${deviceId} orientation drift`);
+      toRequeue.push({ type: "set_orientation", value: lastCommanded["orientation"] });
+    }
+
+    // Re-queue drifted commands
+    for (const cmd of toRequeue) {
+      await pool.query(
+        `INSERT INTO device_commands (device_id, payload, sent, executed)
+         VALUES ($1, $2, false, false)`,
+        [deviceId, JSON.stringify({ type: cmd.type, value: cmd.value, _reconcile: true })],
+      );
+      console.log(`[reconcile] ${deviceId} re-queued: ${cmd.type}=${cmd.value}`);
+    }
+  } catch (err) {
+    console.warn(`[reconcile] ${deviceId} error:`, err);
+  }
 }
