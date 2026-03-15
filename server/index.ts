@@ -11,6 +11,13 @@ import { initWebSocketServer } from "./ws";
 import { createServer } from "http";
 import { pool } from "./db";
 import { startContentScheduler } from "./contentScheduler";
+import {
+  alertDeviceOffline,
+  alertDeviceOnline,
+  alertStorageCritical,
+  OFFLINE_THRESHOLD_MINUTES,
+  STORAGE_CRITICAL_MB,
+} from "./alertEngine";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -175,7 +182,6 @@ app.use((req, res, next) => {
 (async () => {
   await registerRoutes(httpServer, app);
   initWebSocketServer(httpServer);
-  startContentScheduler();
 
   /* --------------------------------------------------
      HEARTBEAT WATCHDOG
@@ -184,14 +190,46 @@ app.use((req, res, next) => {
   -------------------------------------------------- */
   async function markStaleDevicesOffline() {
     try {
-      const result = await pool.query(`
+      // Find devices that just went offline (were online, now stale)
+      const stale = await pool.query(`
         UPDATE screens
-        SET is_online = false, status = 'offline'
+        SET is_online = false, status = 'offline', last_offline = NOW()
         WHERE is_online = true
-          AND (last_seen IS NULL OR last_seen < NOW() - INTERVAL '5 minutes')
+          AND (last_seen IS NULL OR last_seen < NOW() - INTERVAL '${OFFLINE_THRESHOLD_MINUTES} minutes')
+        RETURNING device_id, name, org_id, free_storage
       `);
-      if (result.rowCount && result.rowCount > 0) {
-        log(`[watchdog] Marked ${result.rowCount} stale device(s) offline`);
+
+      if (stale.rowCount && stale.rowCount > 0) {
+        log(`[watchdog] Marked ${stale.rowCount} stale device(s) offline`);
+
+        // Fire offline alert for each device
+        for (const row of stale.rows) {
+          if (row.org_id) {
+            alertDeviceOffline(row.device_id, row.name, row.org_id).catch(
+              (err) => console.error("[watchdog] alertDeviceOffline failed:", err),
+            );
+          }
+        }
+      }
+
+      // Check for critically low storage on online devices
+      const lowStorage = await pool.query(`
+        SELECT device_id, name, org_id,
+               ROUND((free_storage::numeric / 1048576)) AS free_mb
+        FROM screens
+        WHERE is_online = true
+          AND free_storage IS NOT NULL
+          AND free_storage < ${STORAGE_CRITICAL_MB * 1048576}
+          AND org_id IS NOT NULL
+      `);
+
+      for (const row of lowStorage.rows) {
+        alertStorageCritical(
+          row.device_id,
+          row.name,
+          row.org_id,
+          Number(row.free_mb),
+        ).catch((err) => console.error("[watchdog] alertStorageCritical failed:", err));
       }
     } catch (err) {
       console.error("[watchdog] Failed to mark stale devices:", err);
