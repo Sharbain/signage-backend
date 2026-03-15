@@ -4086,12 +4086,12 @@ async function renderEl(el) {
     const v = document.createElement('video');
     v.src = el.url; v.autoplay = true; v.muted = true; v.loop = true; v.playsInline = true;
     v.style.objectFit = el.fit || 'cover';
-    // Respect volume previously set by native CMS command (stored as window.__luminaVolume)
+    // Read CMS-commanded volume from native bridge on first play.
+    // Videos start muted (required for autoplay), then apply the bridge volume.
     v.addEventListener('canplay', function() {
-      if (window.__luminaVolume != null && window.__luminaVolume > 0) {
-        v.muted = false;
-        try { v.volume = window.__luminaVolume; } catch(e) {}
-      }
+      const vol = (window.LuminaPlayer ? window.LuminaPlayer.getVolume() : null)
+                  ?? window.__luminaVolume ?? 1.0;
+      if (vol > 0) { v.muted = false; try { v.volume = vol; } catch(e) {} }
     }, { once: true });
     div.appendChild(v);
   }
@@ -4579,11 +4579,17 @@ async function renderEl(el) {
 
         if (mtype === 'video' || /\\.mp4|webm|ogg/i.test(url)) {
           const v = document.createElement('video');
-          v.src = url; v.autoplay = true; v.muted = !item.volume || item.volume === 0; v.playsInline = true;
+          v.src = url; v.autoplay = true; v.muted = true; v.playsInline = true;
           v.style.objectFit = el.fit || 'cover';
           v.className = 'fade-in';
           v.onended = () => advance();
           v.onerror = () => { if (timer) clearTimeout(timer); advance(); };
+          // Apply CMS-commanded volume from native bridge on first play
+          v.addEventListener('canplay', function() {
+            const vol = (window.LuminaPlayer ? window.LuminaPlayer.getVolume() : null)
+                        ?? window.__luminaVolume ?? 1.0;
+            if (vol > 0) { v.muted = false; try { v.volume = vol; } catch(e) {} }
+          }, { once: true });
           pWrap.appendChild(v);
           // Fallback timer in case video doesn't end (e.g. looping source)
           timer = setTimeout(advance, dur + 2000);
