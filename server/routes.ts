@@ -39,6 +39,7 @@ import { registerScreensRoutes } from "./routes/screens.routes";
 import { registerClientRoutes } from "./routes/clients.routes";
 import { registerScheduleRoutes } from "./routes/schedule.routes";
 import { registerGroupRoutes } from "./routes/groups.routes";
+import { registerMultitenancyRoutes } from "./routes/multitenancy.routes";
 import { broadcastPublishJobUpdate } from "./ws";
 import WebSocketClient from "ws";
 import { createClient } from "@supabase/supabase-js";
@@ -462,6 +463,7 @@ export async function registerRoutes(
   // Register modular route groups (NEW)
   // --------------------------------------------------
   registerAuthRoutes(app);
+  registerMultitenancyRoutes(app); // Must be first — overrides non-scoped routes
   registerDeviceRoutes(app);
   await registerPublishJobRoutes(app);
   await registerScreensRoutes(app);
@@ -1375,6 +1377,160 @@ app.get("/api/dashboard/live-content", authenticateJWT, async (_req, res) => {
   });
 
 // =====================================================
+// DEVICE FETCHES ITS PENDING COMMANDS (DEVICE AUTH)
+// - device_commands.device_id is TEXT like "DEV-XXXX"
+// - device_commands.id is INTEGER
+// =====================================================
+const handleDeviceGetCommands = async (req: Request, res: Response) => {
+  const deviceId = String(req.params.deviceId || "").trim();
+  if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT id, payload
+      FROM device_commands
+      WHERE device_id = $1
+        AND sent = false
+      ORDER BY created_at ASC
+      LIMIT 50
+      `,
+      [deviceId],
+    );
+
+    if (result.rows.length > 0) {
+      const ids: number[] = result.rows
+        .map((r: any) => Number(r.id))
+        .filter((n) => Number.isFinite(n));
+
+      if (ids.length > 0) {
+        await pool.query(
+          `
+          UPDATE device_commands
+          SET sent = true
+          WHERE id = ANY($1::int[])
+          `,
+          [ids],
+        );
+      }
+
+      const publishJobIds: number[] = result.rows
+        .map((r: any) => {
+          try {
+            const payload = typeof r.payload === "string" ? JSON.parse(r.payload) : r.payload;
+            const raw = String(payload?.publishJobId ?? payload?.publish_job_id ?? "").trim();
+            const id = Number(raw);
+            return Number.isFinite(id) ? id : null;
+          } catch {
+            return null;
+          }
+        })
+        .filter((n: any) => Number.isFinite(n));
+
+      if (publishJobIds.length > 0) {
+        await pool.query(
+          `
+          UPDATE publish_jobs
+          SET
+            status = CASE WHEN status = 'completed' THEN status ELSE 'downloading' END,
+            progress = CASE WHEN progress >= 5 THEN progress ELSE 5 END,
+            updated_at = NOW()
+          WHERE id = ANY($1::int[])
+            AND status IN ('pending', 'downloading')
+          `,
+          [publishJobIds],
+        );
+      }
+    }
+
+    return res.json(
+      result.rows.map((r: any) => {
+        let payload: any = r.payload;
+        try {
+          if (typeof payload === "string") payload = JSON.parse(payload);
+        } catch {
+          // ignore
+        }
+        return { id: r.id, ...(payload && typeof payload === "object" ? payload : { payload }) };
+      }),
+    );
+  } catch (err) {
+    console.error("Error fetching commands:", err);
+    // ✅ Device resilience: return [] so player doesn't crash
+    return res.json([]);
+  }
+};
+
+app.get("/api/device/:deviceId/commands", authenticateDevice, handleDeviceGetCommands);
+app.get("/api/devices/:deviceId/commands", authenticateDevice, handleDeviceGetCommands);
+
+const handleDeviceAckCommand = async (req: Request, res: Response) => {
+  const deviceId = String(req.params.deviceId || "").trim();
+  const commandId = Number(req.params.commandId);
+
+  if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
+  if (!Number.isFinite(commandId)) return res.status(400).json({ error: "invalid_command_id" });
+
+  try {
+    const result = await pool.query(
+      `
+      UPDATE device_commands
+      SET
+        executed = true,
+        executed_at = NOW()
+      WHERE id = $1
+        AND device_id = $2
+      RETURNING id, payload
+      `,
+      [commandId, deviceId],
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "command_not_found" });
+    }
+
+    let payload: any = result.rows[0].payload;
+    try {
+      if (typeof payload === "string") payload = JSON.parse(payload);
+    } catch {
+      // ignore
+    }
+
+    const publishJobId = String(
+      payload?.publishJobId ??
+      payload?.publish_job_id ??
+      "",
+    ).trim();
+
+    if (publishJobId) {
+      await pool.query(
+        `
+        UPDATE publish_jobs
+        SET
+          status = 'completed',
+          progress = 100,
+          downloaded_bytes = COALESCE(total_bytes, downloaded_bytes),
+          completed_at = NOW(),
+          updated_at = NOW()
+        WHERE id = $1::int
+        `,
+        [publishJobId],
+      );
+    }
+
+    return res.json({ success: true, commandId });
+  } catch (err) {
+    console.error("Command ACK error:", err);
+    return res.status(500).json({ error: "failed_to_ack_command" });
+  }
+};
+
+app.post("/api/device/:deviceId/commands/:commandId/ack", authenticateDevice, handleDeviceAckCommand);
+app.post("/api/devices/:deviceId/commands/:commandId/ack", authenticateDevice, handleDeviceAckCommand);
+
+  
+
+  // =====================================================
 // DEVICE UPLOADS VIDEO RECORDING (DEVICE AUTH)
 // Stores file path in DB via updateDeviceRecording (screens.last_recording)
 // =====================================================
