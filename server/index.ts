@@ -10,6 +10,7 @@ import { registerRoutes } from "./routes";
 import { initWebSocketServer } from "./ws";
 import { createServer } from "http";
 import { pool } from "./db";
+import { startContentScheduler } from "./contentScheduler";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -174,6 +175,7 @@ app.use((req, res, next) => {
 (async () => {
   await registerRoutes(httpServer, app);
   initWebSocketServer(httpServer);
+  startContentScheduler();
 
   /* --------------------------------------------------
      HEARTBEAT WATCHDOG
