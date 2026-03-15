@@ -20,7 +20,9 @@
  *   SELECT * FROM pgboss.job WHERE name = 'content-push' ORDER BY createdon DESC;
  */
 
-import PgBoss from "pg-boss";
+import PgBossModule from "pg-boss";
+// Handle both ESM default export and CJS module.exports patterns
+const PgBoss = (PgBossModule as any).default ?? PgBossModule;
 import { pool } from "./db";
 
 let boss: PgBoss | null = null;
@@ -131,7 +133,7 @@ async function scheduleCheckWorker() {
 
 // ── Content push worker ───────────────────────────────────────────────────────
 
-async function contentPushWorker(job: PgBoss.Job<ContentPushPayload>) {
+async function contentPushWorker(job: PgBossModule.Job<ContentPushPayload>) {
   const { scheduleId, deviceId, contentType, contentId, contentName } = job.data;
 
   console.log(`[scheduler] Push: ${contentType} "${contentName}" → ${deviceId} (schedule=${scheduleId})`);
