@@ -20,12 +20,16 @@
  *   SELECT * FROM pgboss.job WHERE name = 'content-push' ORDER BY createdon DESC;
  */
 
-import PgBossModule from "pg-boss";
-// Handle both ESM default export and CJS module.exports patterns
-const PgBoss = (PgBossModule as any).default ?? PgBossModule;
+import { createRequire } from "module";
 import { pool } from "./db";
 
-let boss: PgBoss | null = null;
+// pg-boss must be loaded via require() at runtime — not bundled by esbuild.
+// The CJS bundle mangles the ESM default export, breaking `new PgBoss()`.
+const _require = createRequire(import.meta.url);
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const PgBoss = _require("pg-boss");
+
+let boss: any = null;
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 
@@ -133,7 +137,7 @@ async function scheduleCheckWorker() {
 
 // ── Content push worker ───────────────────────────────────────────────────────
 
-async function contentPushWorker(job: PgBossModule.Job<ContentPushPayload>) {
+async function contentPushWorker(job: any) {
   const { scheduleId, deviceId, contentType, contentId, contentName } = job.data;
 
   console.log(`[scheduler] Push: ${contentType} "${contentName}" → ${deviceId} (schedule=${scheduleId})`);
