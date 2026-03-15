@@ -541,7 +541,8 @@ export const publishJobs = pgTable("publish_jobs", {
   deviceId: text("device_id").notNull(),
   deviceName: text("device_name").notNull(),
   contentType: text("content_type").notNull(),
-  contentId: varchar("content_id").notNull(),
+  // DB column is integer, nullable — templates don't have a numeric contentId
+  contentId: integer("content_id"),
   contentName: text("content_name").notNull(),
   status: text("status").default("pending").notNull(),
   progress: integer("progress").default(0).notNull(),
