@@ -27,7 +27,8 @@
  */
 
 import type { Express, Request, Response } from "express";
-import { authenticateJWT, requireRole } from "./auth";
+import { authenticateJWT } from "../middleware/auth";
+import { requireRole } from "../middleware/permissions";
 import { pool } from "../db";
 
 export function registerMultitenancyRoutes(app: Express) {
