@@ -40,6 +40,7 @@ import { registerClientRoutes } from "./routes/clients.routes";
 import { registerScheduleRoutes } from "./routes/schedule.routes";
 import { registerGroupRoutes } from "./routes/groups.routes";
 import { registerMultitenancyRoutes } from "./routes/multitenancy.routes";
+import { registerNotificationRoutes } from "./routes/notifications.routes";
 import { broadcastPublishJobUpdate } from "./ws";
 import WebSocketClient from "ws";
 import { createClient } from "@supabase/supabase-js";
@@ -464,6 +465,7 @@ export async function registerRoutes(
   // --------------------------------------------------
   registerAuthRoutes(app);
   registerMultitenancyRoutes(app); // Must be first — overrides non-scoped routes
+  registerNotificationRoutes(app);
   registerDeviceRoutes(app);
   await registerPublishJobRoutes(app);
   await registerScreensRoutes(app);
