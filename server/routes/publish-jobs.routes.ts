@@ -302,12 +302,14 @@ export async function registerPublishJobRoutes(app: Express) {
             [deviceId, String(publishTemplateId)],
           ).catch(() => { /* table may not exist yet */ });
 
-          // CRITICAL: Clear all playlist assignments for this device so the
-          // template always wins.
-          await client.query(
-            `DELETE FROM playlist_assignments WHERE device_id = $1`,
-            [deviceId],
-          ).catch(() => {});
+          // IMPORTANT: Do NOT delete playlist_assignments.
+          // The playlist endpoint already returns the template first when a
+          // device_template_assignment exists (template always wins).
+          // Keeping playlist_assignments intact means:
+          //   1. If the template is unpublished, the device falls back to its playlist.
+          //   2. Reboot no longer shows a black screen — the device fetches the
+          //      playlist endpoint which returns templateId, so it loads the template.
+          //   3. No data loss — admins can switch back to playlist mode cleanly.
         }
 
         // Build and queue device command
