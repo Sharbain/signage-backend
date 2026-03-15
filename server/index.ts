@@ -182,6 +182,7 @@ app.use((req, res, next) => {
 (async () => {
   await registerRoutes(httpServer, app);
   initWebSocketServer(httpServer);
+  startContentScheduler();
 
   /* --------------------------------------------------
      HEARTBEAT WATCHDOG
