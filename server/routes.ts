@@ -5829,7 +5829,33 @@ app.post("/api/data-proxy/test", authenticateJWT, async (req: Request, res: Resp
     },
   );
 
-  // Get all devices in a group (including nested groups)
+  // Alias used by TemplateDesigner group publish — returns devices in format { devices: [{deviceId, name}] }
+  app.get("/api/groups/:groupId/subtree-devices", async (req, res) => {
+    try {
+      const { groupId } = req.params;
+      const id = String(groupId).replace("group_", "").trim();
+      // Recursive CTE to get all devices in this group and all nested subgroups
+      const result = await pool.query(`
+        WITH RECURSIVE group_tree AS (
+          SELECT id::text FROM device_groups WHERE id::text = $1 OR id = $1::uuid
+          UNION ALL
+          SELECT dg.id::text FROM device_groups dg
+          JOIN group_tree gt ON dg.parent_id::text = gt.id
+        )
+        SELECT DISTINCT s.device_id AS "deviceId", s.name, s.is_online
+        FROM screens s
+        JOIN device_group_map dgm ON dgm.device_id = s.device_id
+        WHERE dgm.group_id::text IN (SELECT id FROM group_tree)
+        ORDER BY s.name
+      `, [id]);
+      return res.json({ devices: result.rows, count: result.rows.length });
+    } catch (err) {
+      console.error("subtree-devices error:", err);
+      return res.status(500).json({ error: "Failed to get group devices", devices: [] });
+    }
+  });
+
+    // Get all devices in a group (including nested groups)
   app.get("/api/device-groups/:id/devices", async (req, res) => {
     const rawId = req.params.id;
     const id = rawId.replace("group_", "");
