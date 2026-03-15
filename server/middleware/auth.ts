@@ -32,6 +32,7 @@ export type AuthedUser = {
   id: string;
   email: string;
   role: string;
+  orgId: string | null; // null for super-admins with no org
 };
 
 declare global {
@@ -144,15 +145,23 @@ export async function authenticateJWT(req: Request, res: Response, next: NextFun
     if (!userId) return res.status(401).json({ error: "invalid_token" });
 
     const { rows } = await pool.query(
-      `SELECT id::text AS id, email, role
-       FROM users
-       WHERE id = $1`,
+      `SELECT u.id::text AS id, u.email, u.role,
+              m.org_id::text AS org_id
+       FROM users u
+       LEFT JOIN memberships m ON m.user_id = u.id
+       WHERE u.id = $1
+       LIMIT 1`,
       [userId],
     );
 
     if (!rows.length) return res.status(401).json({ error: "user_not_found" });
 
-    req.user = { id: rows[0].id, email: rows[0].email, role: rows[0].role };
+    req.user = {
+      id:     rows[0].id,
+      email:  rows[0].email,
+      role:   rows[0].role,
+      orgId:  rows[0].org_id ?? null,
+    };
     return next();
   } catch {
     return res.status(401).json({ error: "invalid_token" });
