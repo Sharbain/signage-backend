@@ -82,13 +82,6 @@ async function buildServer() {
     },
     minify: true,
     external: externals,
-    // Banner injects a CJS-compatible require shim so external ESM packages
-    // load correctly when required from a CJS bundle
-    banner: {
-      js: `
-const __require = typeof require !== 'undefined' ? require : (await import('module')).createRequire(import.meta.url);
-`.trim(),
-    },
     logLevel: "info",
   });
 }
