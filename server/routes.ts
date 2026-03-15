@@ -1375,160 +1375,6 @@ app.get("/api/dashboard/live-content", authenticateJWT, async (_req, res) => {
   });
 
 // =====================================================
-// DEVICE FETCHES ITS PENDING COMMANDS (DEVICE AUTH)
-// - device_commands.device_id is TEXT like "DEV-XXXX"
-// - device_commands.id is INTEGER
-// =====================================================
-const handleDeviceGetCommands = async (req: Request, res: Response) => {
-  const deviceId = String(req.params.deviceId || "").trim();
-  if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
-
-  try {
-    const result = await pool.query(
-      `
-      SELECT id, payload
-      FROM device_commands
-      WHERE device_id = $1
-        AND sent = false
-      ORDER BY created_at ASC
-      LIMIT 50
-      `,
-      [deviceId],
-    );
-
-    if (result.rows.length > 0) {
-      const ids: number[] = result.rows
-        .map((r: any) => Number(r.id))
-        .filter((n) => Number.isFinite(n));
-
-      if (ids.length > 0) {
-        await pool.query(
-          `
-          UPDATE device_commands
-          SET sent = true
-          WHERE id = ANY($1::int[])
-          `,
-          [ids],
-        );
-      }
-
-      const publishJobIds: number[] = result.rows
-        .map((r: any) => {
-          try {
-            const payload = typeof r.payload === "string" ? JSON.parse(r.payload) : r.payload;
-            const raw = String(payload?.publishJobId ?? payload?.publish_job_id ?? "").trim();
-            const id = Number(raw);
-            return Number.isFinite(id) ? id : null;
-          } catch {
-            return null;
-          }
-        })
-        .filter((n: any) => Number.isFinite(n));
-
-      if (publishJobIds.length > 0) {
-        await pool.query(
-          `
-          UPDATE publish_jobs
-          SET
-            status = CASE WHEN status = 'completed' THEN status ELSE 'downloading' END,
-            progress = CASE WHEN progress >= 5 THEN progress ELSE 5 END,
-            updated_at = NOW()
-          WHERE id = ANY($1::int[])
-            AND status IN ('pending', 'downloading')
-          `,
-          [publishJobIds],
-        );
-      }
-    }
-
-    return res.json(
-      result.rows.map((r: any) => {
-        let payload: any = r.payload;
-        try {
-          if (typeof payload === "string") payload = JSON.parse(payload);
-        } catch {
-          // ignore
-        }
-        return { id: r.id, ...(payload && typeof payload === "object" ? payload : { payload }) };
-      }),
-    );
-  } catch (err) {
-    console.error("Error fetching commands:", err);
-    // ✅ Device resilience: return [] so player doesn't crash
-    return res.json([]);
-  }
-};
-
-app.get("/api/device/:deviceId/commands", authenticateDevice, handleDeviceGetCommands);
-app.get("/api/devices/:deviceId/commands", authenticateDevice, handleDeviceGetCommands);
-
-const handleDeviceAckCommand = async (req: Request, res: Response) => {
-  const deviceId = String(req.params.deviceId || "").trim();
-  const commandId = Number(req.params.commandId);
-
-  if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
-  if (!Number.isFinite(commandId)) return res.status(400).json({ error: "invalid_command_id" });
-
-  try {
-    const result = await pool.query(
-      `
-      UPDATE device_commands
-      SET
-        executed = true,
-        executed_at = NOW()
-      WHERE id = $1
-        AND device_id = $2
-      RETURNING id, payload
-      `,
-      [commandId, deviceId],
-    );
-
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: "command_not_found" });
-    }
-
-    let payload: any = result.rows[0].payload;
-    try {
-      if (typeof payload === "string") payload = JSON.parse(payload);
-    } catch {
-      // ignore
-    }
-
-    const publishJobId = String(
-      payload?.publishJobId ??
-      payload?.publish_job_id ??
-      "",
-    ).trim();
-
-    if (publishJobId) {
-      await pool.query(
-        `
-        UPDATE publish_jobs
-        SET
-          status = 'completed',
-          progress = 100,
-          downloaded_bytes = COALESCE(total_bytes, downloaded_bytes),
-          completed_at = NOW(),
-          updated_at = NOW()
-        WHERE id = $1::int
-        `,
-        [publishJobId],
-      );
-    }
-
-    return res.json({ success: true, commandId });
-  } catch (err) {
-    console.error("Command ACK error:", err);
-    return res.status(500).json({ error: "failed_to_ack_command" });
-  }
-};
-
-app.post("/api/device/:deviceId/commands/:commandId/ack", authenticateDevice, handleDeviceAckCommand);
-app.post("/api/devices/:deviceId/commands/:commandId/ack", authenticateDevice, handleDeviceAckCommand);
-
-  
-
-  // =====================================================
 // DEVICE UPLOADS VIDEO RECORDING (DEVICE AUTH)
 // Stores file path in DB via updateDeviceRecording (screens.last_recording)
 // =====================================================
@@ -1638,65 +1484,32 @@ app.get(
       if (!deviceId) return res.status(400).json({ error: "missing_device_id" });
 
       try {
-        // 1. Get actual reported state from screens table (updated by heartbeat)
-        const screenResult = await pool.query(
-          `SELECT brightness, volume, is_muted
-           FROM screens
-           WHERE device_id = $1
-           LIMIT 1`,
-          [deviceId]
-        );
-
-        const reported = screenResult.rows[0] || {};
-
-        // 2. Get last commanded state from device_commands history
-        const commandResult = await pool.query(
+        // Pull last brightness and volume from device_commands history
+        const result = await pool.query(
           `SELECT payload FROM device_commands
            WHERE device_id = $1
-             AND payload->>'type' IN ('brightness', 'volume', 'mute', 'unmute')
+             AND payload->>'type' IN ('brightness', 'volume')
              AND sent = true
            ORDER BY created_at DESC
            LIMIT 20`,
           [deviceId]
         );
 
-        let commandedBrightness: number | null = null;
-        let commandedVolume: number | null = null;
-        let commandedMuted: boolean | null = null;
+        let brightness: number | null = null;
+        let volume: number | null = null;
 
-        for (const row of commandResult.rows) {
+        for (const row of result.rows) {
           const p = row.payload || {};
-          if (commandedBrightness === null && p.type === 'brightness' && p.value != null) {
-            commandedBrightness = Number(p.value);
+          if (brightness === null && p.type === 'brightness' && p.value != null) {
+            brightness = Number(p.value);
           }
-          if (commandedVolume === null && p.type === 'volume' && p.value != null) {
-            commandedVolume = Number(p.value);
+          if (volume === null && p.type === 'volume' && p.value != null) {
+            volume = Number(p.value);
           }
-          if (commandedMuted === null && (p.type === 'mute' || p.type === 'unmute')) {
-            commandedMuted = p.type === 'mute';
-          }
-          if (commandedBrightness !== null && commandedVolume !== null && commandedMuted !== null) break;
+          if (brightness !== null && volume !== null) break;
         }
 
-        // Prefer reported (actual) over commanded — reported reflects reality.
-        // Fall back to commanded if device hasn't reported yet (e.g. new device).
-        return res.json({
-          // Actual values reported by device on last heartbeat
-          brightness: reported.brightness ?? commandedBrightness,
-          volume:     reported.volume     ?? commandedVolume,
-          muted:      reported.is_muted   ?? commandedMuted ?? false,
-          // Also expose both sources separately so the UI can show drift if needed
-          reported: {
-            brightness: reported.brightness  ?? null,
-            volume:     reported.volume      ?? null,
-            muted:      reported.is_muted    ?? null,
-          },
-          commanded: {
-            brightness: commandedBrightness,
-            volume:     commandedVolume,
-            muted:      commandedMuted,
-          },
-        });
+        return res.json({ brightness, volume });
       } catch (err) {
         console.error("Device state error:", err);
         return res.status(500).json({ error: "failed_to_get_state" });
