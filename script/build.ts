@@ -1,8 +1,22 @@
 import { build as esbuild } from "esbuild";
 import { rm, readFile } from "fs/promises";
 
-// Server deps to bundle to reduce cold start times.
-const allowlist = [
+/**
+ * Build script — produces dist/index.cjs for production.
+ *
+ * Strategy:
+ *   - Bundle pure-JS deps from the allowlist for faster cold starts
+ *   - Keep all native modules and ESM-only packages EXTERNAL
+ *     so Node loads them directly from node_modules at runtime
+ *   - pg-boss and other ESM packages are explicitly external to
+ *     prevent esbuild from mangling their module format
+ *
+ * Rule of thumb: if a package uses dynamic imports, top-level await,
+ * or ships only ESM, it goes in ESM_EXTERNAL, not the allowlist.
+ */
+
+// Packages to bundle (pure CJS, no native bindings, no dynamic imports)
+const BUNDLE_ALLOWLIST = [
   "@google/generative-ai",
   "@neondatabase/serverless",
   "axios",
@@ -31,6 +45,15 @@ const allowlist = [
   "zod-validation-error",
 ];
 
+// Packages that MUST stay external — ESM-only or native bindings
+// Adding a package here = Node loads it from node_modules at runtime
+const FORCE_EXTERNAL = [
+  "pg-boss",      // ESM — constructor breaks when bundled into CJS
+  "puppeteer",    // Native bindings
+  "bcrypt",       // Native bindings
+  "pg",           // Native bindings (libpq)
+];
+
 async function buildServer() {
   await rm("dist", { recursive: true, force: true });
 
@@ -40,7 +63,13 @@ async function buildServer() {
     ...Object.keys(pkg.dependencies || {}),
     ...Object.keys(pkg.devDependencies || {}),
   ];
-  const externals = allDeps.filter((dep) => !allowlist.includes(dep));
+
+  // Everything not in the allowlist is external by default
+  // FORCE_EXTERNAL adds explicit safety for problematic packages
+  const externals = [
+    ...allDeps.filter((dep) => !BUNDLE_ALLOWLIST.includes(dep)),
+    ...FORCE_EXTERNAL,
+  ].filter((v, i, a) => a.indexOf(v) === i); // dedupe
 
   await esbuild({
     entryPoints: ["server/index.ts"],
@@ -53,6 +82,13 @@ async function buildServer() {
     },
     minify: true,
     external: externals,
+    // Banner injects a CJS-compatible require shim so external ESM packages
+    // load correctly when required from a CJS bundle
+    banner: {
+      js: `
+const __require = typeof require !== 'undefined' ? require : (await import('module')).createRequire(import.meta.url);
+`.trim(),
+    },
     logLevel: "info",
   });
 }
